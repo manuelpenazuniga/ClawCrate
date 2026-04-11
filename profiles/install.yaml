@@ -1,0 +1,55 @@
+name: install
+default_mode: Replica
+
+filesystem:
+  read:
+    - "."
+    - "~/.cargo"
+    - "~/.npm"
+    - "~/.pnpm-store"
+    - "~/.cache/pip"
+  write:
+    - "."
+    - "./node_modules"
+    - "./.venv"
+    - "./target"
+    - "~/.cargo/registry"
+    - "~/.cargo/git"
+    - "~/.npm"
+    - "~/.pnpm-store"
+    - "~/.cache/pip"
+  deny: []
+
+network: open
+
+environment:
+  scrub:
+    - "AWS_*"
+    - "*_SECRET*"
+    - "*_PASSWORD*"
+    - "*_TOKEN*"
+    - "*_KEY"
+    - "SSH_AUTH_SOCK"
+    - "GOOGLE_APPLICATION_CREDENTIALS"
+    - "DATABASE_URL"
+  passthrough:
+    - "HOME"
+    - "PATH"
+    - "USER"
+    - "SHELL"
+    - "TERM"
+    - "LANG"
+    - "LC_*"
+    - "TMPDIR"
+    - "XDG_*"
+    - "CARGO_HOME"
+    - "RUSTUP_HOME"
+    - "NPM_CONFIG_CACHE"
+    - "PIP_CACHE_DIR"
+
+resources:
+  max_cpu_seconds: 1200
+  max_memory_mb: 8192
+  max_open_files: 4096
+  max_processes: 512
+  max_output_bytes: 16777216

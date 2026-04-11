@@ -1,0 +1,38 @@
+name: safe
+default_mode: Direct
+
+filesystem:
+  read:
+    - "."
+  write: []
+  deny: []
+
+network: none
+
+environment:
+  scrub:
+    - "AWS_*"
+    - "*_SECRET*"
+    - "*_PASSWORD*"
+    - "*_TOKEN*"
+    - "*_KEY"
+    - "SSH_AUTH_SOCK"
+    - "GOOGLE_APPLICATION_CREDENTIALS"
+    - "DATABASE_URL"
+  passthrough:
+    - "HOME"
+    - "PATH"
+    - "USER"
+    - "SHELL"
+    - "TERM"
+    - "LANG"
+    - "LC_*"
+    - "TMPDIR"
+    - "XDG_*"
+
+resources:
+  max_cpu_seconds: 120
+  max_memory_mb: 2048
+  max_open_files: 1024
+  max_processes: 128
+  max_output_bytes: 2097152
