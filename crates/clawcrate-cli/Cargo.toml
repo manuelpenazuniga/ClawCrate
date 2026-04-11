@@ -1,0 +1,18 @@
+[package]
+name = "clawcrate-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "clawcrate"
+path = "src/main.rs"
+
+[dependencies]
+clawcrate-audit = { path = "../clawcrate-audit" }
+clawcrate-capture = { path = "../clawcrate-capture" }
+clawcrate-profiles = { path = "../clawcrate-profiles" }
+clawcrate-sandbox = { path = "../clawcrate-sandbox" }
+clawcrate-types = { path = "../clawcrate-types" }
