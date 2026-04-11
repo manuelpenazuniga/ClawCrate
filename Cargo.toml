@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/clawcrate-types",
+    "crates/clawcrate-profiles",
+    "crates/clawcrate-sandbox",
+    "crates/clawcrate-capture",
+    "crates/clawcrate-audit",
+    "crates/clawcrate-cli",
+]
+default-members = ["crates/clawcrate-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0-alpha.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.78"
