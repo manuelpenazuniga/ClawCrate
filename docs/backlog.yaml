@@ -1,0 +1,473 @@
+version: 1
+
+labels:
+  - name: "type:epic"
+    color: "b60205"
+    description: "Large cross-issue initiative"
+  - name: "type:feature"
+    color: "1d76db"
+    description: "Product or engineering feature"
+  - name: "type:infra"
+    color: "5319e7"
+    description: "Build, tooling, or repository plumbing"
+  - name: "type:docs"
+    color: "0e8a16"
+    description: "Documentation work"
+  - name: "type:release"
+    color: "d93f0b"
+    description: "Release prep or shipping tasks"
+  - name: "phase:alpha"
+    color: "fbca04"
+    description: "Alpha delivery scope"
+  - name: "phase:post-alpha"
+    color: "c5def5"
+    description: "Post-alpha roadmap scope"
+  - name: "priority:p0"
+    color: "d73a4a"
+    description: "Critical path"
+  - name: "priority:p1"
+    color: "fbca04"
+    description: "Important but not critical path"
+  - name: "priority:p2"
+    color: "0e8a16"
+    description: "Nice to have"
+  - name: "platform:linux"
+    color: "006b75"
+    description: "Linux-specific scope"
+  - name: "platform:macos"
+    color: "0052cc"
+    description: "macOS-specific scope"
+  - name: "platform:cross-platform"
+    color: "6f42c1"
+    description: "Cross-platform scope"
+  - name: "crate:types"
+    color: "bfd4f2"
+    description: "clawcrate-types"
+  - name: "crate:profiles"
+    color: "bfdadc"
+    description: "clawcrate-profiles"
+  - name: "crate:sandbox"
+    color: "d4c5f9"
+    description: "clawcrate-sandbox"
+  - name: "crate:capture"
+    color: "f9d0c4"
+    description: "clawcrate-capture"
+  - name: "crate:audit"
+    color: "fef2c0"
+    description: "clawcrate-audit"
+  - name: "crate:cli"
+    color: "c2e0c6"
+    description: "clawcrate-cli"
+  - name: "area:repo"
+    color: "ededed"
+    description: "Repository-level work"
+  - name: "area:ci"
+    color: "cfd3d7"
+    description: "CI pipelines and checks"
+  - name: "area:docs"
+    color: "bfdadc"
+    description: "Project documentation"
+  - name: "area:release"
+    color: "f9d0c4"
+    description: "Versioning and release assets"
+
+milestones:
+  - key: "M0"
+    title: "M0 - Workspace Bootstrap"
+    description: "Scaffold workspace and baseline CI."
+  - key: "M1"
+    title: "M1 - Core Contracts + Plan"
+    description: "Core types, profile engine, and plan command."
+  - key: "M2"
+    title: "M2 - Sandbox Backends"
+    description: "Linux and macOS sandbox backend implementation."
+  - key: "M3"
+    title: "M3 - Run + Capture + Audit"
+    description: "End-to-end run, capture, and artifact pipeline."
+  - key: "M4"
+    title: "M4 - Replica Mode"
+    description: "Replica workspace flow and sync-back."
+  - key: "M5"
+    title: "M5 - Alpha Hardening + Release"
+    description: "Polish, CI hardening, docs, and alpha release."
+  - key: "P1"
+    title: "P1 - Network + Approvals"
+    description: "Domain-aware networking and approval workflow."
+  - key: "P2"
+    title: "P2 - Audit DB + API + Integrations"
+    description: "Audit DB, local API, and integrations."
+  - key: "P3"
+    title: "P3 - WSL2"
+    description: "Windows support via WSL2."
+
+epics:
+  - id: "M0-EPIC"
+    milestone: "M0 - Workspace Bootstrap"
+    title: "[EPIC] M0 - Workspace Bootstrap"
+    labels: ["type:epic", "phase:alpha", "priority:p0", "area:repo"]
+    objective: "Turn the repository into a buildable Rust workspace with enforceable quality gates."
+    done_when:
+      - "Workspace compiles on Linux/macOS."
+      - "CI runs fmt, clippy, test, and check."
+      - "Built-in profile files are present in version control."
+
+  - id: "M1-EPIC"
+    milestone: "M1 - Core Contracts + Plan"
+    title: "[EPIC] M1 - Core Contracts + Plan"
+    labels: ["type:epic", "phase:alpha", "priority:p0", "platform:cross-platform"]
+    objective: "Implement shared contracts, profile resolution, and the dry-run planning UX."
+    done_when:
+      - "Core types are stable and serializable."
+      - "Profile resolver works for built-in profiles."
+      - "`clawcrate plan` produces human and JSON output."
+
+  - id: "M2-EPIC"
+    milestone: "M2 - Sandbox Backends"
+    title: "[EPIC] M2 - Sandbox Backends"
+    labels: ["type:epic", "phase:alpha", "priority:p0", "platform:cross-platform", "crate:sandbox"]
+    objective: "Implement native Linux and macOS sandbox backends with capability diagnostics."
+    done_when:
+      - "Linux backend enforces Landlock + seccomp policy."
+      - "macOS backend enforces Seatbelt profile."
+      - "`clawcrate doctor` reports capabilities clearly."
+
+  - id: "M3-EPIC"
+    milestone: "M3 - Run + Capture + Audit"
+    title: "[EPIC] M3 - Run + Capture + Audit"
+    labels: ["type:epic", "phase:alpha", "priority:p0", "platform:cross-platform"]
+    objective: "Deliver end-to-end command execution with logs, fs-diff, and artifacts."
+    done_when:
+      - "`clawcrate run` executes with sandbox applied."
+      - "stdout/stderr and fs-diff are captured."
+      - "All artifact files are emitted per execution."
+
+  - id: "M4-EPIC"
+    milestone: "M4 - Replica Mode"
+    title: "[EPIC] M4 - Replica Mode"
+    labels: ["type:epic", "phase:alpha", "priority:p0", "crate:cli", "platform:cross-platform"]
+    objective: "Ship secure replica workflows, including exclusions and explicit sync-back."
+    done_when:
+      - "Install profile defaults to replica."
+      - "`.env*` and secret files are excluded from copy."
+      - "Sync-back requires explicit confirmation."
+
+  - id: "M5-EPIC"
+    milestone: "M5 - Alpha Hardening + Release"
+    title: "[EPIC] M5 - Alpha Hardening + Release"
+    labels: ["type:epic", "phase:alpha", "priority:p1", "platform:cross-platform"]
+    objective: "Polish alpha UX, harden CI, and publish reproducible release artifacts."
+    done_when:
+      - "CLI polish and golden tests are in place."
+      - "Linux/macOS CI is green."
+      - "Alpha release artifacts and docs are published."
+
+  - id: "P1-EPIC"
+    milestone: "P1 - Network + Approvals"
+    title: "[EPIC] P1 - Network + Approvals"
+    labels: ["type:epic", "phase:post-alpha", "priority:p1", "platform:cross-platform"]
+    objective: "Introduce domain-aware network control and approval workflows."
+    done_when:
+      - "Egress proxy MVP exists with policy controls."
+      - "Sensitive commands can require explicit approval."
+      - "Community profile contribution path is documented."
+
+  - id: "P2-EPIC"
+    milestone: "P2 - Audit DB + API + Integrations"
+    title: "[EPIC] P2 - Audit DB + API + Integrations"
+    labels: ["type:epic", "phase:post-alpha", "priority:p2", "platform:cross-platform"]
+    objective: "Provide queryable audit storage and programmable interfaces."
+    done_when:
+      - "SQLite audit index is functional."
+      - "Local API exposes core operations."
+      - "Integration bridge is available for external tooling."
+
+  - id: "P3-EPIC"
+    milestone: "P3 - WSL2"
+    title: "[EPIC] P3 - WSL2"
+    labels: ["type:epic", "phase:post-alpha", "priority:p2", "platform:linux"]
+    objective: "Define and implement minimum viable support for WSL2 users."
+    done_when:
+      - "Compatibility constraints are documented."
+      - "CI validates baseline WSL2 support."
+      - "Known limitations are explicit in docs."
+
+issues:
+  - id: "M0-01"
+    epic: "M0-EPIC"
+    milestone: "M0 - Workspace Bootstrap"
+    title: "Initialize Rust workspace scaffold (all crates + toolchain)"
+    labels: ["type:infra", "phase:alpha", "priority:p0", "area:repo", "platform:cross-platform"]
+    scope: "Create root workspace files and crate skeletons for `clawcrate-types`, `clawcrate-profiles`, `clawcrate-sandbox`, `clawcrate-capture`, `clawcrate-audit`, and `clawcrate-cli` with minimal compile targets."
+
+  - id: "M0-02"
+    epic: "M0-EPIC"
+    milestone: "M0 - Workspace Bootstrap"
+    title: "Add baseline CI (fmt, clippy, test, check)"
+    labels: ["type:infra", "phase:alpha", "priority:p0", "area:ci", "platform:cross-platform"]
+    scope: "Add GitHub Actions pipelines for Linux and macOS that run `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, and `cargo check --workspace`."
+
+  - id: "M0-03"
+    epic: "M0-EPIC"
+    milestone: "M0 - Workspace Bootstrap"
+    title: "Seed built-in profile YAML files (safe, build, install, open)"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:profiles", "platform:cross-platform"]
+    scope: "Add `profiles/safe.yaml`, `profiles/build.yaml`, `profiles/install.yaml`, and `profiles/open.yaml` with schema-compatible fields and defaults aligned to `CLAUDE.md`."
+
+  - id: "M1-01"
+    epic: "M1-EPIC"
+    milestone: "M1 - Core Contracts + Plan"
+    title: "Implement shared domain types in clawcrate-types"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:types", "platform:cross-platform"]
+    scope: "Implement all public types and enums described in the module specifications, including `ExecutionPlan`, `ExecutionResult`, audit events, modes, profiles, and capability structs."
+
+  - id: "M1-02"
+    epic: "M1-EPIC"
+    milestone: "M1 - Core Contracts + Plan"
+    title: "Add serde roundtrip tests for core types"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:types", "platform:cross-platform"]
+    scope: "Add unit tests that serialize/deserialize representative instances of the key types and assert structural equality."
+
+  - id: "M1-03"
+    epic: "M1-EPIC"
+    milestone: "M1 - Core Contracts + Plan"
+    title: "Implement profile loading and resolution in clawcrate-profiles"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:profiles", "platform:cross-platform"]
+    scope: "Implement YAML loading for built-in and custom profiles, including merge/override behavior to produce `ResolvedProfile`."
+
+  - id: "M1-04"
+    epic: "M1-EPIC"
+    milestone: "M1 - Core Contracts + Plan"
+    title: "Implement stack auto-detection (Cargo.toml, package.json, pyproject.toml)"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:profiles", "platform:cross-platform"]
+    scope: "Implement deterministic stack auto-detection and fallback behavior when no explicit profile is provided."
+
+  - id: "M1-05"
+    epic: "M1-EPIC"
+    milestone: "M1 - Core Contracts + Plan"
+    title: "Implement env scrub + rlimits modules in clawcrate-sandbox"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:sandbox", "platform:cross-platform"]
+    scope: "Implement environment variable scrubbing with pattern rules and cross-platform `setrlimit` application from `ResourceLimits`."
+
+  - id: "M1-06"
+    epic: "M1-EPIC"
+    milestone: "M1 - Core Contracts + Plan"
+    title: "Implement clawcrate plan command (human + --json)"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:cli", "platform:cross-platform"]
+    scope: "Implement CLI parsing for `plan`, profile resolution wiring, and dual output modes (human-readable table and JSON)."
+
+  - id: "M2-01"
+    epic: "M2-EPIC"
+    milestone: "M2 - Sandbox Backends"
+    title: "Implement Linux capability probe (Landlock/seccomp/kernel)"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:sandbox", "platform:linux"]
+    scope: "Implement Linux probe path to detect Landlock ABI availability, seccomp support, and kernel compatibility details."
+
+  - id: "M2-02"
+    epic: "M2-EPIC"
+    milestone: "M2 - Sandbox Backends"
+    title: "Implement Linux sandbox prepare + launch pipeline"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:sandbox", "platform:linux"]
+    scope: "Implement Linux backend `prepare` and `launch` with enforcement order: rlimits -> Landlock -> seccomp -> exec."
+
+  - id: "M2-03"
+    epic: "M2-EPIC"
+    milestone: "M2 - Sandbox Backends"
+    title: "Implement macOS capability probe (sandbox-exec, OS version)"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:sandbox", "platform:macos"]
+    scope: "Implement macOS probe path to validate Seatbelt runtime availability and collect OS diagnostics."
+
+  - id: "M2-04"
+    epic: "M2-EPIC"
+    milestone: "M2 - Sandbox Backends"
+    title: "Implement macOS SBPL generation + launch pipeline"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:sandbox", "platform:macos"]
+    scope: "Implement SBPL generation from `ResolvedProfile` and `sandbox-exec` launch flow with scrubbed env and stream capture."
+
+  - id: "M2-05"
+    epic: "M2-EPIC"
+    milestone: "M2 - Sandbox Backends"
+    title: "Implement clawcrate doctor command wiring"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:cli", "platform:cross-platform"]
+    scope: "Wire `doctor` command to backend probes and emit consistent human/JSON diagnostics."
+
+  - id: "M2-06"
+    epic: "M2-EPIC"
+    milestone: "M2 - Sandbox Backends"
+    title: "Add security fixtures for both platforms"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:sandbox", "platform:cross-platform"]
+    scope: "Add integration fixtures and assertions for blocked secret reads, process restrictions, environment scrubbing, and profile-driven network policy."
+
+  - id: "M3-01"
+    epic: "M3-EPIC"
+    milestone: "M3 - Run + Capture + Audit"
+    title: "Implement stdout/stderr capture with output limits"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:capture", "platform:cross-platform"]
+    scope: "Implement concurrent stream readers, log writers, and max output byte truncation behavior."
+
+  - id: "M3-02"
+    epic: "M3-EPIC"
+    milestone: "M3 - Run + Capture + Audit"
+    title: "Implement filesystem snapshot and diff engine"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:capture", "platform:cross-platform"]
+    scope: "Implement pre/post walk snapshots over writable paths and diff generation with created/modified/deleted classification."
+
+  - id: "M3-03"
+    epic: "M3-EPIC"
+    milestone: "M3 - Run + Capture + Audit"
+    title: "Implement artifact writer (plan.json, result.json, audit.ndjson, fs-diff.json)"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:audit", "platform:cross-platform"]
+    scope: "Implement artifact directory setup and writers for all required per-execution outputs."
+
+  - id: "M3-04"
+    epic: "M3-EPIC"
+    milestone: "M3 - Run + Capture + Audit"
+    title: "Implement clawcrate run end-to-end pipeline"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:cli", "platform:cross-platform"]
+    scope: "Wire full run flow from argument parsing through plan creation, backend launch, capture, fs-diff, and final summary output."
+
+  - id: "M3-05"
+    epic: "M3-EPIC"
+    milestone: "M3 - Run + Capture + Audit"
+    title: "Add signal handling and timeout behavior"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:cli", "platform:cross-platform"]
+    scope: "Handle SIGINT/SIGTERM forwarding and timeout-based child termination while preserving final artifact integrity."
+
+  - id: "M4-01"
+    epic: "M4-EPIC"
+    milestone: "M4 - Replica Mode"
+    title: "Implement replica copy engine with default exclusions"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:cli", "platform:cross-platform"]
+    scope: "Implement workspace copy to temporary location and enforce default secret exclusions (`.env`, `.env.*`, `.git/config`)."
+
+  - id: "M4-02"
+    epic: "M4-EPIC"
+    milestone: "M4 - Replica Mode"
+    title: "Implement .clawcrateignore parser and matching"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:cli", "platform:cross-platform"]
+    scope: "Implement ignore rule parsing compatible with `.gitignore`-style matching for replica copy filtering."
+
+  - id: "M4-03"
+    epic: "M4-EPIC"
+    milestone: "M4 - Replica Mode"
+    title: "Materialize DefaultMode -> WorkspaceMode in CLI"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:cli", "platform:cross-platform"]
+    scope: "Implement precedence logic for profile defaults and `--replica/--direct` overrides, then materialize concrete runtime paths."
+
+  - id: "M4-04"
+    epic: "M4-EPIC"
+    milestone: "M4 - Replica Mode"
+    title: "Implement sync-back confirmation flow (--json non-interactive)"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:cli", "platform:cross-platform"]
+    scope: "Implement explicit sync-back prompt for interactive mode and deterministic non-sync behavior in JSON mode."
+
+  - id: "M4-05"
+    epic: "M4-EPIC"
+    milestone: "M4 - Replica Mode"
+    title: "Add integration tests for install defaulting to replica"
+    labels: ["type:feature", "phase:alpha", "priority:p0", "crate:cli", "platform:cross-platform"]
+    scope: "Add integration coverage to ensure `install` profile defaults to replica and keeps secret files out of the copied workspace."
+
+  - id: "M5-01"
+    epic: "M5-EPIC"
+    milestone: "M5 - Alpha Hardening + Release"
+    title: "Polish CLI errors, --verbose, and NO_COLOR support"
+    labels: ["type:feature", "phase:alpha", "priority:p1", "crate:cli", "platform:cross-platform"]
+    scope: "Improve user-facing error messages, add `--verbose` behavior, and ensure `NO_COLOR` output compliance."
+
+  - id: "M5-02"
+    epic: "M5-EPIC"
+    milestone: "M5 - Alpha Hardening + Release"
+    title: "Add golden tests for plan, run, doctor"
+    labels: ["type:feature", "phase:alpha", "priority:p1", "crate:cli", "area:ci", "platform:cross-platform"]
+    scope: "Add stable golden-output tests for all user-facing command paths in both text and JSON modes where relevant."
+
+  - id: "M5-03"
+    epic: "M5-EPIC"
+    milestone: "M5 - Alpha Hardening + Release"
+    title: "Complete alpha docs pack"
+    labels: ["type:docs", "phase:alpha", "priority:p1", "area:docs", "platform:cross-platform"]
+    scope: "Publish architecture, profiles reference, kernel requirements, and integration guides aligned to implemented behavior."
+
+  - id: "M5-04"
+    epic: "M5-EPIC"
+    milestone: "M5 - Alpha Hardening + Release"
+    title: "Add Linux/macOS CI matrix with security fixtures"
+    labels: ["type:infra", "phase:alpha", "priority:p1", "area:ci", "platform:cross-platform"]
+    scope: "Extend CI matrix to execute integration and security fixture suites on both Linux and macOS runners."
+
+  - id: "M5-05"
+    epic: "M5-EPIC"
+    milestone: "M5 - Alpha Hardening + Release"
+    title: "Implement release artifacts + install script + checksums"
+    labels: ["type:release", "phase:alpha", "priority:p1", "area:release", "platform:cross-platform"]
+    scope: "Build multi-target binaries, generate checksums, and automate install script behavior for platform/arch selection."
+
+  - id: "M5-06"
+    epic: "M5-EPIC"
+    milestone: "M5 - Alpha Hardening + Release"
+    title: "Execute alpha release checklist and tag release"
+    labels: ["type:release", "phase:alpha", "priority:p1", "area:release", "platform:cross-platform"]
+    scope: "Prepare changelog, validate release criteria, and publish a tagged alpha release with attached artifacts."
+
+  - id: "P1-01"
+    epic: "P1-EPIC"
+    milestone: "P1 - Network + Approvals"
+    title: "Draft egress proxy design doc + threat model"
+    labels: ["type:feature", "phase:post-alpha", "priority:p1", "crate:sandbox", "area:docs", "platform:cross-platform"]
+    scope: "Define architecture, trust boundaries, and failure modes for local egress proxy-based domain controls."
+
+  - id: "P1-02"
+    epic: "P1-EPIC"
+    milestone: "P1 - Network + Approvals"
+    title: "Build egress proxy MVP with SNI/domain filtering"
+    labels: ["type:feature", "phase:post-alpha", "priority:p1", "crate:sandbox", "platform:cross-platform"]
+    scope: "Implement first functional proxy path for allow/deny domain rules and integrate with profile policy model."
+
+  - id: "P1-03"
+    epic: "P1-EPIC"
+    milestone: "P1 - Network + Approvals"
+    title: "Add approval workflow for commands exceeding profile permissions"
+    labels: ["type:feature", "phase:post-alpha", "priority:p1", "crate:cli", "platform:cross-platform"]
+    scope: "Implement interactive approval prompts when commands request permissions outside the active profile."
+
+  - id: "P1-04"
+    epic: "P1-EPIC"
+    milestone: "P1 - Network + Approvals"
+    title: "Define community profile catalog and contribution flow"
+    labels: ["type:docs", "phase:post-alpha", "priority:p2", "crate:profiles", "area:docs", "platform:cross-platform"]
+    scope: "Define repository structure, schema validation, and contribution review flow for community-maintained profiles."
+
+  - id: "P2-01"
+    epic: "P2-EPIC"
+    milestone: "P2 - Audit DB + API + Integrations"
+    title: "Implement SQLite audit indexing layer"
+    labels: ["type:feature", "phase:post-alpha", "priority:p2", "crate:audit", "platform:cross-platform"]
+    scope: "Add optional SQLite indexing for run metadata and audit events while preserving existing file artifacts."
+
+  - id: "P2-02"
+    epic: "P2-EPIC"
+    milestone: "P2 - Audit DB + API + Integrations"
+    title: "Implement local HTTP API for agent integrations"
+    labels: ["type:feature", "phase:post-alpha", "priority:p2", "crate:cli", "platform:cross-platform"]
+    scope: "Expose core operations through a local authenticated API surface for tool integrations."
+
+  - id: "P2-03"
+    epic: "P2-EPIC"
+    milestone: "P2 - Audit DB + API + Integrations"
+    title: "Implement PennyPrompt integration bridge"
+    labels: ["type:feature", "phase:post-alpha", "priority:p2", "crate:cli", "platform:cross-platform"]
+    scope: "Implement an adapter layer allowing PennyPrompt to dispatch shell operations through ClawCrate."
+
+  - id: "P3-01"
+    epic: "P3-EPIC"
+    milestone: "P3 - WSL2"
+    title: "Run WSL2 compatibility spike and constraints report"
+    labels: ["type:feature", "phase:post-alpha", "priority:p2", "crate:sandbox", "platform:linux"]
+    scope: "Assess Landlock/seccomp capability behavior under WSL2 and document constraints, workarounds, and unsupported cases."
+
+  - id: "P3-02"
+    epic: "P3-EPIC"
+    milestone: "P3 - WSL2"
+    title: "Add WSL2 CI lane and minimal support baseline"
+    labels: ["type:infra", "phase:post-alpha", "priority:p2", "area:ci", "platform:linux"]
+    scope: "Add CI execution path for WSL2 compatibility checks and define minimum supported behavior for documentation."
