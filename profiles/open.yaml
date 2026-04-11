@@ -1,0 +1,37 @@
+name: open
+default_mode: Direct
+
+filesystem:
+  read:
+    - "."
+  write:
+    - "."
+  deny: []
+
+network: open
+
+environment:
+  scrub:
+    - "AWS_*"
+    - "*_SECRET*"
+    - "*_PASSWORD*"
+    - "*_TOKEN*"
+    - "SSH_AUTH_SOCK"
+    - "GOOGLE_APPLICATION_CREDENTIALS"
+  passthrough:
+    - "HOME"
+    - "PATH"
+    - "USER"
+    - "SHELL"
+    - "TERM"
+    - "LANG"
+    - "LC_*"
+    - "TMPDIR"
+    - "XDG_*"
+
+resources:
+  max_cpu_seconds: 1800
+  max_memory_mb: 8192
+  max_open_files: 8192
+  max_processes: 1024
+  max_output_bytes: 16777216
