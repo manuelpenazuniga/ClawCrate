@@ -58,7 +58,11 @@ fn resolved_profile_roundtrip() {
 fn execution_plan_roundtrip() {
     let value = ExecutionPlan {
         id: "0195a4d2-3f72-7a1b-b7af-a9fd8f24d9e2".to_string(),
-        command: vec!["cargo".to_string(), "test".to_string(), "--workspace".to_string()],
+        command: vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "--workspace".to_string(),
+        ],
         cwd: PathBuf::from("/work/clawcrate"),
         profile: sample_profile(),
         mode: WorkspaceMode::Replica {
