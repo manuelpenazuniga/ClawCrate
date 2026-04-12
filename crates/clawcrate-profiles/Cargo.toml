@@ -11,3 +11,6 @@ path = "src/lib.rs"
 
 [dependencies]
 clawcrate-types = { path = "../clawcrate-types" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
