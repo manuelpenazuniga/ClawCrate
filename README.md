@@ -300,6 +300,7 @@ cargo clippy --workspace -- -D warnings
 ```
 
 See [CLAUDE.md](CLAUDE.md) for the complete development guide with architecture decisions, coding standards, and step-by-step build instructions.
+See [docs/WORKFLOW.md](docs/WORKFLOW.md) for the operational issue-to-PR workflow used in this repository.
 
 ## License
 
@@ -310,4 +311,3 @@ MIT — see [LICENSE](LICENSE).
 <p align="center">
   <strong>Your agent runs free. Your secrets stay locked.</strong>
 </p>
-
