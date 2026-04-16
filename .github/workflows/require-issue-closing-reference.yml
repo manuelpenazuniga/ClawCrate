@@ -1,0 +1,43 @@
+name: PR Issue Closing Reference
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+
+jobs:
+  require-closing-reference:
+    if: ${{ github.event.pull_request.base.ref == 'main' && github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR body has auto-close reference
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${PR_BODY:-}" ]]; then
+            echo "PR body is empty."
+            echo "Add one of: 'Closes #123', 'Fixes #123', or 'Resolves #123'."
+            exit 1
+          fi
+
+          pattern='(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+((#[0-9]+)|(https://github\.com/[^/]+/[^/]+/issues/[0-9]+)|([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+))'
+          if printf '%s\n' "$PR_BODY" | grep -Eiq "$pattern"; then
+            echo "Found issue auto-close reference."
+            exit 0
+          fi
+
+          echo "Missing issue auto-close reference in PR body."
+          echo "Add one of these lines:"
+          echo "  Closes #123"
+          echo "  Fixes #123"
+          echo "  Resolves #123"
+          exit 1
