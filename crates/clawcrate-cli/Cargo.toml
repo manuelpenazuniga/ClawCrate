@@ -11,8 +11,14 @@ name = "clawcrate"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
 clawcrate-audit = { path = "../clawcrate-audit" }
 clawcrate-capture = { path = "../clawcrate-capture" }
 clawcrate-profiles = { path = "../clawcrate-profiles" }
 clawcrate-sandbox = { path = "../clawcrate-sandbox" }
 clawcrate-types = { path = "../clawcrate-types" }
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+serde_json = "1"
+uuid = { version = "1", features = ["v7"] }
