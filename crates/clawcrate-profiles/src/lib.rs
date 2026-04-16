@@ -9,6 +9,14 @@ use serde::Deserialize;
 
 pub const BUILTIN_PROFILE_NAMES: [&str; 4] = ["safe", "build", "install", "open"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectedStack {
+    Rust,
+    Node,
+    Python,
+    Unknown,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileError {
     #[error("profile not found: {0}")]
@@ -79,6 +87,25 @@ impl ProfileResolver {
         let entry = ProfileEntry::Path(path.as_ref().to_path_buf());
         let inherited = self.resolve_entry(&entry, None, &mut HashSet::new())?;
         self.to_resolved_profile(inherited, entry.fallback_name())
+    }
+
+    pub fn detect_stack(&self, workspace_root: impl AsRef<Path>) -> DetectedStack {
+        detect_stack(workspace_root.as_ref())
+    }
+
+    pub fn resolve_auto(
+        &self,
+        workspace_root: impl AsRef<Path>,
+    ) -> Result<ResolvedProfile, ProfileError> {
+        let stack = detect_stack(workspace_root.as_ref());
+        let mut resolved = match stack {
+            DetectedStack::Unknown => self.resolve_builtin("safe")?,
+            DetectedStack::Rust | DetectedStack::Node | DetectedStack::Python => {
+                self.resolve_builtin("build")?
+            }
+        };
+        apply_stack_overrides(&mut resolved, stack);
+        Ok(resolved)
     }
 
     fn resolve_entry(
@@ -369,13 +396,64 @@ fn load_raw_profile(path: &Path) -> Result<RawProfile, ProfileError> {
     })
 }
 
+fn detect_stack(workspace_root: &Path) -> DetectedStack {
+    if !workspace_root.is_dir() {
+        return DetectedStack::Unknown;
+    }
+
+    if workspace_root.join("Cargo.toml").is_file() {
+        return DetectedStack::Rust;
+    }
+    if workspace_root.join("package.json").is_file() {
+        return DetectedStack::Node;
+    }
+    if workspace_root.join("pyproject.toml").is_file() {
+        return DetectedStack::Python;
+    }
+
+    DetectedStack::Unknown
+}
+
+fn apply_stack_overrides(profile: &mut ResolvedProfile, stack: DetectedStack) {
+    match stack {
+        DetectedStack::Rust | DetectedStack::Unknown => {}
+        DetectedStack::Node => {
+            push_unique_path(&mut profile.fs_read, "~/.npm");
+            push_unique_path(&mut profile.fs_read, "~/.pnpm-store");
+            push_unique_path(&mut profile.fs_write, "./node_modules");
+            push_unique_path(&mut profile.fs_write, "~/.npm");
+            push_unique_path(&mut profile.fs_write, "~/.pnpm-store");
+            push_unique_string(&mut profile.env_passthrough, "NPM_CONFIG_CACHE");
+        }
+        DetectedStack::Python => {
+            push_unique_path(&mut profile.fs_read, "~/.cache/pip");
+            push_unique_path(&mut profile.fs_write, "./.venv");
+            push_unique_path(&mut profile.fs_write, "~/.cache/pip");
+            push_unique_string(&mut profile.env_passthrough, "PIP_CACHE_DIR");
+        }
+    }
+}
+
+fn push_unique_path(values: &mut Vec<PathBuf>, candidate: &str) {
+    let path = PathBuf::from(candidate);
+    if values.iter().all(|existing| existing != &path) {
+        values.push(path);
+    }
+}
+
+fn push_unique_string(values: &mut Vec<String>, candidate: &str) {
+    if values.iter().all(|existing| existing != candidate) {
+        values.push(candidate.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::ProfileResolver;
+    use super::{DetectedStack, ProfileResolver};
     use clawcrate_types::{DefaultMode, NetLevel};
 
     fn unique_tmp_dir(prefix: &str) -> PathBuf {
@@ -485,5 +563,79 @@ network: open
         assert_eq!(resolved.net, NetLevel::Open);
         assert_eq!(resolved.fs_write, vec![PathBuf::from("./target")]);
         assert_eq!(resolved.resources.max_cpu_seconds, 100);
+    }
+
+    #[test]
+    fn detects_stack_with_deterministic_priority() {
+        let resolver = ProfileResolver::default();
+        let tmp = unique_tmp_dir("clawcrate_profiles_detect_priority");
+        write(
+            &tmp.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        );
+        write(&tmp.join("package.json"), "{ \"name\": \"demo\" }\n");
+        write(&tmp.join("pyproject.toml"), "[project]\nname='demo'\n");
+
+        let stack = resolver.detect_stack(&tmp);
+        assert_eq!(stack, DetectedStack::Rust);
+    }
+
+    #[test]
+    fn detects_node_when_only_package_json_exists() {
+        let resolver = ProfileResolver::default();
+        let tmp = unique_tmp_dir("clawcrate_profiles_detect_node");
+        write(&tmp.join("package.json"), "{ \"name\": \"demo\" }\n");
+
+        let stack = resolver.detect_stack(&tmp);
+        assert_eq!(stack, DetectedStack::Node);
+    }
+
+    #[test]
+    fn resolves_auto_with_safe_fallback_when_stack_is_unknown() {
+        let resolver = ProfileResolver::default();
+        let tmp = unique_tmp_dir("clawcrate_profiles_resolve_auto_safe");
+
+        let profile = resolver.resolve_auto(&tmp).expect("resolve auto fallback");
+        assert_eq!(profile.name, "safe");
+        assert_eq!(profile.default_mode, DefaultMode::Direct);
+        assert_eq!(profile.net, NetLevel::None);
+        assert!(profile.fs_write.is_empty());
+    }
+
+    #[test]
+    fn resolves_auto_with_node_overrides() {
+        let resolver = ProfileResolver::default();
+        let tmp = unique_tmp_dir("clawcrate_profiles_resolve_auto_node");
+        write(&tmp.join("package.json"), "{ \"name\": \"demo\" }\n");
+
+        let profile = resolver
+            .resolve_auto(&tmp)
+            .expect("resolve node auto profile");
+        assert_eq!(profile.name, "build");
+        assert!(profile
+            .fs_write
+            .iter()
+            .any(|it| it == Path::new("./node_modules")));
+        assert!(profile
+            .env_passthrough
+            .iter()
+            .any(|it| it == "NPM_CONFIG_CACHE"));
+    }
+
+    #[test]
+    fn resolves_auto_with_python_overrides() {
+        let resolver = ProfileResolver::default();
+        let tmp = unique_tmp_dir("clawcrate_profiles_resolve_auto_python");
+        write(&tmp.join("pyproject.toml"), "[project]\nname='demo'\n");
+
+        let profile = resolver
+            .resolve_auto(&tmp)
+            .expect("resolve python auto profile");
+        assert_eq!(profile.name, "build");
+        assert!(profile.fs_write.iter().any(|it| it == Path::new("./.venv")));
+        assert!(profile
+            .env_passthrough
+            .iter()
+            .any(|it| it == "PIP_CACHE_DIR"));
     }
 }
