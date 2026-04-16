@@ -4,3 +4,8 @@ clawcrate-v3.1.1
 clawcrate-v3.1.1.md
 claude.md
 CLAUDE.md
+
+# Local-only files (do not commit)
+.github/pull_request_template.md
+.github/workflows/require-issue-closing-reference.yml
+error.log
