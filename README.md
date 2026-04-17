@@ -191,7 +191,7 @@ clawcrate run --replica --profile build -- cargo test
 clawcrate run --direct --profile install -- npm install
 ```
 
-What gets excluded from the replica: `.env`, `.env.*`, `.git/config`, and anything in `.clawcrateignore`.
+Current default exclusions in replica copy: `.env`, `.env.*`, `.git/config`.
 
 **Syncing changes back always requires explicit confirmation. It never happens automatically.**
 
