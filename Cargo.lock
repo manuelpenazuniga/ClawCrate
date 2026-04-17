@@ -173,6 +173,7 @@ name = "clawcrate-capture"
 version = "0.1.0-alpha.0"
 dependencies = [
  "clawcrate-types",
+ "thiserror",
 ]
 
 [[package]]
