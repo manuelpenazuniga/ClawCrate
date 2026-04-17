@@ -141,6 +141,10 @@ impl DarwinSandboxedChild {
         self.child.id()
     }
 
+    pub fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
     pub fn sbpl_profile_path(&self) -> &Path {
         &self.sbpl_profile_path
     }

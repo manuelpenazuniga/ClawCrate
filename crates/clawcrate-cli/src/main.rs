@@ -1,19 +1,34 @@
 #![forbid(unsafe_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use clap::{ArgAction, Args, Parser, Subcommand};
+use clawcrate_audit::ArtifactWriter;
+use clawcrate_capture::{
+    capture_streams, diff_snapshots, snapshot_paths, CaptureConfig, CaptureError, CaptureSummary,
+    FsChange,
+};
 use clawcrate_profiles::ProfileResolver;
+#[cfg(target_os = "macos")]
+use clawcrate_sandbox::darwin::DarwinSandbox;
+#[cfg(target_os = "linux")]
+use clawcrate_sandbox::linux::LinuxSandbox;
 #[cfg(target_os = "linux")]
 use clawcrate_sandbox::linux_probe::probe_linux_capabilities;
 #[cfg(target_os = "macos")]
 use clawcrate_sandbox::macos_probe::probe_macos_capabilities;
 use clawcrate_types::{
-    Actor, DefaultMode, ExecutionPlan, Platform, SystemCapabilities, WorkspaceMode,
+    Actor, AuditEvent, AuditEventKind, DefaultMode, ExecutionPlan, ExecutionResult, Platform,
+    Status, SystemCapabilities, WorkspaceMode,
 };
 use comfy_table::{Cell, Table};
+use serde::Serialize;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -80,9 +95,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Plan(args) => handle_plan(&resolver, args),
-        Commands::Run(_) => Err(anyhow!(
-            "`run` is not implemented yet. Use `clawcrate plan -- ...` for now."
-        )),
+        Commands::Run(args) => handle_run(&resolver, args),
         Commands::Doctor(args) => handle_doctor(args),
     }
 }
@@ -99,6 +112,369 @@ fn handle_plan(resolver: &ProfileResolver, args: CommandArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct RunExecutionOutcome {
+    backend: String,
+    scrubbed_keys: Vec<String>,
+    exit_status: ExitStatus,
+    capture_summary: CaptureSummary,
+}
+
+#[derive(Debug)]
+struct RunPipelineResult {
+    execution: RunExecutionOutcome,
+    fs_diff: Vec<FsChange>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunSummary {
+    result: ExecutionResult,
+    backend: String,
+    scrubbed_env_vars: usize,
+    fs_changes: usize,
+    output_truncated: bool,
+    dropped_output_bytes: u64,
+    stdout_log: PathBuf,
+    stderr_log: PathBuf,
+}
+
+fn handle_run(resolver: &ProfileResolver, args: CommandArgs) -> Result<()> {
+    let cwd =
+        std::env::current_dir().map_err(|source| anyhow!("failed to get current dir: {source}"))?;
+    let plan = build_execution_plan(resolver, &cwd, &args)?;
+    let writer = ArtifactWriter::new(&runs_root()?, &plan.id)
+        .map_err(|source| anyhow!("failed to initialize artifact writer: {source}"))?;
+
+    writer
+        .write_plan(&plan)
+        .map_err(|source| anyhow!("failed to write plan artifact: {source}"))?;
+
+    let started_at = Instant::now();
+    let pipeline = match execute_run_pipeline(&plan, &writer) {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            persist_sandbox_error_result(
+                &writer,
+                &plan.id,
+                started_at.elapsed().as_millis() as u64,
+                &error,
+            )?;
+            return Err(error);
+        }
+    };
+
+    writer
+        .write_fs_diff(&pipeline.fs_diff)
+        .map_err(|source| anyhow!("failed to write fs-diff artifact: {source}"))?;
+
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+    append_audit_event(
+        &writer,
+        AuditEventKind::ProcessExited {
+            exit_code: pipeline.execution.exit_status.code().unwrap_or(-1),
+            duration_ms,
+        },
+    )?;
+
+    let result = ExecutionResult {
+        id: plan.id.clone(),
+        exit_code: pipeline.execution.exit_status.code(),
+        status: execution_status_from_exit_status(&pipeline.execution.exit_status),
+        duration_ms,
+        artifacts_dir: writer.artifacts_dir().to_path_buf(),
+    };
+    writer
+        .write_result(&result)
+        .map_err(|source| anyhow!("failed to write result artifact: {source}"))?;
+
+    let summary = RunSummary {
+        result,
+        backend: pipeline.execution.backend,
+        scrubbed_env_vars: pipeline.execution.scrubbed_keys.len(),
+        fs_changes: pipeline.fs_diff.len(),
+        output_truncated: pipeline.execution.capture_summary.truncated,
+        dropped_output_bytes: pipeline.execution.capture_summary.total_dropped_bytes,
+        stdout_log: writer.artifacts_dir().join("stdout.log"),
+        stderr_log: writer.artifacts_dir().join("stderr.log"),
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        print_human_run_summary(&summary);
+    }
+
+    Ok(())
+}
+
+fn execute_run_pipeline(
+    plan: &ExecutionPlan,
+    writer: &ArtifactWriter,
+) -> Result<RunPipelineResult> {
+    ensure_workspace_mode_supported(plan)?;
+    let fs_diff_roots = resolve_fs_diff_roots(plan);
+    let snapshot_before = snapshot_paths(&fs_diff_roots).map_err(|source| {
+        anyhow!("failed to snapshot writable paths before execution: {source}")
+    })?;
+
+    let capture_config = CaptureConfig {
+        artifacts_dir: writer.artifacts_dir().to_path_buf(),
+        max_output_bytes: plan.profile.resources.max_output_bytes,
+    };
+    let execution = launch_and_capture(plan, writer, &capture_config)?;
+
+    let snapshot_after = snapshot_paths(&fs_diff_roots)
+        .map_err(|source| anyhow!("failed to snapshot writable paths after execution: {source}"))?;
+    let fs_diff = diff_snapshots(&snapshot_before, &snapshot_after);
+
+    Ok(RunPipelineResult { execution, fs_diff })
+}
+
+fn ensure_workspace_mode_supported(plan: &ExecutionPlan) -> Result<()> {
+    if matches!(plan.mode, WorkspaceMode::Replica { .. }) {
+        return Err(anyhow!(
+            "replica mode execution is not implemented yet in `run`; use `--direct` for now"
+        ));
+    }
+    Ok(())
+}
+
+fn runs_root() -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join(".clawcrate").join("runs"));
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|source| anyhow!("failed to resolve current dir: {source}"))?;
+    Ok(cwd.join(".clawcrate").join("runs"))
+}
+
+fn resolve_fs_diff_roots(plan: &ExecutionPlan) -> Vec<PathBuf> {
+    plan.profile
+        .fs_write
+        .iter()
+        .map(|path| resolve_execution_path(&plan.cwd, path))
+        .collect()
+}
+
+fn resolve_execution_path(cwd: &Path, path: &Path) -> PathBuf {
+    let expanded = expand_home(path);
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    }
+}
+
+fn expand_home(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if path_str == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    if let Some(rest) = path_str.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn append_audit_event(writer: &ArtifactWriter, event: AuditEventKind) -> Result<()> {
+    writer
+        .append_audit_event(&AuditEvent {
+            timestamp: Utc::now(),
+            event,
+        })
+        .map_err(|source| anyhow!("failed to append audit event: {source}"))
+}
+
+fn persist_sandbox_error_result(
+    writer: &ArtifactWriter,
+    execution_id: &str,
+    duration_ms: u64,
+    error: &anyhow::Error,
+) -> Result<()> {
+    writer
+        .write_fs_diff(&Vec::<FsChange>::new())
+        .map_err(|source| anyhow!("failed to write empty fs-diff artifact: {source}"))?;
+
+    let result = ExecutionResult {
+        id: execution_id.to_string(),
+        exit_code: None,
+        status: Status::SandboxError(error.to_string()),
+        duration_ms,
+        artifacts_dir: writer.artifacts_dir().to_path_buf(),
+    };
+    writer
+        .write_result(&result)
+        .map_err(|source| anyhow!("failed to write sandbox error result: {source}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn launch_and_capture(
+    plan: &ExecutionPlan,
+    writer: &ArtifactWriter,
+    capture_config: &CaptureConfig,
+) -> Result<RunExecutionOutcome> {
+    let sandbox = LinuxSandbox::new();
+    let prepared = sandbox.prepare(plan);
+    let scrubbed_keys = prepared.scrubbed_keys.clone();
+
+    append_audit_event(
+        writer,
+        AuditEventKind::SandboxApplied {
+            backend: "linux".to_string(),
+            capabilities: vec![
+                "rlimits".to_string(),
+                "landlock".to_string(),
+                "seccomp".to_string(),
+            ],
+        },
+    )?;
+    if !scrubbed_keys.is_empty() {
+        append_audit_event(
+            writer,
+            AuditEventKind::EnvScrubbed {
+                removed: scrubbed_keys.clone(),
+            },
+        )?;
+    }
+
+    let mut child = sandbox
+        .launch(&prepared)
+        .map_err(|source| anyhow!("failed to launch linux sandbox: {source}"))?;
+    let pid = child.pid();
+    append_audit_event(
+        writer,
+        AuditEventKind::ProcessStarted {
+            pid,
+            command: plan.command.clone(),
+        },
+    )?;
+
+    let stdout = child
+        .child_mut()
+        .stdout
+        .take()
+        .ok_or(CaptureError::MissingStdoutPipe)
+        .map_err(|source| anyhow!("failed to capture stdout pipe: {source}"))?;
+    let stderr = child
+        .child_mut()
+        .stderr
+        .take()
+        .ok_or(CaptureError::MissingStderrPipe)
+        .map_err(|source| anyhow!("failed to capture stderr pipe: {source}"))?;
+    let capture_summary = capture_streams(stdout, stderr, capture_config)
+        .map_err(|source| anyhow!("failed to capture process output: {source}"))?;
+    let exit_status = child
+        .wait()
+        .map_err(CaptureError::WaitChild)
+        .map_err(|source| anyhow!("failed while waiting for process exit: {source}"))?;
+
+    Ok(RunExecutionOutcome {
+        backend: "linux".to_string(),
+        scrubbed_keys,
+        exit_status,
+        capture_summary,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn launch_and_capture(
+    plan: &ExecutionPlan,
+    writer: &ArtifactWriter,
+    capture_config: &CaptureConfig,
+) -> Result<RunExecutionOutcome> {
+    let sandbox = DarwinSandbox::new();
+    let prepared = sandbox.prepare(plan);
+    let scrubbed_keys = prepared.scrubbed_keys.clone();
+
+    append_audit_event(
+        writer,
+        AuditEventKind::SandboxApplied {
+            backend: "macos-seatbelt".to_string(),
+            capabilities: vec!["seatbelt".to_string()],
+        },
+    )?;
+    if !scrubbed_keys.is_empty() {
+        append_audit_event(
+            writer,
+            AuditEventKind::EnvScrubbed {
+                removed: scrubbed_keys.clone(),
+            },
+        )?;
+    }
+
+    let mut child = sandbox
+        .launch(&prepared)
+        .map_err(|source| anyhow!("failed to launch macOS sandbox: {source}"))?;
+    let pid = child.pid();
+    append_audit_event(
+        writer,
+        AuditEventKind::ProcessStarted {
+            pid,
+            command: plan.command.clone(),
+        },
+    )?;
+
+    let stdout = child
+        .child_mut()
+        .stdout
+        .take()
+        .ok_or(CaptureError::MissingStdoutPipe)
+        .map_err(|source| anyhow!("failed to capture stdout pipe: {source}"))?;
+    let stderr = child
+        .child_mut()
+        .stderr
+        .take()
+        .ok_or(CaptureError::MissingStderrPipe)
+        .map_err(|source| anyhow!("failed to capture stderr pipe: {source}"))?;
+    let capture_summary = capture_streams(stdout, stderr, capture_config)
+        .map_err(|source| anyhow!("failed to capture process output: {source}"))?;
+    let exit_status = child
+        .wait()
+        .map_err(CaptureError::WaitChild)
+        .map_err(|source| anyhow!("failed while waiting for process exit: {source}"))?;
+
+    Ok(RunExecutionOutcome {
+        backend: "macos-seatbelt".to_string(),
+        scrubbed_keys,
+        exit_status,
+        capture_summary,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn launch_and_capture(
+    _plan: &ExecutionPlan,
+    _writer: &ArtifactWriter,
+    _capture_config: &CaptureConfig,
+) -> Result<RunExecutionOutcome> {
+    Err(anyhow!("unsupported platform for `run` command"))
+}
+
+fn execution_status_from_exit_status(status: &ExitStatus) -> Status {
+    if status.success() {
+        return Status::Success;
+    }
+    if terminated_by_signal(status) {
+        return Status::Killed;
+    }
+    Status::Failed
+}
+
+#[cfg(unix)]
+fn terminated_by_signal(status: &ExitStatus) -> bool {
+    status.signal().is_some()
+}
+
+#[cfg(not(unix))]
+fn terminated_by_signal(_status: &ExitStatus) -> bool {
+    false
 }
 
 fn build_execution_plan(
@@ -264,6 +640,78 @@ fn platform_label(platform: &Platform) -> String {
     }
 }
 
+fn print_human_run_summary(summary: &RunSummary) {
+    let mut table = Table::new();
+    table
+        .set_header(vec!["Field", "Value"])
+        .add_row(vec![
+            Cell::new("Execution ID"),
+            Cell::new(&summary.result.id),
+        ])
+        .add_row(vec![
+            Cell::new("Status"),
+            Cell::new(status_label(&summary.result.status)),
+        ])
+        .add_row(vec![
+            Cell::new("Exit Code"),
+            Cell::new(
+                summary
+                    .result
+                    .exit_code
+                    .map_or_else(|| "n/a".to_string(), |code| code.to_string()),
+            ),
+        ])
+        .add_row(vec![
+            Cell::new("Duration"),
+            Cell::new(format!("{} ms", summary.result.duration_ms)),
+        ])
+        .add_row(vec![Cell::new("Backend"), Cell::new(&summary.backend)])
+        .add_row(vec![
+            Cell::new("Env Vars Scrubbed"),
+            Cell::new(summary.scrubbed_env_vars.to_string()),
+        ])
+        .add_row(vec![
+            Cell::new("FS Changes"),
+            Cell::new(summary.fs_changes.to_string()),
+        ])
+        .add_row(vec![
+            Cell::new("Output Truncated"),
+            Cell::new(if summary.output_truncated {
+                "yes"
+            } else {
+                "no"
+            }),
+        ])
+        .add_row(vec![
+            Cell::new("Dropped Output"),
+            Cell::new(format!("{} bytes", summary.dropped_output_bytes)),
+        ])
+        .add_row(vec![
+            Cell::new("Artifacts Directory"),
+            Cell::new(summary.result.artifacts_dir.display().to_string()),
+        ])
+        .add_row(vec![
+            Cell::new("stdout.log"),
+            Cell::new(summary.stdout_log.display().to_string()),
+        ])
+        .add_row(vec![
+            Cell::new("stderr.log"),
+            Cell::new(summary.stderr_log.display().to_string()),
+        ]);
+
+    println!("{table}");
+}
+
+fn status_label(status: &Status) -> String {
+    match status {
+        Status::Success => "success".to_string(),
+        Status::Failed => "failed".to_string(),
+        Status::Timeout => "timeout".to_string(),
+        Status::Killed => "killed".to_string(),
+        Status::SandboxError(message) => format!("sandbox_error: {message}"),
+    }
+}
+
 fn print_human_plan(plan: &ExecutionPlan) {
     let mut table = Table::new();
     table
@@ -312,12 +760,17 @@ fn print_human_plan(plan: &ExecutionPlan) {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{build_execution_plan, doctor_rows, select_default_mode, CommandArgs};
+    use super::{
+        build_execution_plan, doctor_rows, ensure_workspace_mode_supported,
+        execution_status_from_exit_status, resolve_execution_path, select_default_mode,
+        CommandArgs,
+    };
     use clap::Parser;
     use clawcrate_profiles::ProfileResolver;
-    use clawcrate_types::{DefaultMode, Platform, SystemCapabilities, WorkspaceMode};
+    use clawcrate_types::{DefaultMode, Platform, Status, SystemCapabilities, WorkspaceMode};
 
     fn unique_tmp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -475,5 +928,54 @@ mod tests {
         assert!(rows
             .iter()
             .any(|(name, value)| name == "Landlock ABI" && value == "n/a"));
+    }
+
+    #[test]
+    fn resolve_execution_path_expands_relative_and_home_paths() {
+        let cwd = PathBuf::from("/tmp/workspace");
+        let relative = resolve_execution_path(&cwd, Path::new("./target"));
+        assert_eq!(relative, PathBuf::from("/tmp/workspace/./target"));
+
+        if let Some(home) = std::env::var_os("HOME") {
+            let expected = PathBuf::from(home).join(".cargo");
+            let resolved = resolve_execution_path(&cwd, Path::new("~/.cargo"));
+            assert_eq!(resolved, expected);
+        }
+    }
+
+    #[test]
+    fn run_pipeline_rejects_replica_mode_until_m4() {
+        let resolver = ProfileResolver::default();
+        let cwd = unique_tmp_dir("clawcrate_cli_run_replica_guard");
+        let args = CommandArgs {
+            profile: Some("install".to_string()),
+            replica: false,
+            direct: false,
+            json: false,
+            command: vec!["echo".to_string(), "hello".to_string()],
+        };
+        let plan = build_execution_plan(&resolver, &cwd, &args).expect("build execution plan");
+
+        let error = ensure_workspace_mode_supported(&plan).expect_err("replica should be rejected");
+        assert!(error
+            .to_string()
+            .contains("replica mode execution is not implemented yet"));
+    }
+
+    #[test]
+    fn execution_status_maps_process_outcome() {
+        let success = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .status()
+            .expect("run success command");
+        let failure = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 3")
+            .status()
+            .expect("run failure command");
+
+        assert_eq!(execution_status_from_exit_status(&success), Status::Success);
+        assert_eq!(execution_status_from_exit_status(&failure), Status::Failed);
     }
 }

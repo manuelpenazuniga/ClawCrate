@@ -165,6 +165,10 @@ impl LinuxSandboxedChild {
         self.child.id()
     }
 
+    pub fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
     pub fn wait(&mut self) -> Result<std::process::ExitStatus, io::Error> {
         self.child.wait()
     }
