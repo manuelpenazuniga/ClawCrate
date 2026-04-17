@@ -210,6 +210,8 @@ clawcrate doctor
 | `--direct` | Force Direct Mode (for profiles that default to Replica) |
 | `--json` | Machine-readable output (for agent integration) |
 
+`clawcrate run` forwards `SIGINT`/`SIGTERM` to the sandboxed child and still writes final artifacts (`result.json`, logs, `fs-diff.json`) before exit. It also enforces a runtime timeout based on profile `resources.max_cpu_seconds`.
+
 ## Architecture
 
 ### Dual-Platform Native Sandboxing
