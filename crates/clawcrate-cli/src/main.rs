@@ -235,7 +235,7 @@ fn execute_run_pipeline(
     plan: &ExecutionPlan,
     writer: &ArtifactWriter,
 ) -> Result<RunPipelineResult> {
-    ensure_workspace_mode_supported(plan)?;
+    materialize_workspace_for_execution(plan, writer)?;
     let fs_diff_roots = resolve_fs_diff_roots(plan);
     let snapshot_before = snapshot_paths(&fs_diff_roots).map_err(|source| {
         anyhow!("failed to snapshot writable paths before execution: {source}")
@@ -254,13 +254,170 @@ fn execute_run_pipeline(
     Ok(RunPipelineResult { execution, fs_diff })
 }
 
-fn ensure_workspace_mode_supported(plan: &ExecutionPlan) -> Result<()> {
-    if matches!(plan.mode, WorkspaceMode::Replica { .. }) {
+const REPLICA_DEFAULT_EXCLUSIONS: [&str; 3] = [".env", ".env.*", ".git/config"];
+
+fn materialize_workspace_for_execution(
+    plan: &ExecutionPlan,
+    writer: &ArtifactWriter,
+) -> Result<()> {
+    let WorkspaceMode::Replica { source, copy } = &plan.mode else {
+        return Ok(());
+    };
+
+    copy_workspace_with_default_exclusions(source, copy)?;
+    append_audit_event(
+        writer,
+        AuditEventKind::ReplicaCreated {
+            source: source.clone(),
+            copy: copy.clone(),
+            excluded: REPLICA_DEFAULT_EXCLUSIONS
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        },
+    )?;
+    Ok(())
+}
+
+fn copy_workspace_with_default_exclusions(source: &Path, copy: &Path) -> Result<()> {
+    if !source.is_dir() {
         return Err(anyhow!(
-            "replica mode execution is not implemented yet in `run`; use `--direct` for now"
+            "replica source workspace does not exist or is not a directory: {}",
+            source.display()
         ));
     }
+
+    if copy.exists() {
+        std::fs::remove_dir_all(copy).map_err(|source_error| {
+            anyhow!(
+                "failed to clean existing replica workspace at {}: {source_error}",
+                copy.display()
+            )
+        })?;
+    }
+    std::fs::create_dir_all(copy).map_err(|source_error| {
+        anyhow!(
+            "failed to create replica workspace at {}: {source_error}",
+            copy.display()
+        )
+    })?;
+
+    copy_directory_recursive(source, copy, source)?;
     Ok(())
+}
+
+fn copy_directory_recursive(
+    source_dir: &Path,
+    target_dir: &Path,
+    source_root: &Path,
+) -> Result<()> {
+    for entry in std::fs::read_dir(source_dir).map_err(|source_error| {
+        anyhow!(
+            "failed to read source workspace directory {}: {source_error}",
+            source_dir.display()
+        )
+    })? {
+        let entry = entry.map_err(|source_error| {
+            anyhow!(
+                "failed to read source workspace entry in {}: {source_error}",
+                source_dir.display()
+            )
+        })?;
+        let source_path = entry.path();
+        let relative_path = source_path
+            .strip_prefix(source_root)
+            .map_err(|source_error| {
+                anyhow!("failed to compute relative source path: {source_error}")
+            })?;
+
+        if should_exclude_replica_path(relative_path) {
+            continue;
+        }
+
+        let target_path = target_dir.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|source_error| {
+            anyhow!(
+                "failed to inspect source entry type {}: {source_error}",
+                source_path.display()
+            )
+        })?;
+
+        if file_type.is_dir() {
+            std::fs::create_dir_all(&target_path).map_err(|source_error| {
+                anyhow!(
+                    "failed to create replica directory {}: {source_error}",
+                    target_path.display()
+                )
+            })?;
+            copy_directory_recursive(&source_path, &target_path, source_root)?;
+            continue;
+        }
+
+        if file_type.is_file() {
+            std::fs::copy(&source_path, &target_path).map_err(|source_error| {
+                anyhow!(
+                    "failed to copy source file {} to {}: {source_error}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+            continue;
+        }
+
+        if file_type.is_symlink() {
+            copy_symlink(&source_path, &target_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(source_path: &Path, target_path: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let link_target = std::fs::read_link(source_path).map_err(|source_error| {
+        anyhow!(
+            "failed to read symlink target for {}: {source_error}",
+            source_path.display()
+        )
+    })?;
+    symlink(&link_target, target_path).map_err(|source_error| {
+        anyhow!(
+            "failed to recreate symlink {} -> {}: {source_error}",
+            target_path.display(),
+            link_target.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(source_path: &Path, target_path: &Path) -> Result<()> {
+    std::fs::copy(source_path, target_path).map_err(|source_error| {
+        anyhow!(
+            "failed to copy symlink-like path {} to {}: {source_error}",
+            source_path.display(),
+            target_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn should_exclude_replica_path(relative_path: &Path) -> bool {
+    if relative_path == Path::new(".git/config") {
+        return true;
+    }
+
+    relative_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(is_secret_env_filename)
+        .unwrap_or(false)
+}
+
+fn is_secret_env_filename(file_name: &str) -> bool {
+    file_name == ".env" || file_name.starts_with(".env.")
 }
 
 fn runs_root() -> Result<PathBuf> {
@@ -927,9 +1084,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_execution_plan, doctor_rows, ensure_workspace_mode_supported, execution_status,
-        execution_status_from_exit_status, resolve_execution_path, run_monitored_child,
-        select_default_mode, CommandArgs, RunTermination,
+        build_execution_plan, copy_workspace_with_default_exclusions, doctor_rows,
+        execution_status, execution_status_from_exit_status, resolve_execution_path,
+        run_monitored_child, select_default_mode, should_exclude_replica_path, CommandArgs,
+        RunTermination,
     };
     use clap::Parser;
     use clawcrate_profiles::ProfileResolver;
@@ -1107,22 +1265,44 @@ mod tests {
     }
 
     #[test]
-    fn run_pipeline_rejects_replica_mode_until_m4() {
-        let resolver = ProfileResolver::default();
-        let cwd = unique_tmp_dir("clawcrate_cli_run_replica_guard");
-        let args = CommandArgs {
-            profile: Some("install".to_string()),
-            replica: false,
-            direct: false,
-            json: false,
-            command: vec!["echo".to_string(), "hello".to_string()],
-        };
-        let plan = build_execution_plan(&resolver, &cwd, &args).expect("build execution plan");
+    fn should_exclude_replica_defaults() {
+        assert!(should_exclude_replica_path(Path::new(".env")));
+        assert!(should_exclude_replica_path(Path::new(".env.local")));
+        assert!(should_exclude_replica_path(Path::new(
+            "nested/.env.production"
+        )));
+        assert!(should_exclude_replica_path(Path::new(".git/config")));
+        assert!(!should_exclude_replica_path(Path::new(".git/HEAD")));
+        assert!(!should_exclude_replica_path(Path::new("src/main.rs")));
+    }
 
-        let error = ensure_workspace_mode_supported(&plan).expect_err("replica should be rejected");
-        assert!(error
-            .to_string()
-            .contains("replica mode execution is not implemented yet"));
+    #[test]
+    fn replica_copy_excludes_default_secret_files() {
+        let source = unique_tmp_dir("clawcrate_cli_replica_source");
+        fs::create_dir_all(source.join(".git")).expect("create .git");
+        fs::create_dir_all(source.join("nested")).expect("create nested");
+
+        fs::write(source.join(".env"), "SECRET=1").expect("write .env");
+        fs::write(source.join(".env.local"), "SECRET=2").expect("write .env.local");
+        fs::write(source.join(".git/config"), "token = hidden").expect("write .git/config");
+        fs::write(source.join(".git/HEAD"), "ref: refs/heads/main").expect("write .git/HEAD");
+        fs::write(source.join("nested/.env.production"), "SECRET=3")
+            .expect("write nested .env.production");
+        fs::write(source.join("nested/app.txt"), "visible").expect("write visible file");
+
+        let replica_root = unique_tmp_dir("clawcrate_cli_replica_copy_root");
+        let replica = replica_root.join("workspace");
+        copy_workspace_with_default_exclusions(&source, &replica).expect("copy workspace");
+
+        assert!(!replica.join(".env").exists());
+        assert!(!replica.join(".env.local").exists());
+        assert!(!replica.join(".git/config").exists());
+        assert!(!replica.join("nested/.env.production").exists());
+        assert!(replica.join(".git/HEAD").exists());
+        assert_eq!(
+            fs::read_to_string(replica.join("nested/app.txt")).expect("read copied file"),
+            "visible"
+        );
     }
 
     #[test]
