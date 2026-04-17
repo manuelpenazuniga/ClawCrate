@@ -11,3 +11,9 @@ path = "src/lib.rs"
 
 [dependencies]
 clawcrate-types = { path = "../clawcrate-types" }
+serde = "1"
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+chrono = { version = "0.4", features = ["serde"] }
