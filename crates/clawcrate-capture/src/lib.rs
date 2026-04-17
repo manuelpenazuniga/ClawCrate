@@ -1,3 +1,357 @@
 #![forbid(unsafe_code)]
 
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Read, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStderr, ChildStdout, ExitStatus};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
 pub const CRATE_NAME: &str = "clawcrate-capture";
+
+const STDOUT_LOG: &str = "stdout.log";
+const STDERR_LOG: &str = "stderr.log";
+const READ_CHUNK_SIZE: usize = 8192;
+
+#[derive(Debug, Clone)]
+pub struct CaptureConfig {
+    pub artifacts_dir: PathBuf,
+    pub max_output_bytes: u64,
+}
+
+impl CaptureConfig {
+    pub fn stdout_log_path(&self) -> PathBuf {
+        self.artifacts_dir.join(STDOUT_LOG)
+    }
+
+    pub fn stderr_log_path(&self) -> PathBuf {
+        self.artifacts_dir.join(STDERR_LOG)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+impl StreamKind {
+    fn label(self) -> &'static str {
+        match self {
+            StreamKind::Stdout => "stdout",
+            StreamKind::Stderr => "stderr",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCaptureStats {
+    pub written_bytes: u64,
+    pub dropped_bytes: u64,
+}
+
+impl StreamCaptureStats {
+    fn truncated(self) -> bool {
+        self.dropped_bytes > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureSummary {
+    pub stdout: StreamCaptureStats,
+    pub stderr: StreamCaptureStats,
+    pub total_written_bytes: u64,
+    pub total_dropped_bytes: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapturedChildOutput {
+    pub status: ExitStatus,
+    pub summary: CaptureSummary,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureError {
+    #[error("failed to create artifacts directory: {0}")]
+    CreateArtifactsDir(#[source] io::Error),
+    #[error("failed to create {stream} log file at {path}: {source}")]
+    CreateLogFile {
+        stream: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("child stdout pipe was not available for capture")]
+    MissingStdoutPipe,
+    #[error("child stderr pipe was not available for capture")]
+    MissingStderrPipe,
+    #[error("failed while reading/writing {stream} stream: {source}")]
+    StreamIo {
+        stream: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("stream capture thread panicked")]
+    ThreadPanic,
+    #[error("failed to wait for child process: {0}")]
+    WaitChild(#[source] io::Error),
+}
+
+#[derive(Debug)]
+struct SharedBudget {
+    remaining: u64,
+}
+
+pub fn capture_streams<R1, R2>(
+    stdout_reader: R1,
+    stderr_reader: R2,
+    config: &CaptureConfig,
+) -> Result<CaptureSummary, CaptureError>
+where
+    R1: Read + Send + 'static,
+    R2: Read + Send + 'static,
+{
+    fs::create_dir_all(&config.artifacts_dir).map_err(CaptureError::CreateArtifactsDir)?;
+
+    let stdout_log_path = config.stdout_log_path();
+    let stdout_log =
+        File::create(&stdout_log_path).map_err(|source| CaptureError::CreateLogFile {
+            stream: StreamKind::Stdout.label(),
+            path: stdout_log_path,
+            source,
+        })?;
+
+    let stderr_log_path = config.stderr_log_path();
+    let stderr_log =
+        File::create(&stderr_log_path).map_err(|source| CaptureError::CreateLogFile {
+            stream: StreamKind::Stderr.label(),
+            path: stderr_log_path,
+            source,
+        })?;
+
+    let budget = Arc::new(Mutex::new(SharedBudget {
+        remaining: config.max_output_bytes,
+    }));
+
+    let stdout_handle = spawn_capture_thread(
+        stdout_reader,
+        BufWriter::new(stdout_log),
+        StreamKind::Stdout,
+        Arc::clone(&budget),
+    );
+    let stderr_handle = spawn_capture_thread(
+        stderr_reader,
+        BufWriter::new(stderr_log),
+        StreamKind::Stderr,
+        Arc::clone(&budget),
+    );
+
+    let stdout_stats = join_capture_thread(stdout_handle)?;
+    let stderr_stats = join_capture_thread(stderr_handle)?;
+
+    let total_written_bytes = stdout_stats.written_bytes + stderr_stats.written_bytes;
+    let total_dropped_bytes = stdout_stats.dropped_bytes + stderr_stats.dropped_bytes;
+
+    Ok(CaptureSummary {
+        stdout: stdout_stats,
+        stderr: stderr_stats,
+        total_written_bytes,
+        total_dropped_bytes,
+        truncated: stdout_stats.truncated() || stderr_stats.truncated(),
+    })
+}
+
+pub fn capture_child_output(
+    mut child: Child,
+    config: &CaptureConfig,
+) -> Result<CapturedChildOutput, CaptureError> {
+    let stdout = child.stdout.take().ok_or(CaptureError::MissingStdoutPipe)?;
+    let stderr = child.stderr.take().ok_or(CaptureError::MissingStderrPipe)?;
+
+    capture_child_pipes(child, stdout, stderr, config)
+}
+
+fn capture_child_pipes(
+    mut child: Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    config: &CaptureConfig,
+) -> Result<CapturedChildOutput, CaptureError> {
+    let summary = capture_streams(stdout, stderr, config)?;
+    let status = child.wait().map_err(CaptureError::WaitChild)?;
+    Ok(CapturedChildOutput { status, summary })
+}
+
+fn spawn_capture_thread<R, W>(
+    mut reader: R,
+    mut writer: W,
+    stream: StreamKind,
+    budget: Arc<Mutex<SharedBudget>>,
+) -> thread::JoinHandle<Result<StreamCaptureStats, CaptureError>>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut stats = StreamCaptureStats {
+            written_bytes: 0,
+            dropped_bytes: 0,
+        };
+        let mut buffer = [0u8; READ_CHUNK_SIZE];
+
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|source| CaptureError::StreamIo {
+                    stream: stream.label(),
+                    source,
+                })?;
+            if read == 0 {
+                break;
+            }
+
+            let write_len = {
+                let mut budget = budget.lock().map_err(|_| CaptureError::ThreadPanic)?;
+                let allowed = read.min(budget.remaining as usize);
+                budget.remaining = budget.remaining.saturating_sub(allowed as u64);
+                allowed
+            };
+
+            if write_len > 0 {
+                writer.write_all(&buffer[..write_len]).map_err(|source| {
+                    CaptureError::StreamIo {
+                        stream: stream.label(),
+                        source,
+                    }
+                })?;
+                stats.written_bytes += write_len as u64;
+            }
+
+            if write_len < read {
+                stats.dropped_bytes += (read - write_len) as u64;
+            }
+        }
+
+        writer.flush().map_err(|source| CaptureError::StreamIo {
+            stream: stream.label(),
+            source,
+        })?;
+        Ok(stats)
+    })
+}
+
+fn join_capture_thread(
+    handle: thread::JoinHandle<Result<StreamCaptureStats, CaptureError>>,
+) -> Result<StreamCaptureStats, CaptureError> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(CaptureError::ThreadPanic),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{capture_child_output, capture_streams, CaptureConfig};
+
+    fn unique_tmp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}_{nanos}_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp test directory");
+        dir
+    }
+
+    #[test]
+    fn capture_streams_writes_stdout_and_stderr_logs() {
+        let tmp = unique_tmp_dir("clawcrate_capture_streams");
+        let config = CaptureConfig {
+            artifacts_dir: tmp.clone(),
+            max_output_bytes: 1024,
+        };
+
+        let summary = capture_streams(
+            Cursor::new(b"hello stdout\n".to_vec()),
+            Cursor::new(b"hello stderr\n".to_vec()),
+            &config,
+        )
+        .expect("capture streams");
+
+        assert_eq!(summary.total_written_bytes, 26);
+        assert!(!summary.truncated);
+        assert_eq!(
+            fs::read_to_string(config.stdout_log_path()).expect("read stdout log"),
+            "hello stdout\n"
+        );
+        assert_eq!(
+            fs::read_to_string(config.stderr_log_path()).expect("read stderr log"),
+            "hello stderr\n"
+        );
+    }
+
+    #[test]
+    fn capture_streams_truncates_using_shared_total_budget() {
+        let tmp = unique_tmp_dir("clawcrate_capture_truncate");
+        let config = CaptureConfig {
+            artifacts_dir: tmp.clone(),
+            max_output_bytes: 6,
+        };
+
+        let summary = capture_streams(
+            Cursor::new(b"AAAA".to_vec()),
+            Cursor::new(b"BBBB".to_vec()),
+            &config,
+        )
+        .expect("capture streams");
+
+        let stdout_len = fs::read(config.stdout_log_path())
+            .expect("read stdout log")
+            .len() as u64;
+        let stderr_len = fs::read(config.stderr_log_path())
+            .expect("read stderr log")
+            .len() as u64;
+
+        assert_eq!(summary.total_written_bytes, 6);
+        assert_eq!(summary.total_dropped_bytes, 2);
+        assert!(summary.truncated);
+        assert_eq!(stdout_len + stderr_len, 6);
+    }
+
+    #[test]
+    fn capture_child_output_reads_pipes_and_returns_exit_status() {
+        let tmp = unique_tmp_dir("clawcrate_capture_child");
+        let config = CaptureConfig {
+            artifacts_dir: tmp.clone(),
+            max_output_bytes: 1024,
+        };
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf 'hello-out'; printf 'hello-err' >&2");
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        let child = command.spawn().expect("spawn shell");
+
+        let captured = capture_child_output(child, &config).expect("capture child output");
+
+        assert!(captured.status.success());
+        assert!(!captured.summary.truncated);
+        assert_eq!(
+            fs::read_to_string(config.stdout_log_path()).expect("read stdout log"),
+            "hello-out"
+        );
+        assert_eq!(
+            fs::read_to_string(config.stderr_log_path()).expect("read stderr log"),
+            "hello-err"
+        );
+    }
+}
