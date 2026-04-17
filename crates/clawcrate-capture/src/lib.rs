@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, ExitStatus};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::UNIX_EPOCH;
+
+use sha2::{Digest, Sha256};
+use walkdir::WalkDir;
 
 pub const CRATE_NAME: &str = "clawcrate-capture";
 
@@ -71,6 +76,32 @@ pub struct CapturedChildOutput {
     pub summary: CaptureSummary,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFingerprint {
+    pub size_bytes: u64,
+    pub modified_unix_nanos: u128,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSnapshot {
+    pub entries: BTreeMap<PathBuf, FileFingerprint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsChangeKind {
+    Created,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsChange {
+    pub path: PathBuf,
+    pub kind: FsChangeKind,
+    pub size_bytes: Option<u64>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("failed to create artifacts directory: {0}")]
@@ -96,6 +127,18 @@ pub enum CaptureError {
     ThreadPanic,
     #[error("failed to wait for child process: {0}")]
     WaitChild(#[source] io::Error),
+    #[error("failed to walk snapshot root {root}: {source}")]
+    SnapshotWalk {
+        root: PathBuf,
+        #[source]
+        source: walkdir::Error,
+    },
+    #[error("filesystem snapshot IO failed for {path}: {source}")]
+    SnapshotIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 #[derive(Debug)]
@@ -250,6 +293,119 @@ fn join_capture_thread(
     }
 }
 
+pub fn snapshot_paths(paths: &[PathBuf]) -> Result<FileSnapshot, CaptureError> {
+    let mut entries = BTreeMap::new();
+
+    for root in paths {
+        if !root.exists() {
+            continue;
+        }
+
+        if root.is_file() {
+            let fingerprint = fingerprint_path(root)?;
+            entries.insert(root.clone(), fingerprint);
+            continue;
+        }
+
+        for walk_entry in WalkDir::new(root).follow_links(false) {
+            let walk_entry = walk_entry.map_err(|source| CaptureError::SnapshotWalk {
+                root: root.clone(),
+                source,
+            })?;
+
+            if !walk_entry.file_type().is_file() {
+                continue;
+            }
+
+            let path = walk_entry.path().to_path_buf();
+            let fingerprint = fingerprint_path(&path)?;
+            entries.insert(path, fingerprint);
+        }
+    }
+
+    Ok(FileSnapshot { entries })
+}
+
+pub fn diff_snapshots(before: &FileSnapshot, after: &FileSnapshot) -> Vec<FsChange> {
+    let mut changes = Vec::new();
+
+    for (path, before_fingerprint) in &before.entries {
+        match after.entries.get(path) {
+            None => changes.push(FsChange {
+                path: path.clone(),
+                kind: FsChangeKind::Deleted,
+                size_bytes: Some(before_fingerprint.size_bytes),
+            }),
+            Some(after_fingerprint) if after_fingerprint != before_fingerprint => {
+                changes.push(FsChange {
+                    path: path.clone(),
+                    kind: FsChangeKind::Modified,
+                    size_bytes: Some(after_fingerprint.size_bytes),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    for (path, after_fingerprint) in &after.entries {
+        if !before.entries.contains_key(path) {
+            changes.push(FsChange {
+                path: path.clone(),
+                kind: FsChangeKind::Created,
+                size_bytes: Some(after_fingerprint.size_bytes),
+            });
+        }
+    }
+
+    changes.sort_by(|left, right| left.path.cmp(&right.path));
+    changes
+}
+
+fn fingerprint_path(path: &Path) -> Result<FileFingerprint, CaptureError> {
+    let metadata = fs::metadata(path).map_err(|source| CaptureError::SnapshotIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let sha256 = hash_sha256(path)?;
+
+    Ok(FileFingerprint {
+        size_bytes: metadata.len(),
+        modified_unix_nanos,
+        sha256,
+    })
+}
+
+fn hash_sha256(path: &Path) -> Result<String, CaptureError> {
+    let mut file = File::open(path).map_err(|source| CaptureError::SnapshotIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; READ_CHUNK_SIZE];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| CaptureError::SnapshotIo {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -258,7 +414,10 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{capture_child_output, capture_streams, CaptureConfig};
+    use super::{
+        capture_child_output, capture_streams, diff_snapshots, snapshot_paths, CaptureConfig,
+        FsChangeKind,
+    };
 
     fn unique_tmp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -353,5 +512,71 @@ mod tests {
             fs::read_to_string(config.stderr_log_path()).expect("read stderr log"),
             "hello-err"
         );
+    }
+
+    #[test]
+    fn snapshot_paths_captures_nested_files_with_hashes() {
+        let tmp = unique_tmp_dir("clawcrate_snapshot_nested");
+        let nested = tmp.join("workspace").join("src");
+        fs::create_dir_all(&nested).expect("create nested directory");
+        fs::write(tmp.join("workspace").join("root.txt"), "root").expect("write root file");
+        fs::write(nested.join("lib.rs"), "fn main() {}").expect("write nested file");
+
+        let snapshot = snapshot_paths(&[tmp.join("workspace")]).expect("snapshot paths");
+        assert_eq!(snapshot.entries.len(), 2);
+        for fingerprint in snapshot.entries.values() {
+            assert_eq!(fingerprint.sha256.len(), 64);
+            assert!(fingerprint.size_bytes > 0);
+        }
+    }
+
+    #[test]
+    fn diff_snapshots_detects_created_modified_and_deleted() {
+        let tmp = unique_tmp_dir("clawcrate_snapshot_diff");
+        let root = tmp.join("workspace");
+        fs::create_dir_all(&root).expect("create workspace");
+
+        let stable = root.join("stable.txt");
+        let modified = root.join("modified.txt");
+        let deleted = root.join("deleted.txt");
+        let created = root.join("created.txt");
+
+        fs::write(&stable, "same").expect("write stable");
+        fs::write(&modified, "before").expect("write modified before");
+        fs::write(&deleted, "remove me").expect("write deleted");
+
+        let before = snapshot_paths(std::slice::from_ref(&root)).expect("snapshot before");
+
+        fs::write(&modified, "after").expect("write modified after");
+        fs::remove_file(&deleted).expect("delete file");
+        fs::write(&created, "new").expect("write created");
+
+        let after = snapshot_paths(&[root]).expect("snapshot after");
+        let diff = diff_snapshots(&before, &after);
+
+        assert!(diff
+            .iter()
+            .any(|change| change.path == modified && change.kind == FsChangeKind::Modified));
+        assert!(diff
+            .iter()
+            .any(|change| change.path == deleted && change.kind == FsChangeKind::Deleted));
+        assert!(diff
+            .iter()
+            .any(|change| change.path == created && change.kind == FsChangeKind::Created));
+        assert!(!diff
+            .iter()
+            .any(|change| change.path == stable && change.kind != FsChangeKind::Modified));
+    }
+
+    #[test]
+    fn snapshot_paths_ignores_missing_roots_and_preserves_existing_ones() {
+        let tmp = unique_tmp_dir("clawcrate_snapshot_missing");
+        let existing = tmp.join("existing");
+        let missing = tmp.join("missing");
+        fs::create_dir_all(&existing).expect("create existing directory");
+        fs::write(existing.join("a.txt"), "a").expect("write existing file");
+
+        let snapshot = snapshot_paths(&[missing, existing]).expect("snapshot with missing root");
+        assert_eq!(snapshot.entries.len(), 1);
     }
 }
