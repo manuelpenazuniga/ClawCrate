@@ -186,6 +186,7 @@ name = "clawcrate-capture"
 version = "0.1.0-alpha.0"
 dependencies = [
  "clawcrate-types",
+ "serde",
  "sha2",
  "thiserror",
  "walkdir",
@@ -204,6 +205,7 @@ dependencies = [
  "clawcrate-sandbox",
  "clawcrate-types",
  "comfy-table",
+ "serde",
  "serde_json",
  "uuid",
 ]
