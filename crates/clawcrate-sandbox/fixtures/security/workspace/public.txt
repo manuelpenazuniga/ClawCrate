@@ -1,0 +1,1 @@
+fixture file used to validate allowed workspace reads
