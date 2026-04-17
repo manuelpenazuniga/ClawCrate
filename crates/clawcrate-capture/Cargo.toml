@@ -11,4 +11,6 @@ path = "src/lib.rs"
 
 [dependencies]
 clawcrate-types = { path = "../clawcrate-types" }
+sha2 = "0.10"
 thiserror = "2"
+walkdir = "2"
