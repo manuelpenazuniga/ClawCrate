@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
-use std::time::Instant;
+use std::process::{Child, ChildStderr, ChildStdout, ExitStatus};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -26,7 +27,17 @@ use clawcrate_types::{
     Status, SystemCapabilities, WorkspaceMode,
 };
 use comfy_table::{Cell, Table};
+#[cfg(unix)]
+use nix::errno::Errno;
+#[cfg(unix)]
+use nix::sys::signal::{kill, Signal};
+#[cfg(unix)]
+use nix::unistd::Pid;
 use serde::Serialize;
+#[cfg(unix)]
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+#[cfg(unix)]
+use signal_hook::iterator::Signals;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use uuid::Uuid;
@@ -120,6 +131,14 @@ struct RunExecutionOutcome {
     scrubbed_keys: Vec<String>,
     exit_status: ExitStatus,
     capture_summary: CaptureSummary,
+    termination: RunTermination,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunTermination {
+    Exited,
+    Interrupted,
+    Timeout,
 }
 
 #[derive(Debug)]
@@ -181,7 +200,10 @@ fn handle_run(resolver: &ProfileResolver, args: CommandArgs) -> Result<()> {
     let result = ExecutionResult {
         id: plan.id.clone(),
         exit_code: pipeline.execution.exit_status.code(),
-        status: execution_status_from_exit_status(&pipeline.execution.exit_status),
+        status: execution_status(
+            &pipeline.execution.exit_status,
+            pipeline.execution.termination,
+        ),
         duration_ms,
         artifacts_dir: writer.artifacts_dir().to_path_buf(),
     };
@@ -368,18 +390,20 @@ fn launch_and_capture(
         .take()
         .ok_or(CaptureError::MissingStderrPipe)
         .map_err(|source| anyhow!("failed to capture stderr pipe: {source}"))?;
-    let capture_summary = capture_streams(stdout, stderr, capture_config)
-        .map_err(|source| anyhow!("failed to capture process output: {source}"))?;
-    let exit_status = child
-        .wait()
-        .map_err(CaptureError::WaitChild)
-        .map_err(|source| anyhow!("failed while waiting for process exit: {source}"))?;
+    let monitored = run_monitored_child(
+        child.child_mut(),
+        stdout,
+        stderr,
+        capture_config,
+        plan.profile.resources.max_cpu_seconds,
+    )?;
 
     Ok(RunExecutionOutcome {
         backend: "linux".to_string(),
         scrubbed_keys,
-        exit_status,
-        capture_summary,
+        exit_status: monitored.exit_status,
+        capture_summary: monitored.capture_summary,
+        termination: monitored.termination,
     })
 }
 
@@ -433,18 +457,20 @@ fn launch_and_capture(
         .take()
         .ok_or(CaptureError::MissingStderrPipe)
         .map_err(|source| anyhow!("failed to capture stderr pipe: {source}"))?;
-    let capture_summary = capture_streams(stdout, stderr, capture_config)
-        .map_err(|source| anyhow!("failed to capture process output: {source}"))?;
-    let exit_status = child
-        .wait()
-        .map_err(CaptureError::WaitChild)
-        .map_err(|source| anyhow!("failed while waiting for process exit: {source}"))?;
+    let monitored = run_monitored_child(
+        child.child_mut(),
+        stdout,
+        stderr,
+        capture_config,
+        plan.profile.resources.max_cpu_seconds,
+    )?;
 
     Ok(RunExecutionOutcome {
         backend: "macos-seatbelt".to_string(),
         scrubbed_keys,
-        exit_status,
-        capture_summary,
+        exit_status: monitored.exit_status,
+        capture_summary: monitored.capture_summary,
+        termination: monitored.termination,
     })
 }
 
@@ -455,6 +481,143 @@ fn launch_and_capture(
     _capture_config: &CaptureConfig,
 ) -> Result<RunExecutionOutcome> {
     Err(anyhow!("unsupported platform for `run` command"))
+}
+
+#[derive(Debug)]
+struct MonitoredChildResult {
+    exit_status: ExitStatus,
+    capture_summary: CaptureSummary,
+    termination: RunTermination,
+}
+
+fn run_monitored_child(
+    child: &mut Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    capture_config: &CaptureConfig,
+    timeout_seconds: u64,
+) -> Result<MonitoredChildResult> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+    const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(2);
+
+    let capture_config = capture_config.clone();
+    let capture_handle = thread::spawn(move || capture_streams(stdout, stderr, &capture_config));
+
+    #[cfg(unix)]
+    let mut signals = Signals::new([SIGINT, SIGTERM])
+        .map_err(|source| anyhow!("failed to install signal handlers: {source}"))?;
+
+    let started_at = Instant::now();
+    let mut interrupted = false;
+    let mut timed_out = false;
+    let mut interrupt_sent_at: Option<Instant> = None;
+    let mut interrupt_forced_kill = false;
+
+    let timeout_limit = (timeout_seconds > 0).then(|| Duration::from_secs(timeout_seconds));
+    let exit_status = loop {
+        #[cfg(unix)]
+        if !interrupted {
+            for signal in signals.pending() {
+                if signal == SIGINT || signal == SIGTERM {
+                    send_termination_signal(child)?;
+                    interrupted = true;
+                    interrupt_sent_at = Some(Instant::now());
+                    break;
+                }
+            }
+        }
+
+        if !timed_out
+            && timeout_limit
+                .map(|timeout| started_at.elapsed() >= timeout)
+                .unwrap_or(false)
+        {
+            send_kill_signal(child)?;
+            timed_out = true;
+        }
+
+        if interrupted && !timed_out && !interrupt_forced_kill {
+            if let Some(interrupt_at) = interrupt_sent_at {
+                if interrupt_at.elapsed() >= INTERRUPT_GRACE_PERIOD {
+                    send_kill_signal(child)?;
+                    interrupt_forced_kill = true;
+                }
+            }
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| anyhow!("failed while waiting for process exit: {source}"))?
+        {
+            break status;
+        }
+
+        thread::sleep(POLL_INTERVAL);
+    };
+
+    let capture_summary = match capture_handle.join() {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(source)) => return Err(anyhow!("failed to capture process output: {source}")),
+        Err(_) => return Err(anyhow!("stream capture thread panicked")),
+    };
+
+    let termination = if timed_out {
+        RunTermination::Timeout
+    } else if interrupted {
+        RunTermination::Interrupted
+    } else {
+        RunTermination::Exited
+    };
+
+    Ok(MonitoredChildResult {
+        exit_status,
+        capture_summary,
+        termination,
+    })
+}
+
+#[cfg(unix)]
+fn send_termination_signal(child: &Child) -> Result<()> {
+    send_unix_signal(child, Signal::SIGTERM)
+}
+
+#[cfg(not(unix))]
+fn send_termination_signal(child: &mut Child) -> Result<()> {
+    child
+        .kill()
+        .map_err(|source| anyhow!("failed to terminate child process: {source}"))
+}
+
+#[cfg(unix)]
+fn send_kill_signal(child: &Child) -> Result<()> {
+    send_unix_signal(child, Signal::SIGKILL)
+}
+
+#[cfg(not(unix))]
+fn send_kill_signal(child: &mut Child) -> Result<()> {
+    child
+        .kill()
+        .map_err(|source| anyhow!("failed to kill child process: {source}"))
+}
+
+#[cfg(unix)]
+fn send_unix_signal(child: &Child, signal: Signal) -> Result<()> {
+    let pid = Pid::from_raw(child.id() as i32);
+    match kill(pid, signal) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(source) => Err(anyhow!(
+            "failed to send {signal:?} to child {}: {source}",
+            child.id()
+        )),
+    }
+}
+
+fn execution_status(status: &ExitStatus, termination: RunTermination) -> Status {
+    match termination {
+        RunTermination::Timeout => Status::Timeout,
+        RunTermination::Interrupted => Status::Killed,
+        RunTermination::Exited => execution_status_from_exit_status(status),
+    }
 }
 
 fn execution_status_from_exit_status(status: &ExitStatus) -> Status {
@@ -760,13 +923,13 @@ fn print_human_plan(plan: &ExecutionPlan) {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_execution_plan, doctor_rows, ensure_workspace_mode_supported,
-        execution_status_from_exit_status, resolve_execution_path, select_default_mode,
-        CommandArgs,
+        build_execution_plan, doctor_rows, ensure_workspace_mode_supported, execution_status,
+        execution_status_from_exit_status, resolve_execution_path, run_monitored_child,
+        select_default_mode, CommandArgs, RunTermination,
     };
     use clap::Parser;
     use clawcrate_profiles::ProfileResolver;
@@ -977,5 +1140,55 @@ mod tests {
 
         assert_eq!(execution_status_from_exit_status(&success), Status::Success);
         assert_eq!(execution_status_from_exit_status(&failure), Status::Failed);
+    }
+
+    #[test]
+    fn execution_status_prefers_runtime_termination_reason() {
+        let success = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .status()
+            .expect("run success command");
+
+        assert_eq!(
+            execution_status(&success, RunTermination::Interrupted),
+            Status::Killed
+        );
+        assert_eq!(
+            execution_status(&success, RunTermination::Timeout),
+            Status::Timeout
+        );
+    }
+
+    #[test]
+    fn monitored_child_timeout_preserves_output_capture() {
+        let artifacts_dir = unique_tmp_dir("clawcrate_cli_timeout_capture");
+        let capture_config = super::CaptureConfig {
+            artifacts_dir,
+            max_output_bytes: 1024,
+        };
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf 'before-timeout'; sleep 2")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn timeout child");
+        let stdout = child.stdout.take().expect("take stdout");
+        let stderr = child.stderr.take().expect("take stderr");
+
+        let result =
+            run_monitored_child(&mut child, stdout, stderr, &capture_config, 1).expect("monitor");
+
+        assert_eq!(result.termination, RunTermination::Timeout);
+        assert_eq!(
+            execution_status(&result.exit_status, result.termination),
+            Status::Timeout
+        );
+        assert_eq!(
+            fs::read_to_string(capture_config.stdout_log_path()).expect("read stdout"),
+            "before-timeout"
+        );
     }
 }
