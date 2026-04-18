@@ -193,6 +193,8 @@ clawcrate run --direct --profile install -- npm install
 
 Replica copy exclusions: default `.env`, `.env.*`, `.git/config`, plus any rules in `.clawcrateignore`.
 
+Mode precedence is explicit: `--replica` / `--direct` flags override the profile default mode. Without flags, the profile default applies (`install` => Replica, most others => Direct).
+
 **Syncing changes back always requires explicit confirmation. It never happens automatically.**
 
 ## CLI Reference

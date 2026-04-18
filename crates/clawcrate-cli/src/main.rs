@@ -1226,6 +1226,30 @@ mod tests {
             select_default_mode(DefaultMode::Direct, &args),
             DefaultMode::Replica
         );
+
+        let args = CommandArgs {
+            profile: None,
+            replica: false,
+            direct: true,
+            json: false,
+            command: vec!["echo".to_string(), "hello".to_string()],
+        };
+        assert_eq!(
+            select_default_mode(DefaultMode::Replica, &args),
+            DefaultMode::Direct
+        );
+
+        let args = CommandArgs {
+            profile: None,
+            replica: false,
+            direct: false,
+            json: false,
+            command: vec!["echo".to_string(), "hello".to_string()],
+        };
+        assert_eq!(
+            select_default_mode(DefaultMode::Replica, &args),
+            DefaultMode::Replica
+        );
     }
 
     #[test]
@@ -1272,6 +1296,60 @@ mod tests {
                 assert_eq!(plan.cwd, *copy);
             }
             WorkspaceMode::Direct => panic!("install profile must default to replica"),
+        }
+    }
+
+    #[test]
+    fn install_profile_can_be_forced_to_direct_mode() {
+        let resolver = ProfileResolver::default();
+        let cwd = unique_tmp_dir("clawcrate_cli_plan_install_direct");
+        fs::write(
+            cwd.join("package.json"),
+            "{ \"name\": \"demo\", \"version\": \"0.1.0\" }",
+        )
+        .expect("write package json");
+
+        let args = CommandArgs {
+            profile: Some("install".to_string()),
+            replica: false,
+            direct: true,
+            json: false,
+            command: vec!["npm".to_string(), "install".to_string()],
+        };
+
+        let plan = build_execution_plan(&resolver, &cwd, &args).expect("build execution plan");
+        assert!(matches!(plan.mode, WorkspaceMode::Direct));
+        assert_eq!(plan.cwd, cwd);
+    }
+
+    #[test]
+    fn build_profile_can_be_forced_to_replica_mode() {
+        let resolver = ProfileResolver::default();
+        let cwd = unique_tmp_dir("clawcrate_cli_plan_build_replica");
+        fs::write(
+            cwd.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write cargo toml");
+
+        let args = CommandArgs {
+            profile: Some("build".to_string()),
+            replica: true,
+            direct: false,
+            json: false,
+            command: vec!["cargo".to_string(), "check".to_string()],
+        };
+
+        let plan = build_execution_plan(&resolver, &cwd, &args).expect("build execution plan");
+        match &plan.mode {
+            WorkspaceMode::Replica { source, copy } => {
+                assert_eq!(source, &cwd);
+                assert!(copy.starts_with(Path::new(&std::env::temp_dir())));
+                assert_eq!(plan.cwd, *copy);
+            }
+            WorkspaceMode::Direct => {
+                panic!("--replica should override profile default direct mode")
+            }
         }
     }
 
