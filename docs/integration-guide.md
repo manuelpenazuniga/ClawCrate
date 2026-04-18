@@ -116,4 +116,18 @@ fi
 
 - Linux full kernel enforcement is tracked as ongoing work (issue `#69`).
 - macOS and Linux differ in backend internals; keep your integration backend-agnostic by consuming `result` + artifacts.
-- Domain-level network filtering is not part of alpha (`none` vs `open` only).
+
+## Post-Alpha Filtered Network Mode (P1)
+
+Custom profiles can now express domain allowlist network policy:
+
+```yaml
+network:
+  mode: filtered
+  allowed_domains:
+    - "registry.npmjs.org"
+    - "*.pkg.dev"
+```
+
+In filtered mode, ClawCrate starts a local egress proxy and injects proxy env vars
+(`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) for the sandboxed command.

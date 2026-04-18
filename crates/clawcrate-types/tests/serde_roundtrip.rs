@@ -55,6 +55,14 @@ fn resolved_profile_roundtrip() {
 }
 
 #[test]
+fn filtered_net_level_roundtrip() {
+    let value = NetLevel::Filtered {
+        allowed_domains: vec!["registry.npmjs.org".to_string(), "*.pkg.dev".to_string()],
+    };
+    assert_json_roundtrip(&value);
+}
+
+#[test]
 fn execution_plan_roundtrip() {
     let value = ExecutionPlan {
         id: "0195a4d2-3f72-7a1b-b7af-a9fd8f24d9e2".to_string(),

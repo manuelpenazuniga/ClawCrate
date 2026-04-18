@@ -51,6 +51,7 @@ pub enum Actor {
 pub enum NetLevel {
     None,
     Open,
+    Filtered { allowed_domains: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
