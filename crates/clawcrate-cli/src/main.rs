@@ -17,6 +17,7 @@ use clawcrate_capture::{
 use clawcrate_profiles::ProfileResolver;
 #[cfg(target_os = "macos")]
 use clawcrate_sandbox::darwin::DarwinSandbox;
+use clawcrate_sandbox::egress_proxy::{start_egress_proxy, EgressProxyConfig, EgressProxyHandle};
 #[cfg(target_os = "linux")]
 use clawcrate_sandbox::linux::LinuxSandbox;
 #[cfg(target_os = "linux")]
@@ -24,8 +25,8 @@ use clawcrate_sandbox::linux_probe::probe_linux_capabilities;
 #[cfg(target_os = "macos")]
 use clawcrate_sandbox::macos_probe::probe_macos_capabilities;
 use clawcrate_types::{
-    Actor, AuditEvent, AuditEventKind, DefaultMode, ExecutionPlan, ExecutionResult, Platform,
-    Status, SystemCapabilities, WorkspaceMode,
+    Actor, AuditEvent, AuditEventKind, DefaultMode, ExecutionPlan, ExecutionResult, NetLevel,
+    Platform, Status, SystemCapabilities, WorkspaceMode,
 };
 use comfy_table::{Cell, Table};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -841,6 +842,29 @@ fn resolve_execution_path(cwd: &Path, path: &Path) -> PathBuf {
     }
 }
 
+fn maybe_start_filtered_egress_proxy(
+    net: &NetLevel,
+    env: &mut Vec<(String, String)>,
+) -> Result<Option<EgressProxyHandle>> {
+    let NetLevel::Filtered { allowed_domains } = net else {
+        return Ok(None);
+    };
+
+    let proxy = start_egress_proxy(EgressProxyConfig::from_allowed_domains(
+        allowed_domains.clone(),
+    ))
+    .map_err(|source| anyhow!("failed to start filtered egress proxy: {source}"))?;
+    upsert_env_vars(env, &proxy.proxy_env_vars());
+    Ok(Some(proxy))
+}
+
+fn upsert_env_vars(env: &mut Vec<(String, String)>, values: &[(String, String)]) {
+    for (key, value) in values {
+        env.retain(|(existing_key, _)| existing_key != key);
+        env.push((key.clone(), value.clone()));
+    }
+}
+
 fn expand_home(path: &Path) -> PathBuf {
     let path_str = path.to_string_lossy();
     if path_str == "~" {
@@ -895,18 +919,24 @@ fn launch_and_capture(
     capture_config: &CaptureConfig,
 ) -> Result<RunExecutionOutcome> {
     let sandbox = LinuxSandbox::new();
-    let prepared = sandbox.prepare(plan);
+    let mut prepared = sandbox.prepare(plan);
+    let egress_proxy =
+        maybe_start_filtered_egress_proxy(&plan.profile.net, &mut prepared.scrubbed_env)?;
     let scrubbed_keys = prepared.scrubbed_keys.clone();
 
+    let mut capabilities = vec![
+        "rlimits".to_string(),
+        "landlock".to_string(),
+        "seccomp".to_string(),
+    ];
+    if egress_proxy.is_some() {
+        capabilities.push("egress-proxy".to_string());
+    }
     append_audit_event(
         writer,
         AuditEventKind::SandboxApplied {
             backend: "linux".to_string(),
-            capabilities: vec![
-                "rlimits".to_string(),
-                "landlock".to_string(),
-                "seccomp".to_string(),
-            ],
+            capabilities,
         },
     )?;
     if !scrubbed_keys.is_empty() {
@@ -949,6 +979,7 @@ fn launch_and_capture(
         capture_config,
         plan.profile.resources.max_cpu_seconds,
     )?;
+    drop(egress_proxy);
 
     Ok(RunExecutionOutcome {
         backend: "linux".to_string(),
@@ -966,14 +997,20 @@ fn launch_and_capture(
     capture_config: &CaptureConfig,
 ) -> Result<RunExecutionOutcome> {
     let sandbox = DarwinSandbox::new();
-    let prepared = sandbox.prepare(plan);
+    let mut prepared = sandbox.prepare(plan);
+    let egress_proxy =
+        maybe_start_filtered_egress_proxy(&plan.profile.net, &mut prepared.scrubbed_env)?;
     let scrubbed_keys = prepared.scrubbed_keys.clone();
 
+    let mut capabilities = vec!["seatbelt".to_string()];
+    if egress_proxy.is_some() {
+        capabilities.push("egress-proxy".to_string());
+    }
     append_audit_event(
         writer,
         AuditEventKind::SandboxApplied {
             backend: "macos-seatbelt".to_string(),
-            capabilities: vec!["seatbelt".to_string()],
+            capabilities,
         },
     )?;
     if !scrubbed_keys.is_empty() {
@@ -1016,6 +1053,7 @@ fn launch_and_capture(
         capture_config,
         plan.profile.resources.max_cpu_seconds,
     )?;
+    drop(egress_proxy);
 
     Ok(RunExecutionOutcome {
         backend: "macos-seatbelt".to_string(),
@@ -1470,8 +1508,13 @@ fn print_human_plan(plan: &ExecutionPlan, _output: &OutputOptions) {
         .add_row(vec![
             Cell::new("Network"),
             Cell::new(match plan.profile.net {
-                clawcrate_types::NetLevel::None => "none",
-                clawcrate_types::NetLevel::Open => "open",
+                NetLevel::None => "none".to_string(),
+                NetLevel::Open => "open".to_string(),
+                NetLevel::Filtered {
+                    ref allowed_domains,
+                } => {
+                    format!("filtered ({})", allowed_domains.len())
+                }
             }),
         ])
         .add_row(vec![

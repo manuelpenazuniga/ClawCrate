@@ -35,6 +35,8 @@ pub enum ProfileError {
     },
     #[error("invalid network value in {path}: {value}")]
     InvalidNetwork { path: PathBuf, value: String },
+    #[error("invalid filtered network config in {path}: {reason}")]
+    InvalidFilteredNetwork { path: PathBuf, reason: String },
     #[error("invalid default_mode value in {path}: {value}")]
     InvalidDefaultMode { path: PathBuf, value: String },
     #[error("cyclic profile inheritance detected at {0}")]
@@ -143,7 +145,7 @@ impl ProfileResolver {
         fallback_name: String,
     ) -> Result<ResolvedProfile, ProfileError> {
         let path = inherited.source_path;
-        let network = parse_network(inherited.network.as_deref(), &path)?;
+        let network = parse_network(inherited.network.clone(), &path)?;
         let default_mode = parse_default_mode(inherited.default_mode.as_deref(), &path)?;
 
         let fs_read = inherited
@@ -232,7 +234,7 @@ struct RawProfile {
     extends: Option<String>,
     default_mode: Option<String>,
     filesystem: RawFilesystem,
-    network: Option<String>,
+    network: Option<RawNetwork>,
     environment: RawEnvironment,
     resources: RawResources,
 }
@@ -262,12 +264,27 @@ struct RawResources {
     max_output_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RawNetwork {
+    String(String),
+    Config(RawNetworkConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNetworkConfig {
+    mode: String,
+    #[serde(default)]
+    allowed_domains: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct InheritedProfile {
     name: Option<String>,
     default_mode: Option<String>,
     filesystem: RawFilesystem,
-    network: Option<String>,
+    network: Option<RawNetwork>,
     environment: RawEnvironment,
     resources: RawResources,
     source_path: PathBuf,
@@ -354,20 +371,65 @@ fn parse_default_mode(raw: Option<&str>, path: &Path) -> Result<DefaultMode, Pro
     }
 }
 
-fn parse_network(raw: Option<&str>, path: &Path) -> Result<NetLevel, ProfileError> {
-    match raw.map(normalize_string) {
+fn parse_network(raw: Option<RawNetwork>, path: &Path) -> Result<NetLevel, ProfileError> {
+    parse_network_config(raw, path)
+}
+
+fn parse_network_config(raw: Option<RawNetwork>, path: &Path) -> Result<NetLevel, ProfileError> {
+    match raw {
         None => Ok(NetLevel::None),
-        Some(network) if network == "none" => Ok(NetLevel::None),
-        Some(network) if network == "open" => Ok(NetLevel::Open),
-        Some(value) => Err(ProfileError::InvalidNetwork {
+        Some(RawNetwork::String(value)) => parse_network_mode_string(&value, path),
+        Some(RawNetwork::Config(config)) => {
+            let mode = normalize_string(&config.mode);
+            match mode.as_str() {
+                "none" => Ok(NetLevel::None),
+                "open" => Ok(NetLevel::Open),
+                "filtered" => {
+                    let allowed_domains = normalize_allowed_domains(&config.allowed_domains);
+                    if allowed_domains.is_empty() {
+                        return Err(ProfileError::InvalidFilteredNetwork {
+                            path: path.to_path_buf(),
+                            reason: "allowed_domains must contain at least one domain rule"
+                                .to_string(),
+                        });
+                    }
+                    Ok(NetLevel::Filtered { allowed_domains })
+                }
+                _ => Err(ProfileError::InvalidNetwork {
+                    path: path.to_path_buf(),
+                    value: mode,
+                }),
+            }
+        }
+    }
+}
+
+fn parse_network_mode_string(raw: &str, path: &Path) -> Result<NetLevel, ProfileError> {
+    let mode = normalize_string(raw);
+    match mode.as_str() {
+        "none" => Ok(NetLevel::None),
+        "open" => Ok(NetLevel::Open),
+        "filtered" => Err(ProfileError::InvalidFilteredNetwork {
             path: path.to_path_buf(),
-            value,
+            reason: "network: filtered requires object form with allowed_domains".to_string(),
+        }),
+        _ => Err(ProfileError::InvalidNetwork {
+            path: path.to_path_buf(),
+            value: mode,
         }),
     }
 }
 
 fn normalize_string(input: &str) -> String {
     input.trim().to_ascii_lowercase()
+}
+
+fn normalize_allowed_domains(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| normalize_string(value))
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 fn looks_like_path(reference: &str) -> bool {
@@ -637,5 +699,56 @@ network: open
             .env_passthrough
             .iter()
             .any(|it| it == "PIP_CACHE_DIR"));
+    }
+
+    #[test]
+    fn resolves_filtered_network_profile_with_allowed_domains() {
+        let resolver = ProfileResolver::default();
+        let tmp = unique_tmp_dir("clawcrate_profiles_filtered_network");
+        let custom = tmp.join("filtered.yaml");
+
+        write(
+            &custom,
+            r#"
+name: filtered
+network:
+  mode: filtered
+  allowed_domains:
+    - "registry.npmjs.org"
+    - "*.pkg.dev"
+"#,
+        );
+
+        let profile = resolver
+            .resolve_from_path(&custom)
+            .expect("resolve filtered network profile");
+        assert_eq!(
+            profile.net,
+            NetLevel::Filtered {
+                allowed_domains: vec!["registry.npmjs.org".to_string(), "*.pkg.dev".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn filtered_network_requires_allowed_domains() {
+        let resolver = ProfileResolver::default();
+        let tmp = unique_tmp_dir("clawcrate_profiles_filtered_invalid");
+        let custom = tmp.join("filtered-invalid.yaml");
+
+        write(
+            &custom,
+            r#"
+name: filtered-invalid
+network:
+  mode: filtered
+"#,
+        );
+
+        let error = resolver
+            .resolve_from_path(&custom)
+            .expect_err("filtered network without allowed domains should fail");
+        let message = error.to_string();
+        assert!(message.contains("allowed_domains"));
     }
 }

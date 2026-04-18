@@ -4,6 +4,7 @@ pub const CRATE_NAME: &str = "clawcrate-sandbox";
 
 #[cfg(target_os = "macos")]
 pub mod darwin;
+pub mod egress_proxy;
 pub mod env_scrub;
 pub mod linux;
 pub mod linux_probe;
