@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
 use std::thread;
@@ -88,6 +88,8 @@ enum Commands {
     Doctor(DoctorArgs),
     /// Serve local authenticated HTTP API for tool integrations
     Api(ApiArgs),
+    /// Integration bridges for external agent tooling
+    Bridge(BridgeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -135,6 +137,25 @@ struct ApiArgs {
     token: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct BridgeArgs {
+    #[command(subcommand)]
+    target: BridgeTarget,
+}
+
+#[derive(Debug, Subcommand)]
+enum BridgeTarget {
+    /// One-shot JSON bridge compatible with PennyPrompt shell-dispatch flow
+    Pennyprompt(PennyPromptBridgeArgs),
+}
+
+#[derive(Debug, Args)]
+struct PennyPromptBridgeArgs {
+    /// Pretty-print JSON output
+    #[arg(long, action = ArgAction::SetTrue)]
+    pretty: bool,
+}
+
 fn main() {
     let cli = Cli::parse();
     let output = OutputOptions::from_global(&cli.global);
@@ -152,6 +173,7 @@ fn run(cli: Cli, output: OutputOptions) -> Result<()> {
         Commands::Run(args) => handle_run(&resolver, args, &output),
         Commands::Doctor(args) => handle_doctor(args, &output),
         Commands::Api(args) => handle_api(args, &output),
+        Commands::Bridge(args) => handle_bridge(args, &output),
     }
 }
 
@@ -1931,6 +1953,115 @@ fn respond_api_json<T: Serialize>(request: Request, status_code: u16, payload: &
     let _ = request.respond(response);
 }
 
+#[derive(Debug, Deserialize)]
+struct PennyPromptBridgeRequest {
+    action: String,
+    profile: Option<String>,
+    #[serde(default)]
+    replica: bool,
+    #[serde(default)]
+    direct: bool,
+    #[serde(default)]
+    approve_out_of_profile: bool,
+    #[serde(default)]
+    command: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PennyPromptBridgeResponse {
+    ok: bool,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<PennyPromptBridgeError>,
+}
+
+#[derive(Debug, Serialize)]
+struct PennyPromptBridgeError {
+    message: String,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+fn handle_bridge(args: BridgeArgs, _output: &OutputOptions) -> Result<()> {
+    match args.target {
+        BridgeTarget::Pennyprompt(config) => handle_pennyprompt_bridge(config),
+    }
+}
+
+fn handle_pennyprompt_bridge(config: PennyPromptBridgeArgs) -> Result<()> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).map_err(|source| {
+        anyhow!("failed to read PennyPrompt bridge payload from stdin: {source}")
+    })?;
+    if input.trim().is_empty() {
+        return Err(anyhow!(
+            "missing PennyPrompt bridge payload: provide JSON on stdin"
+        ));
+    }
+
+    let request: PennyPromptBridgeRequest = serde_json::from_str(&input)
+        .map_err(|source| anyhow!("invalid PennyPrompt bridge payload JSON: {source}"))?;
+    let action = normalize_action(&request.action);
+    let delegated_args = build_pennyprompt_cli_args(&action, &request)?;
+
+    let response = match execute_cli_json(&delegated_args) {
+        Ok(data) => PennyPromptBridgeResponse {
+            ok: true,
+            action,
+            data: Some(data),
+            error: None,
+        },
+        Err(error) => PennyPromptBridgeResponse {
+            ok: false,
+            action,
+            data: None,
+            error: Some(PennyPromptBridgeError {
+                message: error.error,
+                exit_code: error.exit_code,
+                stdout: error.stdout,
+                stderr: error.stderr,
+            }),
+        },
+    };
+
+    if config.pretty {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!("{}", serde_json::to_string(&response)?);
+    }
+
+    Ok(())
+}
+
+fn normalize_action(action: &str) -> String {
+    action.trim().to_ascii_lowercase()
+}
+
+fn build_pennyprompt_cli_args(
+    action: &str,
+    request: &PennyPromptBridgeRequest,
+) -> Result<Vec<String>> {
+    match action {
+        "doctor" => Ok(vec!["doctor".to_string(), "--json".to_string()]),
+        "plan" | "run" => {
+            let payload = ApiCommandRequest {
+                profile: request.profile.clone(),
+                replica: request.replica,
+                direct: request.direct,
+                approve_out_of_profile: request.approve_out_of_profile,
+                command: request.command.clone(),
+            };
+            build_api_cli_args(action, &payload)
+        }
+        other => Err(anyhow!(
+            "unsupported PennyPrompt action `{other}` (expected run, plan, or doctor)"
+        )),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn probe_system_capabilities() -> Result<SystemCapabilities> {
     Ok(probe_linux_capabilities())
@@ -2169,12 +2300,13 @@ mod tests {
 
     use super::{
         apply_replica_sync_back, build_api_cli_args, build_execution_plan,
-        collect_syncable_replica_changes, command_appears_to_need_network,
-        copy_workspace_with_default_exclusions, detect_out_of_profile_requests, doctor_rows,
-        execution_status, execution_status_from_exit_status, extract_bearer_token,
-        load_replica_ignore_config, resolve_api_route, resolve_execution_path, run_monitored_child,
-        select_default_mode, should_exclude_default_replica_path, should_use_color,
-        ApiCommandRequest, Cli, CommandArgs, Commands, ReplicaSyncChange, RunTermination,
+        build_pennyprompt_cli_args, collect_syncable_replica_changes,
+        command_appears_to_need_network, copy_workspace_with_default_exclusions,
+        detect_out_of_profile_requests, doctor_rows, execution_status,
+        execution_status_from_exit_status, extract_bearer_token, load_replica_ignore_config,
+        resolve_api_route, resolve_execution_path, run_monitored_child, select_default_mode,
+        should_exclude_default_replica_path, should_use_color, ApiCommandRequest, BridgeTarget,
+        Cli, CommandArgs, Commands, PennyPromptBridgeRequest, ReplicaSyncChange, RunTermination,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -2279,6 +2411,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_bridge_pennyprompt_command() {
+        let cli = Cli::parse_from(["clawcrate", "bridge", "pennyprompt", "--pretty"]);
+
+        match cli.command {
+            Commands::Bridge(args) => match args.target {
+                BridgeTarget::Pennyprompt(config) => assert!(config.pretty),
+            },
+            _ => panic!("expected bridge command"),
+        }
+    }
+
+    #[test]
     fn parses_global_verbose_and_no_color_flags() {
         let cli = Cli::parse_from([
             "clawcrate",
@@ -2363,6 +2507,57 @@ mod tests {
             command: vec!["echo".to_string(), "hello".to_string()],
         };
         assert!(build_api_cli_args("plan", &invalid).is_err());
+    }
+
+    #[test]
+    fn build_pennyprompt_cli_args_maps_supported_actions() {
+        let doctor_request = PennyPromptBridgeRequest {
+            action: "doctor".to_string(),
+            profile: None,
+            replica: false,
+            direct: false,
+            approve_out_of_profile: false,
+            command: vec![],
+        };
+        assert_eq!(
+            build_pennyprompt_cli_args("doctor", &doctor_request).expect("doctor args"),
+            vec!["doctor", "--json"]
+        );
+
+        let run_request = PennyPromptBridgeRequest {
+            action: "run".to_string(),
+            profile: Some("build".to_string()),
+            replica: false,
+            direct: false,
+            approve_out_of_profile: true,
+            command: vec!["cargo".to_string(), "test".to_string()],
+        };
+        assert_eq!(
+            build_pennyprompt_cli_args("run", &run_request).expect("run args"),
+            vec![
+                "run",
+                "--json",
+                "--profile",
+                "build",
+                "--approve-out-of-profile",
+                "--",
+                "cargo",
+                "test",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_pennyprompt_cli_args_rejects_invalid_action() {
+        let request = PennyPromptBridgeRequest {
+            action: "unknown".to_string(),
+            profile: None,
+            replica: false,
+            direct: false,
+            approve_out_of_profile: false,
+            command: vec!["echo".to_string()],
+        };
+        assert!(build_pennyprompt_cli_args("unknown", &request).is_err());
     }
 
     #[test]
