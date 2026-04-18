@@ -140,3 +140,21 @@ When a command appears to request permissions outside the active profile,
 - interactive mode: prompt (`Approve and continue? [y/N]`)
 - non-interactive / `--json`: fail-closed by default
 - automation override: `--approve-out-of-profile`
+
+## Optional SQLite Audit Index (P2)
+
+File artifacts remain the primary source of truth (`plan.json`, `result.json`, `audit.ndjson`).
+For query-oriented integrations, you can enable optional SQLite indexing:
+
+```bash
+CLAWCRATE_AUDIT_SQLITE=1 clawcrate run --profile build --json -- cargo test
+```
+
+Optional custom path:
+
+```bash
+CLAWCRATE_AUDIT_SQLITE_PATH=/tmp/clawcrate-audit.db clawcrate run --profile safe --json -- echo ok
+```
+
+When enabled, ClawCrate upserts run metadata and audit events into SQLite after each run,
+without changing artifact generation behavior.
