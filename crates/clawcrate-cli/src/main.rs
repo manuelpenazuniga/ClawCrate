@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use clap::{ArgAction, Args, Parser, Subcommand};
-use clawcrate_audit::ArtifactWriter;
+use clawcrate_audit::{ArtifactWriter, SqliteAuditIndex, DEFAULT_AUDIT_DB};
 use clawcrate_capture::{
     capture_streams, diff_snapshots, snapshot_paths, CaptureConfig, CaptureError, CaptureSummary,
     FsChange, FsChangeKind,
@@ -260,6 +260,7 @@ fn handle_run(resolver: &ProfileResolver, args: CommandArgs, output: &OutputOpti
     let cwd =
         std::env::current_dir().map_err(|source| anyhow!("failed to get current dir: {source}"))?;
     let plan = build_execution_plan(resolver, &cwd, &args)?;
+    let mut sqlite_index = configure_optional_sqlite_index(output);
     verbose_log(
         output,
         1,
@@ -291,6 +292,7 @@ fn handle_run(resolver: &ProfileResolver, args: CommandArgs, output: &OutputOpti
             started_at.elapsed().as_millis() as u64,
             &error,
         )?;
+        maybe_index_artifacts_in_sqlite(&mut sqlite_index, &writer, output);
         return Err(error);
     }
 
@@ -303,6 +305,7 @@ fn handle_run(resolver: &ProfileResolver, args: CommandArgs, output: &OutputOpti
                 started_at.elapsed().as_millis() as u64,
                 &error,
             )?;
+            maybe_index_artifacts_in_sqlite(&mut sqlite_index, &writer, output);
             return Err(error);
         }
     };
@@ -334,6 +337,7 @@ fn handle_run(resolver: &ProfileResolver, args: CommandArgs, output: &OutputOpti
     writer
         .write_result(&result)
         .map_err(|source| anyhow!("failed to write result artifact: {source}"))?;
+    maybe_index_artifacts_in_sqlite(&mut sqlite_index, &writer, output);
 
     let summary = RunSummary {
         result,
@@ -832,12 +836,78 @@ fn apply_replica_sync_back(
 }
 
 fn runs_root() -> Result<PathBuf> {
+    Ok(clawcrate_home_root()?.join("runs"))
+}
+
+fn clawcrate_home_root() -> Result<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".clawcrate").join("runs"));
+        return Ok(PathBuf::from(home).join(".clawcrate"));
     }
     let cwd = std::env::current_dir()
         .map_err(|source| anyhow!("failed to resolve current dir: {source}"))?;
-    Ok(cwd.join(".clawcrate").join("runs"))
+    Ok(cwd.join(".clawcrate"))
+}
+
+fn configure_optional_sqlite_index(output: &OutputOptions) -> Option<SqliteAuditIndex> {
+    let explicit_path = std::env::var_os("CLAWCRATE_AUDIT_SQLITE_PATH").map(PathBuf::from);
+    let enabled_by_flag = std::env::var("CLAWCRATE_AUDIT_SQLITE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let db_path = match explicit_path {
+        Some(path) => path,
+        None if enabled_by_flag => match clawcrate_home_root() {
+            Ok(root) => root.join(DEFAULT_AUDIT_DB),
+            Err(error) => {
+                eprintln!("warning: failed to resolve default SQLite audit path: {error}");
+                return None;
+            }
+        },
+        None => return None,
+    };
+
+    match SqliteAuditIndex::open(&db_path) {
+        Ok(index) => {
+            verbose_log(
+                output,
+                1,
+                format!(
+                    "sqlite audit index enabled at {}",
+                    index.db_path().display()
+                ),
+            );
+            Some(index)
+        }
+        Err(error) => {
+            eprintln!("warning: failed to initialize SQLite audit index: {error}");
+            None
+        }
+    }
+}
+
+fn maybe_index_artifacts_in_sqlite(
+    index: &mut Option<SqliteAuditIndex>,
+    writer: &ArtifactWriter,
+    output: &OutputOptions,
+) {
+    let Some(indexer) = index.as_mut() else {
+        return;
+    };
+
+    match indexer.index_artifacts_dir(writer.artifacts_dir()) {
+        Ok(indexed) => {
+            verbose_log(
+                output,
+                2,
+                format!(
+                    "sqlite audit index updated: execution_id={}, events={}, has_result={}",
+                    indexed.execution_id, indexed.event_count, indexed.has_result
+                ),
+            );
+        }
+        Err(error) => {
+            eprintln!("warning: failed to index run artifacts in SQLite: {error}");
+        }
+    }
 }
 
 fn resolve_fs_diff_roots(plan: &ExecutionPlan) -> Vec<PathBuf> {
