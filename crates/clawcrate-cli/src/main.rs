@@ -51,8 +51,28 @@ use uuid::Uuid;
     about = "Secure execution runtime for AI shell commands"
 )]
 struct Cli {
+    #[command(flatten)]
+    global: GlobalArgs,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Debug, Args, Clone, Copy)]
+struct GlobalArgs {
+    /// Increase diagnostic verbosity (-v, -vv)
+    #[arg(short = 'v', long, action = ArgAction::Count, global = true)]
+    verbose: u8,
+
+    /// Disable ANSI colors in human-readable output
+    #[arg(long, action = ArgAction::SetTrue, global = true)]
+    no_color: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputOptions {
+    verbose: u8,
+    color: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -96,32 +116,101 @@ struct DoctorArgs {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("error: {error}");
+    let cli = Cli::parse();
+    let output = OutputOptions::from_global(&cli.global);
+    if let Err(error) = run(cli, output) {
+        print_cli_error(&error, output.verbose);
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli, output: OutputOptions) -> Result<()> {
     let resolver = ProfileResolver::default();
 
     match cli.command {
-        Commands::Plan(args) => handle_plan(&resolver, args),
-        Commands::Run(args) => handle_run(&resolver, args),
-        Commands::Doctor(args) => handle_doctor(args),
+        Commands::Plan(args) => handle_plan(&resolver, args, &output),
+        Commands::Run(args) => handle_run(&resolver, args, &output),
+        Commands::Doctor(args) => handle_doctor(args, &output),
     }
 }
 
-fn handle_plan(resolver: &ProfileResolver, args: CommandArgs) -> Result<()> {
+impl OutputOptions {
+    fn from_global(global: &GlobalArgs) -> Self {
+        let no_color_env_set = std::env::var_os("NO_COLOR").is_some();
+        let color = should_use_color(
+            global.no_color,
+            no_color_env_set,
+            io::stdout().is_terminal(),
+        );
+        Self {
+            verbose: global.verbose,
+            color,
+        }
+    }
+}
+
+fn should_use_color(no_color_flag: bool, no_color_env_set: bool, stdout_is_terminal: bool) -> bool {
+    !no_color_flag && !no_color_env_set && stdout_is_terminal
+}
+
+fn verbose_log(output: &OutputOptions, level: u8, message: impl AsRef<str>) {
+    if output.verbose >= level {
+        eprintln!("[verbose] {}", message.as_ref());
+    }
+}
+
+fn print_cli_error(error: &anyhow::Error, verbose: u8) {
+    eprintln!("error: {error}");
+    if verbose > 0 {
+        for cause in error.chain().skip(1) {
+            eprintln!("  caused by: {cause}");
+        }
+    } else if error.chain().nth(1).is_some() {
+        eprintln!("hint: re-run with `--verbose` to see the full error chain.");
+    }
+
+    if let Some(hint) = error_hint(error) {
+        eprintln!("hint: {hint}");
+    }
+}
+
+fn error_hint(error: &anyhow::Error) -> Option<&'static str> {
+    let message = error.to_string();
+    if message.contains("failed to resolve profile") {
+        return Some("use `--profile <safe|build|install|open>` or a valid profile YAML path.");
+    }
+    if message.contains("unsupported platform") {
+        return Some("`run` and `doctor` are supported on Linux and macOS only.");
+    }
+    if message.contains("failed to get current dir") {
+        return Some("run clawcrate from an existing and accessible working directory.");
+    }
+    None
+}
+
+fn handle_plan(
+    resolver: &ProfileResolver,
+    args: CommandArgs,
+    output: &OutputOptions,
+) -> Result<()> {
     let cwd =
         std::env::current_dir().map_err(|source| anyhow!("failed to get current dir: {source}"))?;
     let plan = build_execution_plan(resolver, &cwd, &args)?;
+    verbose_log(
+        output,
+        1,
+        format!(
+            "plan built: profile={}, mode={:?}, cwd={}",
+            plan.profile.name,
+            plan.mode,
+            plan.cwd.display()
+        ),
+    );
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
     } else {
-        print_human_plan(&plan);
+        print_human_plan(&plan, output);
     }
 
     Ok(())
@@ -161,12 +250,28 @@ struct RunSummary {
     stderr_log: PathBuf,
 }
 
-fn handle_run(resolver: &ProfileResolver, args: CommandArgs) -> Result<()> {
+fn handle_run(resolver: &ProfileResolver, args: CommandArgs, output: &OutputOptions) -> Result<()> {
     let cwd =
         std::env::current_dir().map_err(|source| anyhow!("failed to get current dir: {source}"))?;
     let plan = build_execution_plan(resolver, &cwd, &args)?;
+    verbose_log(
+        output,
+        1,
+        format!(
+            "run start: id={}, profile={}, mode={:?}",
+            plan.id, plan.profile.name, plan.mode
+        ),
+    );
     let writer = ArtifactWriter::new(&runs_root()?, &plan.id)
         .map_err(|source| anyhow!("failed to initialize artifact writer: {source}"))?;
+    verbose_log(
+        output,
+        2,
+        format!(
+            "artifacts dir initialized at {}",
+            writer.artifacts_dir().display()
+        ),
+    );
 
     writer
         .write_plan(&plan)
@@ -189,7 +294,7 @@ fn handle_run(resolver: &ProfileResolver, args: CommandArgs) -> Result<()> {
     writer
         .write_fs_diff(&pipeline.fs_diff)
         .map_err(|source| anyhow!("failed to write fs-diff artifact: {source}"))?;
-    maybe_sync_back_replica(&plan, &writer, &args, &pipeline.fs_diff)?;
+    maybe_sync_back_replica(&plan, &writer, &args, &pipeline.fs_diff, output)?;
 
     let duration_ms = started_at.elapsed().as_millis() as u64;
     append_audit_event(
@@ -228,7 +333,7 @@ fn handle_run(resolver: &ProfileResolver, args: CommandArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
-        print_human_run_summary(&summary);
+        print_human_run_summary(&summary, output);
     }
 
     Ok(())
@@ -511,6 +616,7 @@ fn maybe_sync_back_replica(
     writer: &ArtifactWriter,
     args: &CommandArgs,
     fs_diff: &[FsChange],
+    output: &OutputOptions,
 ) -> Result<()> {
     let WorkspaceMode::Replica { source, copy } = &plan.mode else {
         return Ok(());
@@ -532,6 +638,14 @@ fn maybe_sync_back_replica(
     }
 
     if args.json {
+        verbose_log(
+            output,
+            1,
+            format!(
+                "replica sync-back skipped for execution {} because --json is enabled",
+                plan.id
+            ),
+        );
         append_audit_event(
             writer,
             AuditEventKind::ReplicaSyncBack {
@@ -546,6 +660,14 @@ fn maybe_sync_back_replica(
         println!(
             "Replica sync-back skipped (non-interactive stdin). Pending changes remain in {}",
             copy.display()
+        );
+        verbose_log(
+            output,
+            1,
+            format!(
+                "replica sync-back skipped for execution {} due to non-interactive stdin",
+                plan.id
+            ),
         );
         append_audit_event(
             writer,
@@ -565,10 +687,26 @@ fn maybe_sync_back_replica(
             changes,
             source.display()
         );
+        verbose_log(
+            output,
+            1,
+            format!(
+                "replica sync-back approved: {} change(s) applied for execution {}",
+                changes, plan.id
+            ),
+        );
     } else {
         println!(
             "Replica sync-back skipped. Pending changes remain in {}",
             copy.display()
+        );
+        verbose_log(
+            output,
+            1,
+            format!(
+                "replica sync-back declined: {} pending change(s) for execution {}",
+                changes, plan.id
+            ),
         );
     }
 
@@ -1111,13 +1249,18 @@ fn materialize_workspace_mode(
     }
 }
 
-fn handle_doctor(args: DoctorArgs) -> Result<()> {
+fn handle_doctor(args: DoctorArgs, output: &OutputOptions) -> Result<()> {
     let capabilities = probe_system_capabilities()?;
+    verbose_log(
+        output,
+        1,
+        format!("doctor capabilities loaded for {:?}", capabilities.platform),
+    );
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&capabilities)?);
     } else {
-        print_human_doctor(&capabilities);
+        print_human_doctor(&capabilities, output);
     }
 
     Ok(())
@@ -1138,7 +1281,7 @@ fn probe_system_capabilities() -> Result<SystemCapabilities> {
     Err(anyhow!("unsupported platform for `doctor` command"))
 }
 
-fn print_human_doctor(capabilities: &SystemCapabilities) {
+fn print_human_doctor(capabilities: &SystemCapabilities, _output: &OutputOptions) {
     let mut table = Table::new();
     table.set_header(vec!["Capability", "Status"]);
     for (name, status) in doctor_rows(capabilities) {
@@ -1217,7 +1360,7 @@ fn platform_label(platform: &Platform) -> String {
     }
 }
 
-fn print_human_run_summary(summary: &RunSummary) {
+fn print_human_run_summary(summary: &RunSummary, output: &OutputOptions) {
     let mut table = Table::new();
     table
         .set_header(vec!["Field", "Value"])
@@ -1227,7 +1370,7 @@ fn print_human_run_summary(summary: &RunSummary) {
         ])
         .add_row(vec![
             Cell::new("Status"),
-            Cell::new(status_label(&summary.result.status)),
+            Cell::new(status_label(&summary.result.status, output.color)),
         ])
         .add_row(vec![
             Cell::new("Exit Code"),
@@ -1279,17 +1422,31 @@ fn print_human_run_summary(summary: &RunSummary) {
     println!("{table}");
 }
 
-fn status_label(status: &Status) -> String {
+fn status_label(status: &Status, color: bool) -> String {
     match status {
-        Status::Success => "success".to_string(),
-        Status::Failed => "failed".to_string(),
-        Status::Timeout => "timeout".to_string(),
-        Status::Killed => "killed".to_string(),
-        Status::SandboxError(message) => format!("sandbox_error: {message}"),
+        Status::Success => colorize("success", "32", color),
+        Status::Failed => colorize("failed", "31", color),
+        Status::Timeout => colorize("timeout", "33", color),
+        Status::Killed => colorize("killed", "35", color),
+        Status::SandboxError(message) => {
+            if color {
+                format!("\x1b[31msandbox_error: {message}\x1b[0m")
+            } else {
+                format!("sandbox_error: {message}")
+            }
+        }
     }
 }
 
-fn print_human_plan(plan: &ExecutionPlan) {
+fn colorize(value: &str, code: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{value}\x1b[0m")
+    } else {
+        value.to_string()
+    }
+}
+
+fn print_human_plan(plan: &ExecutionPlan, _output: &OutputOptions) {
     let mut table = Table::new();
     table
         .set_header(vec!["Field", "Value"])
@@ -1344,8 +1501,8 @@ mod tests {
         apply_replica_sync_back, build_execution_plan, collect_syncable_replica_changes,
         copy_workspace_with_default_exclusions, doctor_rows, execution_status,
         execution_status_from_exit_status, load_replica_ignore_config, resolve_execution_path,
-        run_monitored_child, select_default_mode, should_exclude_default_replica_path, CommandArgs,
-        ReplicaSyncChange, RunTermination,
+        run_monitored_child, select_default_mode, should_exclude_default_replica_path,
+        should_use_color, Cli, CommandArgs, Commands, ReplicaSyncChange, RunTermination,
     };
     use clap::Parser;
     use clawcrate_capture::{FsChange, FsChangeKind};
@@ -1364,7 +1521,7 @@ mod tests {
 
     #[test]
     fn parses_plan_command_with_profile_and_command() {
-        let cli = super::Cli::parse_from([
+        let cli = Cli::parse_from([
             "clawcrate",
             "plan",
             "--profile",
@@ -1375,7 +1532,7 @@ mod tests {
         ]);
 
         match cli.command {
-            super::Commands::Plan(args) => {
+            Commands::Plan(args) => {
                 assert_eq!(args.profile.as_deref(), Some("build"));
                 assert_eq!(args.command, vec!["cargo".to_string(), "test".to_string()]);
                 assert!(!args.json);
@@ -1386,12 +1543,35 @@ mod tests {
 
     #[test]
     fn parses_doctor_command_with_json() {
-        let cli = super::Cli::parse_from(["clawcrate", "doctor", "--json"]);
+        let cli = Cli::parse_from(["clawcrate", "doctor", "--json"]);
 
         match cli.command {
-            super::Commands::Doctor(args) => assert!(args.json),
+            Commands::Doctor(args) => assert!(args.json),
             _ => panic!("expected doctor command"),
         }
+    }
+
+    #[test]
+    fn parses_global_verbose_and_no_color_flags() {
+        let cli = Cli::parse_from([
+            "clawcrate",
+            "--verbose",
+            "--no-color",
+            "plan",
+            "--",
+            "echo",
+            "hello",
+        ]);
+        assert_eq!(cli.global.verbose, 1);
+        assert!(cli.global.no_color);
+    }
+
+    #[test]
+    fn color_policy_respects_flag_env_and_tty() {
+        assert!(!should_use_color(true, false, true));
+        assert!(!should_use_color(false, true, true));
+        assert!(!should_use_color(false, false, false));
+        assert!(should_use_color(false, false, true));
     }
 
     #[test]
