@@ -1,0 +1,7 @@
+Kernel Version=<KERNEL_VERSION>
+Landlock ABI=<LANDLOCK_STATUS>
+Platform=<PLATFORM>
+Seatbelt=<SEATBELT_STATUS>
+User Namespaces=<USER_NAMESPACES_STATUS>
+macOS Version=<MACOS_VERSION>
+seccomp=<SECCOMP_STATUS>

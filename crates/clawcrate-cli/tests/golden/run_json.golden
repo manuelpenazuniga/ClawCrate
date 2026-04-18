@@ -1,0 +1,16 @@
+{
+  "backend": "<BACKEND>",
+  "dropped_output_bytes": 0,
+  "fs_changes": 0,
+  "output_truncated": false,
+  "result": {
+    "artifacts_dir": "<ARTIFACTS_DIR>",
+    "duration_ms": "<DURATION_MS>",
+    "exit_code": "<EXIT_CODE_OR_NULL>",
+    "id": "<EXECUTION_ID>",
+    "status": "<STATUS>"
+  },
+  "scrubbed_env_vars": "<SCRUBBED_ENV_COUNT>",
+  "stderr_log": "<STDERR_LOG>",
+  "stdout_log": "<STDOUT_LOG>"
+}

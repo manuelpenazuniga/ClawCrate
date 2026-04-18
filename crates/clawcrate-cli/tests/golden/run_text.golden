@@ -1,0 +1,12 @@
+Artifacts Directory=<ARTIFACTS_DIR>
+Backend=<BACKEND>
+Dropped Output=0 bytes
+Duration=<DURATION>
+Env Vars Scrubbed=<SCRUBBED_ENV_COUNT>
+Execution ID=<EXECUTION_ID>
+Exit Code=<EXIT_CODE_OR_NA>
+FS Changes=0
+Output Truncated=no
+Status=<STATUS>
+stderr.log=<STDERR_LOG>
+stdout.log=<STDOUT_LOG>
