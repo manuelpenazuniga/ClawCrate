@@ -201,9 +201,9 @@ When `--json` is enabled, sync-back is deterministically skipped (non-interactiv
 ## CLI Reference
 
 ```
-clawcrate run [--profile PROFILE] [--replica | --direct] -- COMMAND...
-clawcrate plan [--profile PROFILE] [--replica | --direct] -- COMMAND...
-clawcrate doctor
+clawcrate [--verbose] [--no-color] run [--profile PROFILE] [--replica | --direct] -- COMMAND...
+clawcrate [--verbose] [--no-color] plan [--profile PROFILE] [--replica | --direct] -- COMMAND...
+clawcrate [--verbose] [--no-color] doctor
 ```
 
 | Flag | Effect |
@@ -212,8 +212,12 @@ clawcrate doctor
 | `--replica` | Force Replica Mode (for profiles that default to Direct) |
 | `--direct` | Force Direct Mode (for profiles that default to Replica) |
 | `--json` | Machine-readable output (for agent integration) |
+| `--verbose` / `-v` | Show detailed diagnostic logs (error chain, execution stages) |
+| `--no-color` | Disable ANSI colors in human-readable output |
 
 `clawcrate run` forwards `SIGINT`/`SIGTERM` to the sandboxed child and still writes final artifacts (`result.json`, logs, `fs-diff.json`) before exit. It also enforces a runtime timeout based on profile `resources.max_cpu_seconds`.
+
+Set `NO_COLOR=1` to disable ANSI colors via environment variable.
 
 ## Architecture
 
