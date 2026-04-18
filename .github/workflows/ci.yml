@@ -39,8 +39,34 @@ jobs:
       - name: Cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Cargo test
-        run: cargo test --workspace
-
       - name: Cargo check
         run: cargo check --workspace
+
+  integration-and-fixtures:
+    name: Integration + Fixtures (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Workspace tests
+        run: cargo test --workspace
+
+      - name: CLI integration tests
+        run: cargo test -p clawcrate-cli --test install_replica_integration
+
+      - name: CLI golden output tests
+        run: cargo test -p clawcrate-cli --test golden_cli_outputs
+
+      - name: Sandbox security fixtures
+        run: cargo test -p clawcrate-sandbox --test security_fixtures
