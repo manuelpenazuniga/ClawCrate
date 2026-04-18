@@ -1,0 +1,18 @@
+version: 1
+profiles:
+  - id: npm-install-allowlist
+    title: npm install with minimal registry allowlist
+    path: npm-install-allowlist.yaml
+    owner: "@clawcrate-community"
+    tags:
+      - node
+      - install
+      - filtered-network
+  - id: pip-install-pypi-only
+    title: pip install restricted to PyPI domains
+    path: pip-install-pypi-only.yaml
+    owner: "@clawcrate-community"
+    tags:
+      - python
+      - install
+      - filtered-network

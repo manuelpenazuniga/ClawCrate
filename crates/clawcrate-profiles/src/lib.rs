@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use clawcrate_types::{DefaultMode, NetLevel, ResolvedProfile, ResourceLimits};
 use serde::Deserialize;
@@ -39,8 +39,36 @@ pub enum ProfileError {
     InvalidFilteredNetwork { path: PathBuf, reason: String },
     #[error("invalid default_mode value in {path}: {value}")]
     InvalidDefaultMode { path: PathBuf, value: String },
+    #[error("failed to parse community catalog {path}: {source}")]
+    ParseCatalog {
+        path: PathBuf,
+        #[source]
+        source: serde_yaml::Error,
+    },
+    #[error("invalid community catalog in {path}: {reason}")]
+    InvalidCatalog { path: PathBuf, reason: String },
     #[error("cyclic profile inheritance detected at {0}")]
     InheritanceCycle(String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommunityCatalog {
+    pub version: u32,
+    #[serde(default)]
+    pub profiles: Vec<CommunityCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommunityCatalogEntry {
+    pub id: String,
+    pub title: String,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +95,10 @@ impl ProfileResolver {
 
     pub fn profiles_dir(&self) -> &Path {
         &self.profiles_dir
+    }
+
+    pub fn community_catalog_path(&self) -> PathBuf {
+        self.profiles_dir.join("community").join("catalog.yaml")
     }
 
     pub fn resolve(&self, profile: &str) -> Result<ResolvedProfile, ProfileError> {
@@ -108,6 +140,93 @@ impl ProfileResolver {
         };
         apply_stack_overrides(&mut resolved, stack);
         Ok(resolved)
+    }
+
+    pub fn load_community_catalog(
+        &self,
+        catalog_path: impl AsRef<Path>,
+    ) -> Result<CommunityCatalog, ProfileError> {
+        let path = catalog_path.as_ref();
+        let content = fs::read_to_string(path).map_err(|source| ProfileError::ReadFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        serde_yaml::from_str(&content).map_err(|source| ProfileError::ParseCatalog {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    pub fn validate_community_catalog(
+        &self,
+        catalog_path: impl AsRef<Path>,
+    ) -> Result<usize, ProfileError> {
+        let catalog_path = catalog_path.as_ref();
+        let catalog = self.load_community_catalog(catalog_path)?;
+        if catalog.version != 1 {
+            return Err(ProfileError::InvalidCatalog {
+                path: catalog_path.to_path_buf(),
+                reason: format!("unsupported version {}; expected 1", catalog.version),
+            });
+        }
+
+        let catalog_dir = catalog_path.parent().unwrap_or_else(|| Path::new("."));
+        let mut seen_ids = HashSet::new();
+        let mut seen_paths = HashSet::new();
+
+        for entry in &catalog.profiles {
+            let normalized_id = normalize_string(&entry.id);
+            if entry.id != normalized_id || !is_valid_catalog_id(&entry.id) {
+                return Err(ProfileError::InvalidCatalog {
+                    path: catalog_path.to_path_buf(),
+                    reason: format!(
+                        "entry id '{}' must be lowercase kebab-case [a-z0-9-]",
+                        entry.id
+                    ),
+                });
+            }
+            if !seen_ids.insert(entry.id.clone()) {
+                return Err(ProfileError::InvalidCatalog {
+                    path: catalog_path.to_path_buf(),
+                    reason: format!("duplicate entry id '{}'", entry.id),
+                });
+            }
+            if entry.path.is_absolute() {
+                return Err(ProfileError::InvalidCatalog {
+                    path: catalog_path.to_path_buf(),
+                    reason: format!("entry '{}' path must be relative", entry.id),
+                });
+            }
+            if entry
+                .path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+            {
+                return Err(ProfileError::InvalidCatalog {
+                    path: catalog_path.to_path_buf(),
+                    reason: format!("entry '{}' path cannot escape catalog directory", entry.id),
+                });
+            }
+            if entry.path.extension().and_then(|it| it.to_str()) != Some("yaml") {
+                return Err(ProfileError::InvalidCatalog {
+                    path: catalog_path.to_path_buf(),
+                    reason: format!("entry '{}' path must end in .yaml", entry.id),
+                });
+            }
+            let path_key = entry.path.to_string_lossy().to_string();
+            if !seen_paths.insert(path_key) {
+                return Err(ProfileError::InvalidCatalog {
+                    path: catalog_path.to_path_buf(),
+                    reason: format!("duplicate profile path '{}'", entry.path.display()),
+                });
+            }
+
+            let profile_path = catalog_dir.join(&entry.path);
+            self.resolve_from_path(&profile_path)?;
+        }
+
+        Ok(catalog.profiles.len())
     }
 
     fn resolve_entry(
@@ -432,6 +551,20 @@ fn normalize_allowed_domains(values: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn is_valid_catalog_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return false;
+    }
+
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
 fn looks_like_path(reference: &str) -> bool {
     reference.ends_with(".yaml")
         || reference.ends_with(".yml")
@@ -750,5 +883,79 @@ network:
             .expect_err("filtered network without allowed domains should fail");
         let message = error.to_string();
         assert!(message.contains("allowed_domains"));
+    }
+
+    #[test]
+    fn validates_repository_community_catalog() {
+        let resolver = ProfileResolver::default();
+        let count = resolver
+            .validate_community_catalog(resolver.community_catalog_path())
+            .expect("validate bundled community catalog");
+        assert!(count >= 1);
+    }
+
+    #[test]
+    fn rejects_catalog_entry_with_parent_directory_escape() {
+        let resolver = ProfileResolver::default();
+        let tmp = unique_tmp_dir("clawcrate_profiles_catalog_path_escape");
+        let catalog = tmp.join("catalog.yaml");
+
+        write(
+            &catalog,
+            r#"
+version: 1
+profiles:
+  - id: escaped-entry
+    title: Escaped
+    path: ../outside.yaml
+"#,
+        );
+
+        let error = resolver
+            .validate_community_catalog(&catalog)
+            .expect_err("catalog path escape should fail");
+        assert!(error.to_string().contains("cannot escape"));
+    }
+
+    #[test]
+    fn rejects_catalog_entry_with_duplicate_id() {
+        let resolver = ProfileResolver::default();
+        let tmp = unique_tmp_dir("clawcrate_profiles_catalog_duplicate_id");
+        let catalog = tmp.join("catalog.yaml");
+        let first = tmp.join("one.yaml");
+        let second = tmp.join("two.yaml");
+
+        write(
+            &first,
+            r#"
+name: one
+extends: safe
+"#,
+        );
+        write(
+            &second,
+            r#"
+name: two
+extends: safe
+"#,
+        );
+        write(
+            &catalog,
+            r#"
+version: 1
+profiles:
+  - id: duplicate
+    title: One
+    path: one.yaml
+  - id: duplicate
+    title: Two
+    path: two.yaml
+"#,
+        );
+
+        let error = resolver
+            .validate_community_catalog(&catalog)
+            .expect_err("duplicate catalog id should fail");
+        assert!(error.to_string().contains("duplicate entry id"));
     }
 }

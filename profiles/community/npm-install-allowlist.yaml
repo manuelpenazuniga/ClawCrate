@@ -1,0 +1,26 @@
+name: npm-install-allowlist
+extends: install
+filesystem:
+  read:
+    - "."
+    - "~/.npm"
+    - "~/.pnpm-store"
+  write:
+    - "./node_modules"
+    - "./package-lock.json"
+    - "./pnpm-lock.yaml"
+    - "~/.npm"
+    - "~/.pnpm-store"
+network:
+  mode: filtered
+  allowed_domains:
+    - registry.npmjs.org
+    - registry.yarnpkg.com
+    - "*.pkg.dev"
+environment:
+  scrub:
+    - "*_TOKEN*"
+    - "NPM_TOKEN"
+  passthrough:
+    - HOME
+    - PATH
