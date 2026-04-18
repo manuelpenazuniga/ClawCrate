@@ -1,0 +1,24 @@
+name: pip-install-pypi-only
+extends: install
+filesystem:
+  read:
+    - "."
+    - "~/.cache/pip"
+  write:
+    - "./.venv"
+    - "./requirements.txt"
+    - "./requirements.lock"
+    - "~/.cache/pip"
+network:
+  mode: filtered
+  allowed_domains:
+    - pypi.org
+    - files.pythonhosted.org
+environment:
+  scrub:
+    - "PIP_INDEX_URL"
+    - "PIP_EXTRA_INDEX_URL"
+    - "*_TOKEN*"
+  passthrough:
+    - HOME
+    - PATH
