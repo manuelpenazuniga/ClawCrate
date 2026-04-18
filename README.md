@@ -195,7 +195,8 @@ Replica copy exclusions: default `.env`, `.env.*`, `.git/config`, plus any rules
 
 Mode precedence is explicit: `--replica` / `--direct` flags override the profile default mode. Without flags, the profile default applies (`install` => Replica, most others => Direct).
 
-**Syncing changes back always requires explicit confirmation. It never happens automatically.**
+**Syncing changes back always requires explicit confirmation in interactive mode.**
+When `--json` is enabled, sync-back is deterministically skipped (non-interactive behavior).
 
 ## CLI Reference
 

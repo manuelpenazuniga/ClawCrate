@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, ExitStatus};
 use std::thread;
@@ -11,7 +12,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 use clawcrate_audit::ArtifactWriter;
 use clawcrate_capture::{
     capture_streams, diff_snapshots, snapshot_paths, CaptureConfig, CaptureError, CaptureSummary,
-    FsChange,
+    FsChange, FsChangeKind,
 };
 use clawcrate_profiles::ProfileResolver;
 #[cfg(target_os = "macos")]
@@ -188,6 +189,7 @@ fn handle_run(resolver: &ProfileResolver, args: CommandArgs) -> Result<()> {
     writer
         .write_fs_diff(&pipeline.fs_diff)
         .map_err(|source| anyhow!("failed to write fs-diff artifact: {source}"))?;
+    maybe_sync_back_replica(&plan, &writer, &args, &pipeline.fs_diff)?;
 
     let duration_ms = started_at.elapsed().as_millis() as u64;
     append_audit_event(
@@ -496,6 +498,183 @@ fn should_exclude_default_replica_path(relative_path: &Path) -> bool {
 
 fn is_secret_env_filename(file_name: &str) -> bool {
     file_name == ".env" || file_name.starts_with(".env.")
+}
+
+#[derive(Debug, Clone)]
+struct ReplicaSyncChange {
+    relative_path: PathBuf,
+    kind: FsChangeKind,
+}
+
+fn maybe_sync_back_replica(
+    plan: &ExecutionPlan,
+    writer: &ArtifactWriter,
+    args: &CommandArgs,
+    fs_diff: &[FsChange],
+) -> Result<()> {
+    let WorkspaceMode::Replica { source, copy } = &plan.mode else {
+        return Ok(());
+    };
+
+    let ignore_config = load_replica_ignore_config(source)?;
+    let sync_changes = collect_syncable_replica_changes(copy, source, fs_diff, &ignore_config);
+    let changes = sync_changes.len();
+
+    if changes == 0 {
+        append_audit_event(
+            writer,
+            AuditEventKind::ReplicaSyncBack {
+                approved: false,
+                changes: 0,
+            },
+        )?;
+        return Ok(());
+    }
+
+    if args.json {
+        append_audit_event(
+            writer,
+            AuditEventKind::ReplicaSyncBack {
+                approved: false,
+                changes,
+            },
+        )?;
+        return Ok(());
+    }
+
+    if !io::stdin().is_terminal() {
+        println!(
+            "Replica sync-back skipped (non-interactive stdin). Pending changes remain in {}",
+            copy.display()
+        );
+        append_audit_event(
+            writer,
+            AuditEventKind::ReplicaSyncBack {
+                approved: false,
+                changes,
+            },
+        )?;
+        return Ok(());
+    }
+
+    let approved = prompt_replica_sync_back(changes, source)?;
+    if approved {
+        apply_replica_sync_back(source, copy, &sync_changes)?;
+        println!(
+            "Replica sync-back complete: {} change(s) applied to {}",
+            changes,
+            source.display()
+        );
+    } else {
+        println!(
+            "Replica sync-back skipped. Pending changes remain in {}",
+            copy.display()
+        );
+    }
+
+    append_audit_event(
+        writer,
+        AuditEventKind::ReplicaSyncBack { approved, changes },
+    )?;
+    Ok(())
+}
+
+fn collect_syncable_replica_changes(
+    copy_root: &Path,
+    source_root: &Path,
+    fs_diff: &[FsChange],
+    ignore_config: &ReplicaIgnoreConfig,
+) -> Vec<ReplicaSyncChange> {
+    fs_diff
+        .iter()
+        .filter_map(|change| {
+            let relative_path = change.path.strip_prefix(copy_root).ok()?;
+            if relative_path.as_os_str().is_empty() {
+                return None;
+            }
+            if should_exclude_replica_path(relative_path, false, source_root, ignore_config) {
+                return None;
+            }
+
+            Some(ReplicaSyncChange {
+                relative_path: relative_path.to_path_buf(),
+                kind: change.kind,
+            })
+        })
+        .collect()
+}
+
+fn prompt_replica_sync_back(changes: usize, source: &Path) -> Result<bool> {
+    println!(
+        "Replica run produced {changes} file change(s) eligible for sync-back to {}.",
+        source.display()
+    );
+    print!("Sync back to the source workspace? [y/N]: ");
+    io::stdout()
+        .flush()
+        .map_err(|source_error| anyhow!("failed to flush sync-back prompt: {source_error}"))?;
+
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|source_error| anyhow!("failed to read sync-back response: {source_error}"))?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
+fn apply_replica_sync_back(
+    source_root: &Path,
+    copy_root: &Path,
+    changes: &[ReplicaSyncChange],
+) -> Result<()> {
+    for change in changes {
+        let source_path = source_root.join(&change.relative_path);
+        match change.kind {
+            FsChangeKind::Created | FsChangeKind::Modified => {
+                let replica_path = copy_root.join(&change.relative_path);
+                if !replica_path.is_file() {
+                    continue;
+                }
+
+                if let Some(parent) = source_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|source_error| {
+                        anyhow!(
+                            "failed to prepare sync-back directory {}: {source_error}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                std::fs::copy(&replica_path, &source_path).map_err(|source_error| {
+                    anyhow!(
+                        "failed to sync-back file {} to {}: {source_error}",
+                        replica_path.display(),
+                        source_path.display()
+                    )
+                })?;
+            }
+            FsChangeKind::Deleted => {
+                if source_path.exists() {
+                    if source_path.is_dir() {
+                        std::fs::remove_dir_all(&source_path).map_err(|source_error| {
+                            anyhow!(
+                                "failed to remove sync-back directory {}: {source_error}",
+                                source_path.display()
+                            )
+                        })?;
+                    } else {
+                        std::fs::remove_file(&source_path).map_err(|source_error| {
+                            anyhow!(
+                                "failed to remove sync-back file {}: {source_error}",
+                                source_path.display()
+                            )
+                        })?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn runs_root() -> Result<PathBuf> {
@@ -1162,12 +1341,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_execution_plan, copy_workspace_with_default_exclusions, doctor_rows,
-        execution_status, execution_status_from_exit_status, load_replica_ignore_config,
-        resolve_execution_path, run_monitored_child, select_default_mode,
-        should_exclude_default_replica_path, CommandArgs, RunTermination,
+        apply_replica_sync_back, build_execution_plan, collect_syncable_replica_changes,
+        copy_workspace_with_default_exclusions, doctor_rows, execution_status,
+        execution_status_from_exit_status, load_replica_ignore_config, resolve_execution_path,
+        run_monitored_child, select_default_mode, should_exclude_default_replica_path, CommandArgs,
+        ReplicaSyncChange, RunTermination,
     };
     use clap::Parser;
+    use clawcrate_capture::{FsChange, FsChangeKind};
     use clawcrate_profiles::ProfileResolver;
     use clawcrate_types::{DefaultMode, Platform, Status, SystemCapabilities, WorkspaceMode};
 
@@ -1489,6 +1670,84 @@ mod tests {
         assert!(replica.join("nested/keep.md").exists());
         assert!(!replica.join("skip.log").exists());
         assert!(!replica.join("nested/tmp/skip.txt").exists());
+    }
+
+    #[test]
+    fn collect_syncable_replica_changes_filters_exclusions_and_outside_paths() {
+        let source = unique_tmp_dir("clawcrate_cli_sync_source");
+        let copy = unique_tmp_dir("clawcrate_cli_sync_copy");
+        fs::write(source.join(".clawcrateignore"), "*.log\n").expect("write .clawcrateignore");
+
+        let fs_diff = vec![
+            FsChange {
+                path: copy.join("keep.txt"),
+                kind: FsChangeKind::Created,
+                size_bytes: Some(10),
+            },
+            FsChange {
+                path: copy.join("drop.log"),
+                kind: FsChangeKind::Created,
+                size_bytes: Some(8),
+            },
+            FsChange {
+                path: copy.join(".env"),
+                kind: FsChangeKind::Created,
+                size_bytes: Some(6),
+            },
+            FsChange {
+                path: source.join("outside.txt"),
+                kind: FsChangeKind::Created,
+                size_bytes: Some(5),
+            },
+        ];
+
+        let ignore_config = load_replica_ignore_config(&source).expect("load ignore config");
+        let changes = collect_syncable_replica_changes(&copy, &source, &fs_diff, &ignore_config);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].relative_path, PathBuf::from("keep.txt"));
+        assert_eq!(changes[0].kind, FsChangeKind::Created);
+    }
+
+    #[test]
+    fn apply_replica_sync_back_applies_created_modified_and_deleted_files() {
+        let source = unique_tmp_dir("clawcrate_cli_sync_apply_source");
+        let copy = unique_tmp_dir("clawcrate_cli_sync_apply_copy");
+        fs::create_dir_all(source.join("dir")).expect("create source dir");
+        fs::create_dir_all(copy.join("dir")).expect("create copy dir");
+
+        fs::write(source.join("dir/modified.txt"), "before").expect("write source modified before");
+        fs::write(copy.join("dir/modified.txt"), "after").expect("write source modified after");
+
+        fs::write(copy.join("new.txt"), "new").expect("write created file");
+        fs::write(source.join("remove.txt"), "remove").expect("write deleted file");
+
+        let changes = vec![
+            ReplicaSyncChange {
+                relative_path: PathBuf::from("dir/modified.txt"),
+                kind: FsChangeKind::Modified,
+            },
+            ReplicaSyncChange {
+                relative_path: PathBuf::from("new.txt"),
+                kind: FsChangeKind::Created,
+            },
+            ReplicaSyncChange {
+                relative_path: PathBuf::from("remove.txt"),
+                kind: FsChangeKind::Deleted,
+            },
+        ];
+
+        apply_replica_sync_back(&source, &copy, &changes).expect("apply sync-back");
+
+        assert_eq!(
+            fs::read_to_string(source.join("dir/modified.txt")).expect("read modified file"),
+            "after"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("new.txt")).expect("read new file"),
+            "new"
+        );
+        assert!(!source.join("remove.txt").exists());
     }
 
     #[test]
