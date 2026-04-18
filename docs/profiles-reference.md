@@ -1,4 +1,4 @@
-# Profiles Reference (Alpha)
+# Profiles Reference
 
 This reference covers built-in and custom profiles as implemented in `clawcrate-profiles`.
 
@@ -95,7 +95,9 @@ filesystem:
   read: ["."]
   write: ["./target"]
   deny: []
-network: none          # none | open
+network:
+  mode: none           # none | open | filtered
+  allowed_domains: []  # required when mode=filtered
 environment:
   scrub: ["*_SECRET*", "AWS_*"]
   passthrough: ["HOME", "PATH"]
@@ -115,12 +117,29 @@ resources:
 
 Inheritance is merged field-by-field and cycle-checked.
 
+`network` also supports shorthand string form for `none` and `open`:
+
+```yaml
+network: open
+```
+
+For filtered mode, object form is required:
+
+```yaml
+network:
+  mode: filtered
+  allowed_domains:
+    - "registry.npmjs.org"
+    - "*.pkg.dev"
+```
+
 ## Validation Rules
 
 Parser behavior includes:
 
 - unknown YAML fields are rejected (`deny_unknown_fields`)
 - invalid `network` values fail profile load
+- `network.mode: filtered` without `allowed_domains` fails profile load
 - invalid `default_mode` values fail profile load
 - missing profile file fails with explicit path error
 

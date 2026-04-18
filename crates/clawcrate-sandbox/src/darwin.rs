@@ -201,6 +201,7 @@ fn generate_sbpl_profile(prepared: &PreparedDarwinSandbox, home: Option<&Path>) 
     match prepared.net {
         NetLevel::None => lines.push("(deny network*)".to_string()),
         NetLevel::Open => lines.push("(allow network*)".to_string()),
+        NetLevel::Filtered { .. } => lines.push("(allow network*)".to_string()),
     }
 
     lines.extend(prepared.fs_read.iter().flat_map(|path| {
