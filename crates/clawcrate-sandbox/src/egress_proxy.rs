@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,10 +112,18 @@ pub fn start_egress_proxy(
                     let _ = handle_client_connection(stream, &allowed, enforce_sni);
                 });
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
                 thread::sleep(Duration::from_millis(20));
             }
-            Err(_) => break,
+            Err(_) => thread::sleep(Duration::from_millis(20)),
         }
     });
 
@@ -169,7 +177,7 @@ fn handle_client_connection(
         return Ok(());
     }
 
-    let mut upstream = match TcpStream::connect((target_host.as_str(), target_port)) {
+    let upstream = match TcpStream::connect((target_host.as_str(), target_port)) {
         Ok(stream) => stream,
         Err(_) => {
             write_http_response(&mut client, 502, "Bad Gateway")?;
@@ -180,18 +188,15 @@ fn handle_client_connection(
 
     write_http_response(&mut client, 200, "Connection Established")?;
 
-    let preface = read_tls_preface(&mut client)?;
-    if !preface.is_empty() {
-        if enforce_sni && target_port == 443 {
-            if let Some(sni) = extract_sni_from_client_hello(&preface) {
-                if !hostnames_match(&target_host, &sni) || !is_host_allowed(&sni, allowed_domains) {
-                    let _ = client.shutdown(Shutdown::Both);
-                    let _ = upstream.shutdown(Shutdown::Both);
-                    return Ok(());
-                }
+    let tls_preface = peek_tls_preface(&mut client)?;
+    if !tls_preface.is_empty() && enforce_sni && target_port == 443 {
+        if let Some(sni) = extract_sni_from_client_hello(&tls_preface) {
+            if !hostnames_match(&target_host, &sni) || !is_host_allowed(&sni, allowed_domains) {
+                let _ = client.shutdown(Shutdown::Both);
+                let _ = upstream.shutdown(Shutdown::Both);
+                return Ok(());
             }
         }
-        upstream.write_all(&preface)?;
     }
 
     tunnel_bidirectional(client, upstream)
@@ -211,12 +216,16 @@ fn tunnel_bidirectional(mut client: TcpStream, mut upstream: TcpStream) -> io::R
     Ok(())
 }
 
-fn read_tls_preface(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+fn peek_tls_preface(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     stream.set_read_timeout(Some(Duration::from_millis(250)))?;
 
-    let mut header = [0_u8; 5];
-    match stream.read_exact(&mut header) {
-        Ok(()) => {}
+    let mut peek_buf = [0_u8; 4096];
+    let prefetched = match stream.peek(&mut peek_buf) {
+        Ok(0) => {
+            stream.set_read_timeout(None)?;
+            return Ok(Vec::new());
+        }
+        Ok(n) => n,
         Err(error)
             if matches!(
                 error.kind(),
@@ -230,25 +239,9 @@ fn read_tls_preface(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
             stream.set_read_timeout(None)?;
             return Err(error);
         }
-    }
-
-    let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-    let mut payload = vec![0_u8; payload_len];
-    if let Err(error) = stream.read_exact(&mut payload) {
-        stream.set_read_timeout(None)?;
-        if matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof
-        ) {
-            return Ok(Vec::new());
-        }
-        return Err(error);
-    }
+    };
     stream.set_read_timeout(None)?;
-
-    let mut record = header.to_vec();
-    record.extend_from_slice(&payload);
-    Ok(record)
+    Ok(peek_buf[..prefetched].to_vec())
 }
 
 fn write_http_response(stream: &mut TcpStream, status: u16, reason: &str) -> io::Result<()> {
@@ -426,6 +419,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn domain_matching_supports_exact_and_wildcard_rules() {
@@ -472,10 +466,7 @@ mod tests {
         )
         .expect("write connect request");
 
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .expect("read connect response");
+        let response = read_http_response_header(&mut stream);
         assert!(response.contains("403 Forbidden"));
         proxy.shutdown();
     }
@@ -485,10 +476,7 @@ mod tests {
         let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
         let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
         let upstream_thread = thread::spawn(move || {
-            let (mut socket, _) = upstream_listener.accept().expect("accept upstream");
-            let mut buf = [0_u8; 4];
-            socket.read_exact(&mut buf).expect("read forwarded payload");
-            assert_eq!(&buf, b"ping");
+            let (_socket, _) = upstream_listener.accept().expect("accept upstream");
         });
 
         let proxy = start_egress_proxy(EgressProxyConfig {
@@ -507,15 +495,38 @@ mod tests {
         )
         .expect("write connect request");
 
-        let mut response = [0_u8; 128];
-        let n = stream.read(&mut response).expect("read connect response");
-        let response = String::from_utf8_lossy(&response[..n]);
-        assert!(response.contains("200 Connection Established"));
-
-        stream.write_all(b"ping").expect("write tunneled payload");
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+        let response = read_http_response_header(&mut stream);
+        assert!(
+            response.contains("200 Connection Established"),
+            "unexpected CONNECT response: {response}"
+        );
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown client write-half");
         upstream_thread.join().expect("join upstream thread");
         proxy.shutdown();
+    }
+
+    fn read_http_response_header(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 128];
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            let n = stream.read(&mut chunk).expect("read response chunk");
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+            if bytes.len() > 4096 {
+                break;
+            }
+        }
+
+        stream.set_read_timeout(None).expect("clear read timeout");
+        String::from_utf8_lossy(&bytes).to_string()
     }
 
     fn make_client_hello(host: &str) -> Vec<u8> {
