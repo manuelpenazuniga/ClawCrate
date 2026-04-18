@@ -1,0 +1,9 @@
+{
+  "kernel_version": "<KERNEL_VERSION_OR_NULL>",
+  "landlock_abi": "<LANDLOCK_ABI_OR_NULL>",
+  "macos_version": "<MACOS_VERSION_OR_NULL>",
+  "platform": "<PLATFORM>",
+  "seatbelt_available": "<SEATBELT_BOOL>",
+  "seccomp_available": "<SECCOMP_BOOL>",
+  "user_namespaces": "<USER_NAMESPACES_BOOL>"
+}

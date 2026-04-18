@@ -1,0 +1,49 @@
+{
+  "actor": "Human",
+  "command": [
+    "/bin/echo",
+    "hello"
+  ],
+  "created_at": "<CREATED_AT>",
+  "cwd": "<EXECUTION_CWD>",
+  "id": "<EXECUTION_ID>",
+  "mode": "Direct",
+  "profile": {
+    "default_mode": "Direct",
+    "env_passthrough": [
+      "HOME",
+      "PATH",
+      "USER",
+      "SHELL",
+      "TERM",
+      "LANG",
+      "LC_*",
+      "TMPDIR",
+      "XDG_*"
+    ],
+    "env_scrub": [
+      "AWS_*",
+      "*_SECRET*",
+      "*_PASSWORD*",
+      "*_TOKEN*",
+      "*_KEY",
+      "SSH_AUTH_SOCK",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "DATABASE_URL"
+    ],
+    "fs_deny": [],
+    "fs_read": [
+      "."
+    ],
+    "fs_write": [],
+    "name": "safe",
+    "net": "None",
+    "resources": {
+      "max_cpu_seconds": 120,
+      "max_memory_mb": 2048,
+      "max_open_files": 1024,
+      "max_output_bytes": 2097152,
+      "max_processes": 128
+    }
+  }
+}

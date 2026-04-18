@@ -1,0 +1,9 @@
+Command=/bin/echo hello
+Env Scrub Patterns=8
+Execution CWD=<EXECUTION_CWD>
+Execution ID=<EXECUTION_ID>
+Filesystem Read Paths=1
+Filesystem Write Paths=0
+Network=none
+Profile=safe
+Workspace Mode=Direct
