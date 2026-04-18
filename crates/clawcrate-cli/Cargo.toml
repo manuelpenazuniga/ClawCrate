@@ -20,6 +20,7 @@ clawcrate-sandbox = { path = "../clawcrate-sandbox" }
 clawcrate-types = { path = "../clawcrate-types" }
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
+ignore = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v7"] }
