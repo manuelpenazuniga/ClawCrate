@@ -310,6 +310,8 @@ cargo clippy --workspace -- -D warnings
 
 See [CLAUDE.md](CLAUDE.md) for the complete development guide with architecture decisions, coding standards, and step-by-step build instructions.
 See [docs/WORKFLOW.md](docs/WORKFLOW.md) for the operational issue-to-PR workflow used in this repository.
+See [CHANGELOG.md](CHANGELOG.md) for release notes and version history.
+See [docs/release-checklist.md](docs/release-checklist.md) for the alpha release and tagging runbook.
 See [docs/architecture.md](docs/architecture.md), [docs/profiles-reference.md](docs/profiles-reference.md), [docs/kernel-requirements.md](docs/kernel-requirements.md), and [docs/integration-guide.md](docs/integration-guide.md) for the alpha technical docs pack.
 
 ## License
