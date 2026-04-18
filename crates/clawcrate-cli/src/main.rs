@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, ExitStatus};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,13 +37,14 @@ use nix::errno::Errno;
 use nix::sys::signal::{kill, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::Signals;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -85,6 +86,8 @@ enum Commands {
     Plan(CommandArgs),
     /// Check system sandboxing capabilities
     Doctor(DoctorArgs),
+    /// Serve local authenticated HTTP API for tool integrations
+    Api(ApiArgs),
 }
 
 #[derive(Debug, Args)]
@@ -121,6 +124,17 @@ struct DoctorArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct ApiArgs {
+    /// Bind address for local API server
+    #[arg(long, default_value = "127.0.0.1:8787")]
+    bind: String,
+
+    /// Bearer token for API authentication (fallback: CLAWCRATE_API_TOKEN)
+    #[arg(long)]
+    token: Option<String>,
+}
+
 fn main() {
     let cli = Cli::parse();
     let output = OutputOptions::from_global(&cli.global);
@@ -137,6 +151,7 @@ fn run(cli: Cli, output: OutputOptions) -> Result<()> {
         Commands::Plan(args) => handle_plan(&resolver, args, &output),
         Commands::Run(args) => handle_run(&resolver, args, &output),
         Commands::Doctor(args) => handle_doctor(args, &output),
+        Commands::Api(args) => handle_api(args, &output),
     }
 }
 
@@ -1641,6 +1656,281 @@ fn handle_doctor(args: DoctorArgs, output: &OutputOptions) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct ApiCommandRequest {
+    profile: Option<String>,
+    #[serde(default)]
+    replica: bool,
+    #[serde(default)]
+    direct: bool,
+    #[serde(default)]
+    approve_out_of_profile: bool,
+    command: Vec<String>,
+}
+
+#[derive(Debug)]
+enum ApiRoute {
+    Health,
+    Doctor,
+    Plan,
+    Run,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiCommandError {
+    error: String,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+fn handle_api(args: ApiArgs, output: &OutputOptions) -> Result<()> {
+    let token = resolve_api_token(&args)?;
+    let server = Server::http(&args.bind)
+        .map_err(|source| anyhow!("failed to bind local API on {}: {source}", args.bind))?;
+
+    verbose_log(output, 1, format!("api server listening on {}", args.bind));
+    println!("clawcrate api listening on http://{}", args.bind);
+
+    for request in server.incoming_requests() {
+        handle_api_request(request, &token, output);
+    }
+
+    Ok(())
+}
+
+fn resolve_api_token(args: &ApiArgs) -> Result<String> {
+    let token = args
+        .token
+        .clone()
+        .or_else(|| std::env::var("CLAWCRATE_API_TOKEN").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "missing API token: provide --token or set CLAWCRATE_API_TOKEN for `clawcrate api`"
+            )
+        })?;
+    Ok(token)
+}
+
+fn handle_api_request(mut request: Request, token: &str, output: &OutputOptions) {
+    if !request_authorized(request.headers(), token) {
+        respond_api_json(
+            request,
+            401,
+            &serde_json::json!({ "error": "unauthorized" }),
+        );
+        return;
+    }
+
+    let Some(route) = resolve_api_route(request.method(), request.url()) else {
+        respond_api_json(request, 404, &serde_json::json!({ "error": "not found" }));
+        return;
+    };
+
+    match route {
+        ApiRoute::Health => {
+            respond_api_json(
+                request,
+                200,
+                &serde_json::json!({
+                    "status": "ok",
+                    "version": env!("CARGO_PKG_VERSION")
+                }),
+            );
+        }
+        ApiRoute::Doctor => {
+            let args = vec!["doctor".to_string(), "--json".to_string()];
+            respond_api_with_cli_json(request, &args, output);
+        }
+        ApiRoute::Plan => {
+            let payload = match parse_api_command_payload(&mut request) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    respond_api_json(request, 400, &serde_json::json!({ "error": error }));
+                    return;
+                }
+            };
+            let args = match build_api_cli_args("plan", &payload) {
+                Ok(args) => args,
+                Err(error) => {
+                    respond_api_json(
+                        request,
+                        400,
+                        &serde_json::json!({ "error": error.to_string() }),
+                    );
+                    return;
+                }
+            };
+            respond_api_with_cli_json(request, &args, output);
+        }
+        ApiRoute::Run => {
+            let payload = match parse_api_command_payload(&mut request) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    respond_api_json(request, 400, &serde_json::json!({ "error": error }));
+                    return;
+                }
+            };
+            let args = match build_api_cli_args("run", &payload) {
+                Ok(args) => args,
+                Err(error) => {
+                    respond_api_json(
+                        request,
+                        400,
+                        &serde_json::json!({ "error": error.to_string() }),
+                    );
+                    return;
+                }
+            };
+            respond_api_with_cli_json(request, &args, output);
+        }
+    }
+}
+
+fn parse_api_command_payload(
+    request: &mut Request,
+) -> std::result::Result<ApiCommandRequest, String> {
+    let mut body = String::new();
+    request
+        .as_reader()
+        .read_to_string(&mut body)
+        .map_err(|source| format!("failed to read request body: {source}"))?;
+    serde_json::from_str::<ApiCommandRequest>(&body)
+        .map_err(|source| format!("invalid JSON body: {source}"))
+}
+
+fn build_api_cli_args(action: &str, payload: &ApiCommandRequest) -> Result<Vec<String>> {
+    if payload.command.is_empty() {
+        return Err(anyhow!("`command` must contain at least one element"));
+    }
+    if payload.replica && payload.direct {
+        return Err(anyhow!("`replica` and `direct` cannot be enabled together"));
+    }
+
+    let mut args = vec![action.to_string(), "--json".to_string()];
+    if let Some(profile) = &payload.profile {
+        args.push("--profile".to_string());
+        args.push(profile.clone());
+    }
+    if payload.replica {
+        args.push("--replica".to_string());
+    }
+    if payload.direct {
+        args.push("--direct".to_string());
+    }
+    if action == "run" && payload.approve_out_of_profile {
+        args.push("--approve-out-of-profile".to_string());
+    }
+    args.push("--".to_string());
+    args.extend(payload.command.clone());
+
+    Ok(args)
+}
+
+fn resolve_api_route(method: &Method, url: &str) -> Option<ApiRoute> {
+    let path = url.split('?').next().unwrap_or(url);
+    match (method, path) {
+        (Method::Get, "/v1/health") => Some(ApiRoute::Health),
+        (Method::Get, "/v1/doctor") => Some(ApiRoute::Doctor),
+        (Method::Post, "/v1/plan") => Some(ApiRoute::Plan),
+        (Method::Post, "/v1/run") => Some(ApiRoute::Run),
+        _ => None,
+    }
+}
+
+fn extract_bearer_token(headers: &[Header]) -> Option<String> {
+    headers
+        .iter()
+        .find(|header| header.field.equiv("Authorization"))
+        .and_then(|header| {
+            let value = header.value.as_str();
+            value
+                .strip_prefix("Bearer ")
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+        })
+        .map(ToString::to_string)
+}
+
+fn request_authorized(headers: &[Header], expected_token: &str) -> bool {
+    extract_bearer_token(headers)
+        .as_deref()
+        .map(|token| token == expected_token)
+        .unwrap_or(false)
+}
+
+fn respond_api_with_cli_json(request: Request, args: &[String], output: &OutputOptions) {
+    match execute_cli_json(args) {
+        Ok(value) => {
+            respond_api_json(request, 200, &value);
+        }
+        Err(error) => {
+            verbose_log(
+                output,
+                1,
+                format!(
+                    "api delegated command failed: args={:?}, error={}",
+                    args, error.error
+                ),
+            );
+            respond_api_json(request, 422, &error);
+        }
+    }
+}
+
+fn execute_cli_json(args: &[String]) -> std::result::Result<serde_json::Value, ApiCommandError> {
+    let exe = std::env::current_exe().map_err(|source| ApiCommandError {
+        error: format!("failed to resolve clawcrate executable path: {source}"),
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+    })?;
+
+    let output = Command::new(exe)
+        .args(args)
+        .output()
+        .map_err(|source| ApiCommandError {
+            error: format!("failed to execute delegated clawcrate command: {source}"),
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        return Err(ApiCommandError {
+            error: "delegated clawcrate command failed".to_string(),
+            exit_code: output.status.code(),
+            stdout,
+            stderr,
+        });
+    }
+
+    serde_json::from_str::<serde_json::Value>(&stdout).map_err(|source| ApiCommandError {
+        error: format!("delegated clawcrate output was not valid JSON: {source}"),
+        exit_code: output.status.code(),
+        stdout,
+        stderr,
+    })
+}
+
+fn respond_api_json<T: Serialize>(request: Request, status_code: u16, payload: &T) {
+    let body = match serde_json::to_string(payload) {
+        Ok(value) => value,
+        Err(source) => {
+            format!(r#"{{"error":"failed to serialize API response","detail":"{source}"}}"#)
+        }
+    };
+    let mut response = Response::from_string(body).with_status_code(StatusCode(status_code));
+    if let Ok(header) = Header::from_bytes("Content-Type", "application/json; charset=utf-8") {
+        response.add_header(header);
+    }
+    let _ = request.respond(response);
+}
+
 #[cfg(target_os = "linux")]
 fn probe_system_capabilities() -> Result<SystemCapabilities> {
     Ok(probe_linux_capabilities())
@@ -1878,12 +2168,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        apply_replica_sync_back, build_execution_plan, collect_syncable_replica_changes,
-        command_appears_to_need_network, copy_workspace_with_default_exclusions,
-        detect_out_of_profile_requests, doctor_rows, execution_status,
-        execution_status_from_exit_status, load_replica_ignore_config, resolve_execution_path,
-        run_monitored_child, select_default_mode, should_exclude_default_replica_path,
-        should_use_color, Cli, CommandArgs, Commands, ReplicaSyncChange, RunTermination,
+        apply_replica_sync_back, build_api_cli_args, build_execution_plan,
+        collect_syncable_replica_changes, command_appears_to_need_network,
+        copy_workspace_with_default_exclusions, detect_out_of_profile_requests, doctor_rows,
+        execution_status, execution_status_from_exit_status, extract_bearer_token,
+        load_replica_ignore_config, resolve_api_route, resolve_execution_path, run_monitored_child,
+        select_default_mode, should_exclude_default_replica_path, should_use_color,
+        ApiCommandRequest, Cli, CommandArgs, Commands, ReplicaSyncChange, RunTermination,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -1893,6 +2184,7 @@ mod tests {
         Actor, DefaultMode, ExecutionPlan, NetLevel, Platform, ResolvedProfile, ResourceLimits,
         Status, SystemCapabilities, WorkspaceMode,
     };
+    use tiny_http::{Header, Method};
 
     fn unique_tmp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1967,6 +2259,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_api_command_with_bind_and_token() {
+        let cli = Cli::parse_from([
+            "clawcrate",
+            "api",
+            "--bind",
+            "127.0.0.1:9999",
+            "--token",
+            "super-secret",
+        ]);
+
+        match cli.command {
+            Commands::Api(args) => {
+                assert_eq!(args.bind, "127.0.0.1:9999");
+                assert_eq!(args.token.as_deref(), Some("super-secret"));
+            }
+            _ => panic!("expected api command"),
+        }
+    }
+
+    #[test]
     fn parses_global_verbose_and_no_color_flags() {
         let cli = Cli::parse_from([
             "clawcrate",
@@ -1987,6 +2299,70 @@ mod tests {
         assert!(!should_use_color(false, true, true));
         assert!(!should_use_color(false, false, false));
         assert!(should_use_color(false, false, true));
+    }
+
+    #[test]
+    fn resolve_api_route_matches_supported_paths() {
+        assert!(matches!(
+            resolve_api_route(&Method::Get, "/v1/health"),
+            Some(super::ApiRoute::Health)
+        ));
+        assert!(matches!(
+            resolve_api_route(&Method::Get, "/v1/doctor"),
+            Some(super::ApiRoute::Doctor)
+        ));
+        assert!(matches!(
+            resolve_api_route(&Method::Post, "/v1/plan"),
+            Some(super::ApiRoute::Plan)
+        ));
+        assert!(matches!(
+            resolve_api_route(&Method::Post, "/v1/run?verbose=1"),
+            Some(super::ApiRoute::Run)
+        ));
+        assert!(resolve_api_route(&Method::Delete, "/v1/run").is_none());
+    }
+
+    #[test]
+    fn extract_bearer_token_reads_authorization_header() {
+        let header = Header::from_bytes("Authorization", "Bearer token-123")
+            .expect("create authorization header");
+        let missing = Header::from_bytes("X-Other", "value").expect("create random header");
+        let headers = vec![missing, header];
+        assert_eq!(extract_bearer_token(&headers).as_deref(), Some("token-123"));
+    }
+
+    #[test]
+    fn build_api_cli_args_enforces_command_and_flags() {
+        let valid = ApiCommandRequest {
+            profile: Some("build".to_string()),
+            replica: false,
+            direct: false,
+            approve_out_of_profile: true,
+            command: vec!["cargo".to_string(), "test".to_string()],
+        };
+        let run_args = build_api_cli_args("run", &valid).expect("build args");
+        assert_eq!(
+            run_args,
+            vec![
+                "run",
+                "--json",
+                "--profile",
+                "build",
+                "--approve-out-of-profile",
+                "--",
+                "cargo",
+                "test",
+            ]
+        );
+
+        let invalid = ApiCommandRequest {
+            profile: None,
+            replica: true,
+            direct: true,
+            approve_out_of_profile: false,
+            command: vec!["echo".to_string(), "hello".to_string()],
+        };
+        assert!(build_api_cli_args("plan", &invalid).is_err());
     }
 
     #[test]

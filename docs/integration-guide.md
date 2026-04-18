@@ -35,6 +35,39 @@ The JSON summary includes:
 - `result.artifacts_dir`
 - capture metadata (`stdout_log`, `stderr_log`, truncation counters)
 
+## Local API Surface (P2)
+
+For tool-to-tool integrations, you can run an authenticated local API:
+
+```bash
+export CLAWCRATE_API_TOKEN="change-me"
+clawcrate api --bind 127.0.0.1:8787
+```
+
+Supported endpoints:
+
+- `GET /v1/health`
+- `GET /v1/doctor`
+- `POST /v1/plan`
+- `POST /v1/run`
+
+`POST` payload schema:
+
+```json
+{
+  "profile": "build",
+  "replica": false,
+  "direct": false,
+  "approve_out_of_profile": false,
+  "command": ["cargo", "test"]
+}
+```
+
+Authentication:
+
+- header `Authorization: Bearer <token>`
+- token source: `--token` or `CLAWCRATE_API_TOKEN`
+
 ## Collect artifacts
 
 Given `result.artifacts_dir`, consume:

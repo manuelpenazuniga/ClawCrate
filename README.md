@@ -204,6 +204,7 @@ When `--json` is enabled, sync-back is deterministically skipped (non-interactiv
 clawcrate [--verbose] [--no-color] run [--profile PROFILE] [--replica | --direct] [--approve-out-of-profile] -- COMMAND...
 clawcrate [--verbose] [--no-color] plan [--profile PROFILE] [--replica | --direct] -- COMMAND...
 clawcrate [--verbose] [--no-color] doctor
+clawcrate [--verbose] [--no-color] api [--bind ADDR] [--token TOKEN]
 ```
 
 | Flag | Effect |
@@ -215,6 +216,8 @@ clawcrate [--verbose] [--no-color] doctor
 | `--json` | Machine-readable output (for agent integration) |
 | `--verbose` / `-v` | Show detailed diagnostic logs (error chain, execution stages) |
 | `--no-color` | Disable ANSI colors in human-readable output |
+| `api --bind <addr>` | Start local HTTP API (default `127.0.0.1:8787`) |
+| `api --token <token>` | Set bearer token for API auth (or use `CLAWCRATE_API_TOKEN`) |
 
 `clawcrate run` forwards `SIGINT`/`SIGTERM` to the sandboxed child and still writes final artifacts (`result.json`, logs, `fs-diff.json`) before exit. It also enforces a runtime timeout based on profile `resources.max_cpu_seconds`.
 
