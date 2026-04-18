@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clawcrate_types::{AuditEvent, ExecutionPlan, ExecutionResult};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 
 pub const CRATE_NAME: &str = "clawcrate-audit";
@@ -12,6 +13,7 @@ pub const PLAN_JSON: &str = "plan.json";
 pub const RESULT_JSON: &str = "result.json";
 pub const AUDIT_NDJSON: &str = "audit.ndjson";
 pub const FS_DIFF_JSON: &str = "fs-diff.json";
+pub const DEFAULT_AUDIT_DB: &str = "audit-index.sqlite3";
 
 #[derive(Debug, Clone)]
 pub struct ArtifactWriter {
@@ -148,6 +150,340 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), ArtifactW
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteIndexedRun {
+    pub execution_id: String,
+    pub has_result: bool,
+    pub event_count: usize,
+}
+
+#[derive(Debug)]
+pub struct SqliteAuditIndex {
+    db_path: PathBuf,
+    connection: Connection,
+}
+
+impl SqliteAuditIndex {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, SqliteAuditIndexError> {
+        let db_path = path.as_ref().to_path_buf();
+        if let Some(parent) = db_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| {
+                SqliteAuditIndexError::CreateParentDir {
+                    path: parent.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
+
+        let connection =
+            Connection::open(&db_path).map_err(|source| SqliteAuditIndexError::OpenDatabase {
+                path: db_path.clone(),
+                source,
+            })?;
+
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS executions (
+               execution_id TEXT PRIMARY KEY,
+               created_at TEXT NOT NULL,
+               command_json TEXT NOT NULL,
+               cwd TEXT NOT NULL,
+               profile_name TEXT NOT NULL,
+               mode_json TEXT NOT NULL,
+               net_json TEXT NOT NULL,
+               artifacts_dir TEXT,
+               status TEXT,
+               status_detail TEXT,
+               exit_code INTEGER,
+               duration_ms INTEGER,
+               indexed_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS audit_events (
+               execution_id TEXT NOT NULL,
+               sequence INTEGER NOT NULL,
+               timestamp TEXT NOT NULL,
+               event_kind TEXT NOT NULL,
+               payload_json TEXT NOT NULL,
+               PRIMARY KEY(execution_id, sequence),
+               FOREIGN KEY(execution_id) REFERENCES executions(execution_id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_audit_events_kind ON audit_events(event_kind);
+             CREATE INDEX IF NOT EXISTS idx_audit_events_ts ON audit_events(execution_id, timestamp);",
+        )
+        .map_err(|source| SqliteAuditIndexError::MigrateDatabase {
+            path: db_path.clone(),
+            source,
+        })?;
+
+        Ok(Self {
+            db_path,
+            connection,
+        })
+    }
+
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    pub fn index_artifacts_dir(
+        &mut self,
+        artifacts_dir: &Path,
+    ) -> Result<SqliteIndexedRun, SqliteAuditIndexError> {
+        let plan_path = artifacts_dir.join(PLAN_JSON);
+        let result_path = artifacts_dir.join(RESULT_JSON);
+        let audit_path = artifacts_dir.join(AUDIT_NDJSON);
+
+        let plan: ExecutionPlan = read_json_file(&plan_path)?;
+        let result = if result_path.exists() {
+            Some(read_json_file::<ExecutionResult>(&result_path)?)
+        } else {
+            None
+        };
+        let audit_events = read_ndjson_audit_events(&audit_path)?;
+
+        let mode_json = serde_json::to_string(&plan.mode).map_err(|source| {
+            SqliteAuditIndexError::Serialize {
+                path: plan_path.clone(),
+                source,
+            }
+        })?;
+        let net_json = serde_json::to_string(&plan.profile.net).map_err(|source| {
+            SqliteAuditIndexError::Serialize {
+                path: plan_path.clone(),
+                source,
+            }
+        })?;
+        let command_json = serde_json::to_string(&plan.command).map_err(|source| {
+            SqliteAuditIndexError::Serialize {
+                path: plan_path.clone(),
+                source,
+            }
+        })?;
+
+        let (status, status_detail, exit_code, duration_ms, artifacts_dir_value) = match &result {
+            Some(value) => {
+                let (status_label, detail) = result_status_columns(&value.status);
+                (
+                    Some(status_label),
+                    detail,
+                    value.exit_code,
+                    Some(value.duration_ms as i64),
+                    Some(value.artifacts_dir.display().to_string()),
+                )
+            }
+            None => (None, None, None, None, None),
+        };
+
+        let tx = self.connection.transaction().map_err(|source| {
+            SqliteAuditIndexError::WriteDatabase {
+                path: self.db_path.clone(),
+                source,
+            }
+        })?;
+
+        tx.execute(
+            "INSERT INTO executions (
+               execution_id, created_at, command_json, cwd, profile_name, mode_json, net_json,
+               artifacts_dir, status, status_detail, exit_code, duration_ms, indexed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(execution_id) DO UPDATE SET
+               created_at=excluded.created_at,
+               command_json=excluded.command_json,
+               cwd=excluded.cwd,
+               profile_name=excluded.profile_name,
+               mode_json=excluded.mode_json,
+               net_json=excluded.net_json,
+               artifacts_dir=excluded.artifacts_dir,
+               status=excluded.status,
+               status_detail=excluded.status_detail,
+               exit_code=excluded.exit_code,
+               duration_ms=excluded.duration_ms,
+               indexed_at=excluded.indexed_at",
+            params![
+                plan.id,
+                plan.created_at.to_rfc3339(),
+                command_json,
+                plan.cwd.display().to_string(),
+                plan.profile.name,
+                mode_json,
+                net_json,
+                artifacts_dir_value,
+                status,
+                status_detail,
+                exit_code,
+                duration_ms,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|source| SqliteAuditIndexError::WriteDatabase {
+            path: self.db_path.clone(),
+            source,
+        })?;
+
+        tx.execute(
+            "DELETE FROM audit_events WHERE execution_id = ?1",
+            params![plan.id],
+        )
+        .map_err(|source| SqliteAuditIndexError::WriteDatabase {
+            path: self.db_path.clone(),
+            source,
+        })?;
+
+        for (sequence, event) in audit_events.iter().enumerate() {
+            let payload_json = serde_json::to_string(event).map_err(|source| {
+                SqliteAuditIndexError::Serialize {
+                    path: audit_path.clone(),
+                    source,
+                }
+            })?;
+            tx.execute(
+                "INSERT INTO audit_events (
+                   execution_id, sequence, timestamp, event_kind, payload_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    plan.id,
+                    sequence as i64,
+                    event.timestamp.to_rfc3339(),
+                    audit_event_kind_label(&event.event),
+                    payload_json
+                ],
+            )
+            .map_err(|source| SqliteAuditIndexError::WriteDatabase {
+                path: self.db_path.clone(),
+                source,
+            })?;
+        }
+
+        tx.commit()
+            .map_err(|source| SqliteAuditIndexError::WriteDatabase {
+                path: self.db_path.clone(),
+                source,
+            })?;
+
+        Ok(SqliteIndexedRun {
+            execution_id: plan.id,
+            has_result: result.is_some(),
+            event_count: audit_events.len(),
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SqliteAuditIndexError {
+    #[error("failed to create SQLite parent directory {path}: {source}")]
+    CreateParentDir {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to open SQLite index at {path}: {source}")]
+    OpenDatabase {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error("failed to migrate SQLite index at {path}: {source}")]
+    MigrateDatabase {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error("failed to write SQLite index at {path}: {source}")]
+    WriteDatabase {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error("failed to read artifact file {path}: {source}")]
+    ReadArtifact {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to parse JSON artifact {path}: {source}")]
+    ParseJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to parse audit event line {line} in {path}: {source}")]
+    ParseNdjsonLine {
+        path: PathBuf,
+        line: usize,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to serialize index payload for {path}: {source}")]
+    Serialize {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, SqliteAuditIndexError> {
+    let content =
+        fs::read_to_string(path).map_err(|source| SqliteAuditIndexError::ReadArtifact {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    serde_json::from_str(&content).map_err(|source| SqliteAuditIndexError::ParseJson {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn read_ndjson_audit_events(path: &Path) -> Result<Vec<AuditEvent>, SqliteAuditIndexError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content =
+        fs::read_to_string(path).map_err(|source| SqliteAuditIndexError::ReadArtifact {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    let mut events = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = serde_json::from_str::<AuditEvent>(line).map_err(|source| {
+            SqliteAuditIndexError::ParseNdjsonLine {
+                path: path.to_path_buf(),
+                line: index + 1,
+                source,
+            }
+        })?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn result_status_columns(status: &clawcrate_types::Status) -> (&'static str, Option<String>) {
+    match status {
+        clawcrate_types::Status::Success => ("success", None),
+        clawcrate_types::Status::Failed => ("failed", None),
+        clawcrate_types::Status::Timeout => ("timeout", None),
+        clawcrate_types::Status::Killed => ("killed", None),
+        clawcrate_types::Status::SandboxError(reason) => ("sandbox_error", Some(reason.clone())),
+    }
+}
+
+fn audit_event_kind_label(event: &clawcrate_types::AuditEventKind) -> &'static str {
+    match event {
+        clawcrate_types::AuditEventKind::SandboxApplied { .. } => "sandbox_applied",
+        clawcrate_types::AuditEventKind::EnvScrubbed { .. } => "env_scrubbed",
+        clawcrate_types::AuditEventKind::ProcessStarted { .. } => "process_started",
+        clawcrate_types::AuditEventKind::ProcessExited { .. } => "process_exited",
+        clawcrate_types::AuditEventKind::PermissionBlocked { .. } => "permission_blocked",
+        clawcrate_types::AuditEventKind::ReplicaCreated { .. } => "replica_created",
+        clawcrate_types::AuditEventKind::ReplicaSyncBack { .. } => "replica_sync_back",
+        clawcrate_types::AuditEventKind::ApprovalDecision { .. } => "approval_decision",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -159,9 +495,12 @@ mod tests {
         Actor, AuditEvent, AuditEventKind, DefaultMode, ExecutionPlan, ExecutionResult, NetLevel,
         ResolvedProfile, ResourceLimits, Status, WorkspaceMode,
     };
+    use rusqlite::Connection;
     use serde::{Deserialize, Serialize};
 
-    use super::{ArtifactWriter, AUDIT_NDJSON, FS_DIFF_JSON, PLAN_JSON, RESULT_JSON};
+    use super::{
+        ArtifactWriter, SqliteAuditIndex, AUDIT_NDJSON, FS_DIFF_JSON, PLAN_JSON, RESULT_JSON,
+    };
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct FsDiffFixture {
@@ -303,5 +642,70 @@ mod tests {
             parsed2.event,
             AuditEventKind::ProcessStarted { .. }
         ));
+    }
+
+    #[test]
+    fn sqlite_indexer_upserts_run_and_events_from_artifacts() {
+        let root = unique_tmp_dir("clawcrate_audit_sqlite_index");
+        let writer = ArtifactWriter::new(&root, "exec-001").expect("create writer");
+        let plan = test_plan();
+        let result = test_result();
+
+        writer.write_plan(&plan).expect("write plan");
+        writer.write_result(&result).expect("write result");
+        writer
+            .append_audit_event(&AuditEvent {
+                timestamp: Utc::now(),
+                event: AuditEventKind::SandboxApplied {
+                    backend: "linux".to_string(),
+                    capabilities: vec!["landlock".to_string(), "seccomp".to_string()],
+                },
+            })
+            .expect("append event 1");
+        writer
+            .append_audit_event(&AuditEvent {
+                timestamp: Utc::now(),
+                event: AuditEventKind::ProcessExited {
+                    exit_code: 0,
+                    duration_ms: 55,
+                },
+            })
+            .expect("append event 2");
+
+        let db_path = root.join("audit-index.sqlite3");
+        let mut index = SqliteAuditIndex::open(&db_path).expect("open sqlite index");
+        let indexed = index
+            .index_artifacts_dir(writer.artifacts_dir())
+            .expect("index artifacts");
+        assert_eq!(indexed.execution_id, plan.id);
+        assert!(indexed.has_result);
+        assert_eq!(indexed.event_count, 2);
+
+        let conn = Connection::open(db_path).expect("open sqlite db");
+        let (profile_name, status, event_count): (String, String, i64) = conn
+            .query_row(
+                "SELECT profile_name, status, (SELECT COUNT(*) FROM audit_events WHERE execution_id = executions.execution_id) FROM executions WHERE execution_id = ?1",
+                [plan.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query indexed execution");
+        assert_eq!(profile_name, "safe");
+        assert_eq!(status, "success");
+        assert_eq!(event_count, 2);
+    }
+
+    #[test]
+    fn sqlite_indexer_accepts_missing_result_and_audit_files() {
+        let root = unique_tmp_dir("clawcrate_audit_sqlite_partial");
+        let writer = ArtifactWriter::new(&root, "exec-002").expect("create writer");
+        writer.write_plan(&test_plan()).expect("write plan");
+
+        let db_path = root.join("audit-index.sqlite3");
+        let mut index = SqliteAuditIndex::open(&db_path).expect("open sqlite index");
+        let indexed = index
+            .index_artifacts_dir(writer.artifacts_dir())
+            .expect("index artifacts");
+        assert!(!indexed.has_result);
+        assert_eq!(indexed.event_count, 0);
     }
 }
