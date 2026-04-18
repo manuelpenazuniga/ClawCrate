@@ -27,6 +27,7 @@ use clawcrate_types::{
     Status, SystemCapabilities, WorkspaceMode,
 };
 use comfy_table::{Cell, Table};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 #[cfg(unix)]
 use nix::errno::Errno;
 #[cfg(unix)]
@@ -256,6 +257,12 @@ fn execute_run_pipeline(
 
 const REPLICA_DEFAULT_EXCLUSIONS: [&str; 3] = [".env", ".env.*", ".git/config"];
 
+#[derive(Debug)]
+struct ReplicaIgnoreConfig {
+    matcher: Gitignore,
+    user_patterns: Vec<String>,
+}
+
 fn materialize_workspace_for_execution(
     plan: &ExecutionPlan,
     writer: &ArtifactWriter,
@@ -264,22 +271,71 @@ fn materialize_workspace_for_execution(
         return Ok(());
     };
 
-    copy_workspace_with_default_exclusions(source, copy)?;
+    let ignore_config = load_replica_ignore_config(source)?;
+    copy_workspace_with_default_exclusions(source, copy, &ignore_config)?;
+    let mut excluded = REPLICA_DEFAULT_EXCLUSIONS
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    excluded.extend(ignore_config.user_patterns);
     append_audit_event(
         writer,
         AuditEventKind::ReplicaCreated {
             source: source.clone(),
             copy: copy.clone(),
-            excluded: REPLICA_DEFAULT_EXCLUSIONS
-                .iter()
-                .map(|value| value.to_string())
-                .collect(),
+            excluded,
         },
     )?;
     Ok(())
 }
 
-fn copy_workspace_with_default_exclusions(source: &Path, copy: &Path) -> Result<()> {
+fn load_replica_ignore_config(source_root: &Path) -> Result<ReplicaIgnoreConfig> {
+    let ignore_path = source_root.join(".clawcrateignore");
+    let user_patterns = load_user_ignore_patterns(&ignore_path)?;
+
+    let mut builder = GitignoreBuilder::new(source_root);
+    if ignore_path.is_file() {
+        if let Some(source) = builder.add(&ignore_path) {
+            return Err(anyhow!(
+                "failed to parse {}: {source}",
+                ignore_path.display()
+            ));
+        }
+    }
+
+    let matcher = builder.build().map_err(|source| {
+        anyhow!(
+            "failed to build .clawcrateignore matcher from {}: {source}",
+            ignore_path.display()
+        )
+    })?;
+
+    Ok(ReplicaIgnoreConfig {
+        matcher,
+        user_patterns,
+    })
+}
+
+fn load_user_ignore_patterns(ignore_path: &Path) -> Result<Vec<String>> {
+    if !ignore_path.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let content = std::fs::read_to_string(ignore_path)
+        .map_err(|source| anyhow!("failed to read {}: {source}", ignore_path.display()))?;
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn copy_workspace_with_default_exclusions(
+    source: &Path,
+    copy: &Path,
+    ignore_config: &ReplicaIgnoreConfig,
+) -> Result<()> {
     if !source.is_dir() {
         return Err(anyhow!(
             "replica source workspace does not exist or is not a directory: {}",
@@ -302,7 +358,7 @@ fn copy_workspace_with_default_exclusions(source: &Path, copy: &Path) -> Result<
         )
     })?;
 
-    copy_directory_recursive(source, copy, source)?;
+    copy_directory_recursive(source, copy, source, ignore_config)?;
     Ok(())
 }
 
@@ -310,6 +366,7 @@ fn copy_directory_recursive(
     source_dir: &Path,
     target_dir: &Path,
     source_root: &Path,
+    ignore_config: &ReplicaIgnoreConfig,
 ) -> Result<()> {
     for entry in std::fs::read_dir(source_dir).map_err(|source_error| {
         anyhow!(
@@ -330,10 +387,6 @@ fn copy_directory_recursive(
                 anyhow!("failed to compute relative source path: {source_error}")
             })?;
 
-        if should_exclude_replica_path(relative_path) {
-            continue;
-        }
-
         let target_path = target_dir.join(entry.file_name());
         let file_type = entry.file_type().map_err(|source_error| {
             anyhow!(
@@ -341,6 +394,14 @@ fn copy_directory_recursive(
                 source_path.display()
             )
         })?;
+        if should_exclude_replica_path(
+            relative_path,
+            file_type.is_dir(),
+            source_root,
+            ignore_config,
+        ) {
+            continue;
+        }
 
         if file_type.is_dir() {
             std::fs::create_dir_all(&target_path).map_err(|source_error| {
@@ -349,7 +410,7 @@ fn copy_directory_recursive(
                     target_path.display()
                 )
             })?;
-            copy_directory_recursive(&source_path, &target_path, source_root)?;
+            copy_directory_recursive(&source_path, &target_path, source_root, ignore_config)?;
             continue;
         }
 
@@ -404,7 +465,24 @@ fn copy_symlink(source_path: &Path, target_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn should_exclude_replica_path(relative_path: &Path) -> bool {
+fn should_exclude_replica_path(
+    relative_path: &Path,
+    is_dir: bool,
+    source_root: &Path,
+    ignore_config: &ReplicaIgnoreConfig,
+) -> bool {
+    if should_exclude_default_replica_path(relative_path) {
+        return true;
+    }
+
+    let full_path = source_root.join(relative_path);
+    ignore_config
+        .matcher
+        .matched_path_or_any_parents(&full_path, is_dir)
+        .is_ignore()
+}
+
+fn should_exclude_default_replica_path(relative_path: &Path) -> bool {
     if relative_path == Path::new(".git/config") {
         return true;
     }
@@ -1085,9 +1163,9 @@ mod tests {
 
     use super::{
         build_execution_plan, copy_workspace_with_default_exclusions, doctor_rows,
-        execution_status, execution_status_from_exit_status, resolve_execution_path,
-        run_monitored_child, select_default_mode, should_exclude_replica_path, CommandArgs,
-        RunTermination,
+        execution_status, execution_status_from_exit_status, load_replica_ignore_config,
+        resolve_execution_path, run_monitored_child, select_default_mode,
+        should_exclude_default_replica_path, CommandArgs, RunTermination,
     };
     use clap::Parser;
     use clawcrate_profiles::ProfileResolver;
@@ -1266,14 +1344,18 @@ mod tests {
 
     #[test]
     fn should_exclude_replica_defaults() {
-        assert!(should_exclude_replica_path(Path::new(".env")));
-        assert!(should_exclude_replica_path(Path::new(".env.local")));
-        assert!(should_exclude_replica_path(Path::new(
+        assert!(should_exclude_default_replica_path(Path::new(".env")));
+        assert!(should_exclude_default_replica_path(Path::new(".env.local")));
+        assert!(should_exclude_default_replica_path(Path::new(
             "nested/.env.production"
         )));
-        assert!(should_exclude_replica_path(Path::new(".git/config")));
-        assert!(!should_exclude_replica_path(Path::new(".git/HEAD")));
-        assert!(!should_exclude_replica_path(Path::new("src/main.rs")));
+        assert!(should_exclude_default_replica_path(Path::new(
+            ".git/config"
+        )));
+        assert!(!should_exclude_default_replica_path(Path::new(".git/HEAD")));
+        assert!(!should_exclude_default_replica_path(Path::new(
+            "src/main.rs"
+        )));
     }
 
     #[test]
@@ -1292,7 +1374,9 @@ mod tests {
 
         let replica_root = unique_tmp_dir("clawcrate_cli_replica_copy_root");
         let replica = replica_root.join("workspace");
-        copy_workspace_with_default_exclusions(&source, &replica).expect("copy workspace");
+        let ignore_config = load_replica_ignore_config(&source).expect("load ignore config");
+        copy_workspace_with_default_exclusions(&source, &replica, &ignore_config)
+            .expect("copy workspace");
 
         assert!(!replica.join(".env").exists());
         assert!(!replica.join(".env.local").exists());
@@ -1303,6 +1387,30 @@ mod tests {
             fs::read_to_string(replica.join("nested/app.txt")).expect("read copied file"),
             "visible"
         );
+    }
+
+    #[test]
+    fn replica_copy_applies_clawcrateignore_patterns() {
+        let source = unique_tmp_dir("clawcrate_cli_replica_ignore_source");
+        fs::create_dir_all(source.join("nested").join("tmp")).expect("create nested tmp");
+
+        fs::write(source.join(".clawcrateignore"), "*.log\nnested/tmp/\n")
+            .expect("write .clawcrateignore");
+        fs::write(source.join("keep.txt"), "keep").expect("write keep file");
+        fs::write(source.join("skip.log"), "skip").expect("write skipped log");
+        fs::write(source.join("nested/tmp/skip.txt"), "skip").expect("write nested skip");
+        fs::write(source.join("nested/keep.md"), "keep").expect("write nested keep");
+
+        let replica_root = unique_tmp_dir("clawcrate_cli_replica_ignore_copy");
+        let replica = replica_root.join("workspace");
+        let ignore_config = load_replica_ignore_config(&source).expect("load ignore config");
+        copy_workspace_with_default_exclusions(&source, &replica, &ignore_config)
+            .expect("copy workspace with ignore rules");
+
+        assert!(replica.join("keep.txt").exists());
+        assert!(replica.join("nested/keep.md").exists());
+        assert!(!replica.join("skip.log").exists());
+        assert!(!replica.join("nested/tmp/skip.txt").exists());
     }
 
     #[test]
