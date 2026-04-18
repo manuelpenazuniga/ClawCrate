@@ -131,3 +131,12 @@ network:
 
 In filtered mode, ClawCrate starts a local egress proxy and injects proxy env vars
 (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) for the sandboxed command.
+
+## Approval Workflow for Out-of-Profile Requests (P1)
+
+When a command appears to request permissions outside the active profile,
+`clawcrate run` now requires explicit approval.
+
+- interactive mode: prompt (`Approve and continue? [y/N]`)
+- non-interactive / `--json`: fail-closed by default
+- automation override: `--approve-out-of-profile`

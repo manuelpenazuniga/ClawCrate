@@ -201,7 +201,7 @@ When `--json` is enabled, sync-back is deterministically skipped (non-interactiv
 ## CLI Reference
 
 ```
-clawcrate [--verbose] [--no-color] run [--profile PROFILE] [--replica | --direct] -- COMMAND...
+clawcrate [--verbose] [--no-color] run [--profile PROFILE] [--replica | --direct] [--approve-out-of-profile] -- COMMAND...
 clawcrate [--verbose] [--no-color] plan [--profile PROFILE] [--replica | --direct] -- COMMAND...
 clawcrate [--verbose] [--no-color] doctor
 ```
@@ -211,6 +211,7 @@ clawcrate [--verbose] [--no-color] doctor
 | `--profile <name>` | Use built-in profile (safe, build, install, open) or path to YAML |
 | `--replica` | Force Replica Mode (for profiles that default to Direct) |
 | `--direct` | Force Direct Mode (for profiles that default to Replica) |
+| `--approve-out-of-profile` | Bypass approval prompt for detected permission requests outside active profile |
 | `--json` | Machine-readable output (for agent integration) |
 | `--verbose` / `-v` | Show detailed diagnostic logs (error chain, execution stages) |
 | `--no-color` | Disable ANSI colors in human-readable output |

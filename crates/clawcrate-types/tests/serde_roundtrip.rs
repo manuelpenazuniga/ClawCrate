@@ -101,6 +101,23 @@ fn audit_event_roundtrip() {
 }
 
 #[test]
+fn approval_audit_event_roundtrip() {
+    let value = AuditEvent {
+        timestamp: ts("2026-04-11T14:32:00Z"),
+        event: AuditEventKind::ApprovalDecision {
+            requested: vec![
+                "network: profile blocks network".to_string(),
+                "domain: denied.example.com not in allowlist".to_string(),
+            ],
+            approved: false,
+            automated: true,
+        },
+    };
+
+    assert_json_roundtrip(&value);
+}
+
+#[test]
 fn execution_result_roundtrip() {
     let value = ExecutionResult {
         id: "0195a4d2-3f72-7a1b-b7af-a9fd8f24d9e2".to_string(),
