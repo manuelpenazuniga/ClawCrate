@@ -133,6 +133,20 @@ network:
     - "*.pkg.dev"
 ```
 
+## Community Profile Catalog
+
+Community-maintained profiles are stored in `profiles/community/` and indexed by
+`profiles/community/catalog.yaml`.
+
+Catalog entries are schema-validated by `clawcrate-profiles` with these rules:
+
+- catalog version must be `1`
+- ids are lowercase kebab-case and unique
+- paths are relative `.yaml` files under `profiles/community/`
+- each listed profile resolves through the same strict profile parser used by built-ins
+
+Contribution and review flow is documented in [docs/community-profiles.md](community-profiles.md).
+
 ## Validation Rules
 
 Parser behavior includes:
