@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, ExitStatus};
@@ -103,6 +104,10 @@ struct CommandArgs {
     /// Machine-readable JSON output
     #[arg(long, action = ArgAction::SetTrue)]
     json: bool,
+
+    /// Auto-approve detected permission requests outside the active profile
+    #[arg(long, action = ArgAction::SetTrue)]
+    approve_out_of_profile: bool,
 
     /// Command to plan/execute (pass after --)
     #[arg(trailing_var_arg = true, num_args = 1.., required = true)]
@@ -279,6 +284,16 @@ fn handle_run(resolver: &ProfileResolver, args: CommandArgs, output: &OutputOpti
         .map_err(|source| anyhow!("failed to write plan artifact: {source}"))?;
 
     let started_at = Instant::now();
+    if let Err(error) = enforce_out_of_profile_approval(&plan, &args, output, &writer) {
+        persist_sandbox_error_result(
+            &writer,
+            &plan.id,
+            started_at.elapsed().as_millis() as u64,
+            &error,
+        )?;
+        return Err(error);
+    }
+
     let pipeline = match execute_run_pipeline(&plan, &writer) {
         Ok(pipeline) => pipeline,
         Err(error) => {
@@ -878,6 +893,258 @@ fn expand_home(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+fn enforce_out_of_profile_approval(
+    plan: &ExecutionPlan,
+    args: &CommandArgs,
+    output: &OutputOptions,
+    writer: &ArtifactWriter,
+) -> Result<()> {
+    let requested = detect_out_of_profile_requests(plan);
+    if requested.is_empty() {
+        return Ok(());
+    }
+
+    if args.approve_out_of_profile {
+        append_audit_event(
+            writer,
+            AuditEventKind::ApprovalDecision {
+                requested,
+                approved: true,
+                automated: true,
+            },
+        )?;
+        verbose_log(
+            output,
+            1,
+            format!(
+                "approval bypassed via --approve-out-of-profile for execution {}",
+                plan.id
+            ),
+        );
+        return Ok(());
+    }
+
+    let non_interactive = args.json || !io::stdin().is_terminal();
+    if non_interactive {
+        let requested_for_audit = requested.clone();
+        append_audit_event(
+            writer,
+            AuditEventKind::ApprovalDecision {
+                requested: requested_for_audit,
+                approved: false,
+                automated: true,
+            },
+        )?;
+        return Err(anyhow!(
+            "command appears to request permissions outside the active profile:\n{}\nre-run interactively to approve or use --approve-out-of-profile to proceed",
+            requested
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    let approved = prompt_out_of_profile_approval(plan, &requested)?;
+    append_audit_event(
+        writer,
+        AuditEventKind::ApprovalDecision {
+            requested,
+            approved,
+            automated: false,
+        },
+    )?;
+    if approved {
+        Ok(())
+    } else {
+        Err(anyhow!("execution aborted: approval declined"))
+    }
+}
+
+fn prompt_out_of_profile_approval(plan: &ExecutionPlan, requested: &[String]) -> Result<bool> {
+    println!(
+        "Approval required for execution {} (profile: {}).",
+        plan.id, plan.profile.name
+    );
+    println!("Detected requested permissions outside active profile:");
+    for request in requested {
+        println!("  - {request}");
+    }
+    print!("Approve and continue? [y/N]: ");
+    io::stdout()
+        .flush()
+        .map_err(|source_error| anyhow!("failed to flush approval prompt: {source_error}"))?;
+
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|source_error| anyhow!("failed to read approval response: {source_error}"))?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
+fn detect_out_of_profile_requests(plan: &ExecutionPlan) -> Vec<String> {
+    let mut requested = Vec::new();
+    if !command_appears_to_need_network(&plan.command) {
+        return requested;
+    }
+
+    match &plan.profile.net {
+        NetLevel::None => {
+            requested.push(
+                "network access requested by command but profile network mode is `none`"
+                    .to_string(),
+            );
+        }
+        NetLevel::Open => {}
+        NetLevel::Filtered { allowed_domains } => {
+            let hosts = extract_hosts_from_command(&plan.command);
+            if hosts.is_empty() {
+                return requested;
+            }
+
+            let denied = hosts
+                .into_iter()
+                .filter(|host| !domain_allowed(host, allowed_domains))
+                .collect::<Vec<_>>();
+            if !denied.is_empty() {
+                requested.push(format!(
+                    "command references host(s) outside filtered allowlist: {}",
+                    denied.join(", ")
+                ));
+            }
+        }
+    }
+
+    requested
+}
+
+fn command_appears_to_need_network(command: &[String]) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+    if command
+        .iter()
+        .any(|arg| extract_host_from_reference(arg).is_some())
+    {
+        return true;
+    }
+
+    let executable = command_basename(&command[0]);
+    let first_arg = command.get(1).map(|arg| arg.to_ascii_lowercase());
+    match executable.as_str() {
+        "curl" | "wget" | "http" | "https" | "scp" | "ssh" | "rsync" => true,
+        "git" => matches!(
+            first_arg.as_deref(),
+            Some("clone" | "fetch" | "pull" | "push" | "ls-remote" | "remote" | "submodule")
+        ),
+        "npm" | "pnpm" | "yarn" => matches!(
+            first_arg.as_deref(),
+            Some("install" | "add" | "update" | "upgrade" | "publish" | "login")
+        ),
+        "pip" | "pip3" | "poetry" | "uv" => matches!(
+            first_arg.as_deref(),
+            Some("install" | "add" | "update" | "publish" | "sync" | "lock" | "export")
+        ),
+        "cargo" => matches!(
+            first_arg.as_deref(),
+            Some(
+                "add"
+                    | "install"
+                    | "search"
+                    | "publish"
+                    | "login"
+                    | "owner"
+                    | "yank"
+                    | "fetch"
+                    | "update"
+            )
+        ),
+        "apt" | "apt-get" | "dnf" | "yum" | "apk" | "brew" => true,
+        _ => false,
+    }
+}
+
+fn extract_hosts_from_command(command: &[String]) -> Vec<String> {
+    let mut hosts = BTreeSet::new();
+    for arg in command {
+        if let Some(host) = extract_host_from_reference(arg) {
+            hosts.insert(host);
+        }
+    }
+    hosts.into_iter().collect()
+}
+
+fn extract_host_from_reference(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    for prefix in ["https://", "http://", "ssh://"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return split_host_port(rest).map(normalize_host);
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("git@") {
+        let (host, _path) = rest.split_once(':')?;
+        return Some(normalize_host(host));
+    }
+
+    None
+}
+
+fn split_host_port(input: &str) -> Option<&str> {
+    let host_port = input.split('/').next().unwrap_or_default();
+    if host_port.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let (host, _tail) = rest.split_once(']')?;
+        return Some(host);
+    }
+
+    if let Some((host, _port)) = host_port.rsplit_once(':') {
+        if !host.is_empty() && host != host_port {
+            return Some(host);
+        }
+    }
+    Some(host_port)
+}
+
+fn domain_allowed(host: &str, allowed_domains: &[String]) -> bool {
+    let host = normalize_host(host);
+    allowed_domains.iter().any(|rule| {
+        let rule = normalize_host(rule);
+        if let Some(suffix) = rule.strip_prefix("*.") {
+            host.ends_with(&format!(".{suffix}"))
+        } else {
+            host == rule
+        }
+    })
+}
+
+fn normalize_host(input: &str) -> String {
+    input
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn command_basename(command: &str) -> String {
+    Path::new(command)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map_or_else(
+            || command.to_ascii_lowercase(),
+            |value| value.to_ascii_lowercase(),
+        )
 }
 
 fn append_audit_event(writer: &ArtifactWriter, event: AuditEventKind) -> Result<()> {
@@ -1542,15 +1809,20 @@ mod tests {
 
     use super::{
         apply_replica_sync_back, build_execution_plan, collect_syncable_replica_changes,
-        copy_workspace_with_default_exclusions, doctor_rows, execution_status,
+        command_appears_to_need_network, copy_workspace_with_default_exclusions,
+        detect_out_of_profile_requests, doctor_rows, execution_status,
         execution_status_from_exit_status, load_replica_ignore_config, resolve_execution_path,
         run_monitored_child, select_default_mode, should_exclude_default_replica_path,
         should_use_color, Cli, CommandArgs, Commands, ReplicaSyncChange, RunTermination,
     };
+    use chrono::Utc;
     use clap::Parser;
     use clawcrate_capture::{FsChange, FsChangeKind};
     use clawcrate_profiles::ProfileResolver;
-    use clawcrate_types::{DefaultMode, Platform, Status, SystemCapabilities, WorkspaceMode};
+    use clawcrate_types::{
+        Actor, DefaultMode, ExecutionPlan, NetLevel, Platform, ResolvedProfile, ResourceLimits,
+        Status, SystemCapabilities, WorkspaceMode,
+    };
 
     fn unique_tmp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1560,6 +1832,35 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}_{nanos}_{}", std::process::id()));
         fs::create_dir_all(&dir).expect("create temp test directory");
         dir
+    }
+
+    fn mock_plan(net: NetLevel, command: &[&str]) -> ExecutionPlan {
+        let cwd = unique_tmp_dir("clawcrate_cli_approval_mock");
+        ExecutionPlan {
+            id: "exec-approval".to_string(),
+            command: command.iter().map(|value| value.to_string()).collect(),
+            cwd,
+            profile: ResolvedProfile {
+                name: "test".to_string(),
+                fs_read: vec![PathBuf::from(".")],
+                fs_write: vec![PathBuf::from("./target")],
+                fs_deny: vec![],
+                net,
+                env_scrub: vec!["*_SECRET*".to_string()],
+                env_passthrough: vec!["HOME".to_string(), "PATH".to_string()],
+                resources: ResourceLimits {
+                    max_cpu_seconds: 60,
+                    max_memory_mb: 512,
+                    max_open_files: 1024,
+                    max_processes: 128,
+                    max_output_bytes: 2 * 1024 * 1024,
+                },
+                default_mode: DefaultMode::Direct,
+            },
+            mode: WorkspaceMode::Direct,
+            actor: Actor::Human,
+            created_at: Utc::now(),
+        }
     }
 
     #[test]
@@ -1579,6 +1880,7 @@ mod tests {
                 assert_eq!(args.profile.as_deref(), Some("build"));
                 assert_eq!(args.command, vec!["cargo".to_string(), "test".to_string()]);
                 assert!(!args.json);
+                assert!(!args.approve_out_of_profile);
             }
             _ => panic!("expected plan command"),
         }
@@ -1618,12 +1920,62 @@ mod tests {
     }
 
     #[test]
+    fn network_detector_identifies_obvious_network_commands() {
+        assert!(command_appears_to_need_network(&[
+            "curl".to_string(),
+            "https://example.com".to_string()
+        ]));
+        assert!(command_appears_to_need_network(&[
+            "git".to_string(),
+            "clone".to_string(),
+            "https://github.com/example/repo.git".to_string()
+        ]));
+        assert!(!command_appears_to_need_network(&[
+            "echo".to_string(),
+            "hello".to_string()
+        ]));
+    }
+
+    #[test]
+    fn approval_detection_flags_network_gap_for_none_profile() {
+        let plan = mock_plan(
+            NetLevel::None,
+            &["curl", "https://registry.npmjs.org/some-package"],
+        );
+        let requests = detect_out_of_profile_requests(&plan);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("network mode is `none`"));
+    }
+
+    #[test]
+    fn approval_detection_honors_filtered_allowlist_hosts() {
+        let allowed_plan = mock_plan(
+            NetLevel::Filtered {
+                allowed_domains: vec!["registry.npmjs.org".to_string()],
+            },
+            &["curl", "https://registry.npmjs.org/some-package"],
+        );
+        assert!(detect_out_of_profile_requests(&allowed_plan).is_empty());
+
+        let denied_plan = mock_plan(
+            NetLevel::Filtered {
+                allowed_domains: vec!["registry.npmjs.org".to_string()],
+            },
+            &["curl", "https://evil.example.com/payload"],
+        );
+        let requests = detect_out_of_profile_requests(&denied_plan);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("evil.example.com"));
+    }
+
+    #[test]
     fn profile_default_mode_is_overridden_by_flags() {
         let args = CommandArgs {
             profile: None,
             replica: true,
             direct: false,
             json: false,
+            approve_out_of_profile: false,
             command: vec!["echo".to_string(), "hello".to_string()],
         };
         assert_eq!(
@@ -1636,6 +1988,7 @@ mod tests {
             replica: false,
             direct: true,
             json: false,
+            approve_out_of_profile: false,
             command: vec!["echo".to_string(), "hello".to_string()],
         };
         assert_eq!(
@@ -1648,6 +2001,7 @@ mod tests {
             replica: false,
             direct: false,
             json: false,
+            approve_out_of_profile: false,
             command: vec!["echo".to_string(), "hello".to_string()],
         };
         assert_eq!(
@@ -1665,6 +2019,7 @@ mod tests {
             replica: false,
             direct: false,
             json: false,
+            approve_out_of_profile: false,
             command: vec!["echo".to_string(), "hello".to_string()],
         };
 
@@ -1689,6 +2044,7 @@ mod tests {
             replica: false,
             direct: false,
             json: false,
+            approve_out_of_profile: false,
             command: vec!["npm".to_string(), "install".to_string()],
         };
 
@@ -1718,6 +2074,7 @@ mod tests {
             replica: false,
             direct: true,
             json: false,
+            approve_out_of_profile: false,
             command: vec!["npm".to_string(), "install".to_string()],
         };
 
@@ -1741,6 +2098,7 @@ mod tests {
             replica: true,
             direct: false,
             json: false,
+            approve_out_of_profile: false,
             command: vec!["cargo".to_string(), "check".to_string()],
         };
 

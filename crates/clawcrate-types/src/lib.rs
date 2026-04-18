@@ -117,6 +117,11 @@ pub enum AuditEventKind {
         approved: bool,
         changes: usize,
     },
+    ApprovalDecision {
+        requested: Vec<String>,
+        approved: bool,
+        automated: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
