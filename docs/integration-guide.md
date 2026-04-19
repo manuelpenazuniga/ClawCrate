@@ -183,6 +183,7 @@ fi
 
 - Linux full kernel enforcement is tracked as ongoing work (issue `#69`).
 - macOS and Linux differ in backend internals; keep your integration backend-agnostic by consuming `result` + artifacts.
+- WSL2 is currently experimental/post-alpha; see [WSL2 compatibility spike](wsl2-compatibility.md).
 
 ## Post-Alpha Filtered Network Mode (P1)
 

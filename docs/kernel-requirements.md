@@ -6,6 +6,7 @@ This page describes current platform assumptions for alpha behavior.
 
 - Linux
 - macOS
+- WSL2 (experimental, post-alpha guidance only)
 
 Other platforms currently return unsupported errors for `run`/`doctor`.
 
@@ -94,3 +95,17 @@ clawcrate doctor --json
 ```
 
 Use the JSON output in CI/automation to gate where specific profiles are allowed.
+
+## WSL2 (Post-Alpha Spike Status)
+
+WSL2 support is currently tracked as post-alpha roadmap scope.
+
+Current position:
+
+- treat WSL2 as experimental
+- validate capability signals via `doctor --json`
+- do not assume Landlock/seccomp parity with native Linux kernels
+
+Detailed constraints/workarounds report:
+
+- [WSL2 Compatibility Spike](wsl2-compatibility.md)
