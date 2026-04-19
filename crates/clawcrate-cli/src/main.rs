@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -419,7 +420,26 @@ fn execute_run_pipeline(
     Ok(RunPipelineResult { execution, fs_diff })
 }
 
-const REPLICA_DEFAULT_EXCLUSIONS: [&str; 3] = [".env", ".env.*", ".git/config"];
+#[derive(Clone, Copy)]
+struct ReplicaDefaultExclusionRule {
+    pattern: &'static str,
+    matcher: fn(&Path) -> bool,
+}
+
+const REPLICA_DEFAULT_EXCLUSION_RULES: [ReplicaDefaultExclusionRule; 3] = [
+    ReplicaDefaultExclusionRule {
+        pattern: ".env",
+        matcher: matches_exact_dotenv,
+    },
+    ReplicaDefaultExclusionRule {
+        pattern: ".env.*",
+        matcher: matches_secret_dotenv_variant,
+    },
+    ReplicaDefaultExclusionRule {
+        pattern: "**/.git/config",
+        matcher: matches_git_config_path,
+    },
+];
 
 #[derive(Debug)]
 struct ReplicaIgnoreConfig {
@@ -437,9 +457,9 @@ fn materialize_workspace_for_execution(
 
     let ignore_config = load_replica_ignore_config(source)?;
     copy_workspace_with_default_exclusions(source, copy, &ignore_config)?;
-    let mut excluded = REPLICA_DEFAULT_EXCLUSIONS
+    let mut excluded = REPLICA_DEFAULT_EXCLUSION_RULES
         .iter()
-        .map(|value| value.to_string())
+        .map(|rule| rule.pattern.to_string())
         .collect::<Vec<_>>();
     excluded.extend(ignore_config.user_patterns);
     append_audit_event(
@@ -647,15 +667,30 @@ fn should_exclude_replica_path(
 }
 
 fn should_exclude_default_replica_path(relative_path: &Path) -> bool {
-    if relative_path == Path::new(".git/config") {
-        return true;
-    }
+    REPLICA_DEFAULT_EXCLUSION_RULES
+        .iter()
+        .any(|rule| (rule.matcher)(relative_path))
+}
 
+fn matches_exact_dotenv(relative_path: &Path) -> bool {
+    relative_path.file_name() == Some(OsStr::new(".env"))
+}
+
+fn matches_secret_dotenv_variant(relative_path: &Path) -> bool {
     relative_path
         .file_name()
         .and_then(|name| name.to_str())
         .map(is_secret_env_filename)
         .unwrap_or(false)
+}
+
+fn matches_git_config_path(relative_path: &Path) -> bool {
+    let mut components = relative_path.components().rev();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(config)), Some(Component::Normal(git_dir)))
+            if config == OsStr::new("config") && git_dir == OsStr::new(".git")
+    )
 }
 
 fn is_secret_env_filename(file_name: &str) -> bool {
@@ -2304,17 +2339,19 @@ mod tests {
         command_appears_to_need_network, copy_workspace_with_default_exclusions,
         detect_out_of_profile_requests, doctor_rows, execution_status,
         execution_status_from_exit_status, extract_bearer_token, load_replica_ignore_config,
-        resolve_api_route, resolve_execution_path, run_monitored_child, select_default_mode,
-        should_exclude_default_replica_path, should_use_color, ApiCommandRequest, BridgeTarget,
-        Cli, CommandArgs, Commands, PennyPromptBridgeRequest, ReplicaSyncChange, RunTermination,
+        materialize_workspace_for_execution, resolve_api_route, resolve_execution_path,
+        run_monitored_child, select_default_mode, should_exclude_default_replica_path,
+        should_use_color, ApiCommandRequest, BridgeTarget, Cli, CommandArgs, Commands,
+        PennyPromptBridgeRequest, ReplicaSyncChange, RunTermination,
     };
     use chrono::Utc;
     use clap::Parser;
+    use clawcrate_audit::ArtifactWriter;
     use clawcrate_capture::{FsChange, FsChangeKind};
     use clawcrate_profiles::ProfileResolver;
     use clawcrate_types::{
-        Actor, DefaultMode, ExecutionPlan, NetLevel, Platform, ResolvedProfile, ResourceLimits,
-        Status, SystemCapabilities, WorkspaceMode,
+        Actor, AuditEvent, AuditEventKind, DefaultMode, ExecutionPlan, NetLevel, Platform,
+        ResolvedProfile, ResourceLimits, Status, SystemCapabilities, WorkspaceMode,
     };
     use tiny_http::{Header, Method};
 
@@ -2833,6 +2870,12 @@ mod tests {
         assert!(should_exclude_default_replica_path(Path::new(
             ".git/config"
         )));
+        assert!(should_exclude_default_replica_path(Path::new(
+            "submodule/.git/config"
+        )));
+        assert!(should_exclude_default_replica_path(Path::new(
+            "nested/repo/.git/config"
+        )));
         assert!(!should_exclude_default_replica_path(Path::new(".git/HEAD")));
         assert!(!should_exclude_default_replica_path(Path::new(
             "src/main.rs"
@@ -2849,6 +2892,11 @@ mod tests {
         fs::write(source.join(".env.local"), "SECRET=2").expect("write .env.local");
         fs::write(source.join(".git/config"), "token = hidden").expect("write .git/config");
         fs::write(source.join(".git/HEAD"), "ref: refs/heads/main").expect("write .git/HEAD");
+        fs::create_dir_all(source.join("nested/repo/.git")).expect("create nested repo .git");
+        fs::write(source.join("nested/repo/.git/config"), "nested = hidden")
+            .expect("write nested repo .git/config");
+        fs::write(source.join("nested/repo/.git/HEAD"), "ref: refs/heads/dev")
+            .expect("write nested repo .git/HEAD");
         fs::write(source.join("nested/.env.production"), "SECRET=3")
             .expect("write nested .env.production");
         fs::write(source.join("nested/app.txt"), "visible").expect("write visible file");
@@ -2862,12 +2910,57 @@ mod tests {
         assert!(!replica.join(".env").exists());
         assert!(!replica.join(".env.local").exists());
         assert!(!replica.join(".git/config").exists());
+        assert!(!replica.join("nested/repo/.git/config").exists());
         assert!(!replica.join("nested/.env.production").exists());
         assert!(replica.join(".git/HEAD").exists());
+        assert!(replica.join("nested/repo/.git/HEAD").exists());
         assert_eq!(
             fs::read_to_string(replica.join("nested/app.txt")).expect("read copied file"),
             "visible"
         );
+    }
+
+    #[test]
+    fn replica_created_audit_exclusions_match_runtime_rules() {
+        let source = unique_tmp_dir("clawcrate_cli_replica_audit_source");
+        fs::create_dir_all(source.join("nested/repo/.git")).expect("create nested repo .git");
+        fs::write(source.join(".clawcrateignore"), "*.tmp\ncache/\n")
+            .expect("write .clawcrateignore");
+        fs::write(source.join("nested/repo/.git/config"), "nested = hidden")
+            .expect("write nested repo .git/config");
+        fs::write(source.join("nested/repo/.git/HEAD"), "ref: refs/heads/main")
+            .expect("write nested repo .git/HEAD");
+
+        let copy_root = unique_tmp_dir("clawcrate_cli_replica_audit_copy_root");
+        let artifacts_dir = unique_tmp_dir("clawcrate_cli_replica_audit_artifacts");
+        let writer = ArtifactWriter::from_artifacts_dir(artifacts_dir.join("run"))
+            .expect("create artifact writer");
+
+        let copy_path = copy_root.join("workspace");
+        let mut plan = mock_plan(NetLevel::Open, &["/bin/echo", "ok"]);
+        plan.mode = WorkspaceMode::Replica {
+            source: source.clone(),
+            copy: copy_path.clone(),
+        };
+
+        materialize_workspace_for_execution(&plan, &writer).expect("materialize replica workspace");
+
+        let audit_content = fs::read_to_string(writer.audit_ndjson_path()).expect("read audit");
+        let event = audit_content
+            .lines()
+            .map(|line| serde_json::from_str::<AuditEvent>(line).expect("parse audit event"))
+            .find_map(|event| match event.event {
+                AuditEventKind::ReplicaCreated { excluded, .. } => Some(excluded),
+                _ => None,
+            })
+            .expect("find ReplicaCreated event");
+
+        assert!(event.contains(&".env".to_string()));
+        assert!(event.contains(&".env.*".to_string()));
+        assert!(event.contains(&"**/.git/config".to_string()));
+        assert!(event.contains(&"*.tmp".to_string()));
+        assert!(event.contains(&"cache/".to_string()));
+        assert!(!copy_path.join("nested/repo/.git/config").exists());
     }
 
     #[test]
