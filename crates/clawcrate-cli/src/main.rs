@@ -5,6 +5,7 @@ use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1400,6 +1401,7 @@ fn launch_and_capture(
         stderr,
         capture_config,
         plan.profile.resources.max_cpu_seconds,
+        Some(pid as i32),
     )?;
     drop(egress_proxy);
 
@@ -1474,6 +1476,7 @@ fn launch_and_capture(
         stderr,
         capture_config,
         plan.profile.resources.max_cpu_seconds,
+        Some(pid as i32),
     )?;
     drop(egress_proxy);
 
@@ -1508,16 +1511,55 @@ fn run_monitored_child(
     stderr: ChildStderr,
     capture_config: &CaptureConfig,
     timeout_seconds: u64,
+    process_group_id: Option<i32>,
 ) -> Result<MonitoredChildResult> {
-    const POLL_INTERVAL: Duration = Duration::from_millis(25);
-    const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(2);
-
-    let capture_config = capture_config.clone();
-    let capture_handle = thread::spawn(move || capture_streams(stdout, stderr, &capture_config));
-
     #[cfg(unix)]
     let mut signals = Signals::new([SIGINT, SIGTERM])
         .map_err(|source| anyhow!("failed to install signal handlers: {source}"))?;
+
+    #[cfg(unix)]
+    let mut poll_pending_interrupts = || {
+        signals
+            .pending()
+            .filter(|signal| *signal == SIGINT || *signal == SIGTERM)
+            .count()
+    };
+    #[cfg(not(unix))]
+    let mut poll_pending_interrupts = || 0usize;
+
+    run_monitored_child_with_signal_poller(
+        child,
+        stdout,
+        stderr,
+        capture_config,
+        timeout_seconds,
+        process_group_id,
+        &mut poll_pending_interrupts,
+    )
+}
+
+fn run_monitored_child_with_signal_poller<F>(
+    child: &mut Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    capture_config: &CaptureConfig,
+    timeout_seconds: u64,
+    process_group_id: Option<i32>,
+    poll_pending_interrupts: &mut F,
+) -> Result<MonitoredChildResult>
+where
+    F: FnMut() -> usize,
+{
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+    const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(2);
+    const CAPTURE_DRAIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
+    const CAPTURE_DRAIN_MAX_WAIT: Duration = Duration::from_secs(2);
+
+    let capture_config = capture_config.clone();
+    let (capture_tx, capture_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = capture_tx.send(capture_streams(stdout, stderr, &capture_config));
+    });
 
     let started_at = Instant::now();
     let mut interrupted = false;
@@ -1527,15 +1569,19 @@ fn run_monitored_child(
 
     let timeout_limit = (timeout_seconds > 0).then(|| Duration::from_secs(timeout_seconds));
     let exit_status = loop {
-        #[cfg(unix)]
-        if !interrupted {
-            for signal in signals.pending() {
-                if signal == SIGINT || signal == SIGTERM {
-                    send_termination_signal(child)?;
-                    interrupted = true;
-                    interrupt_sent_at = Some(Instant::now());
-                    break;
-                }
+        let pending_interrupts = poll_pending_interrupts();
+        let was_interrupted = interrupted;
+        if pending_interrupts > 0 {
+            if !interrupted {
+                send_termination_signal(child, process_group_id)?;
+                interrupted = true;
+                interrupt_sent_at = Some(Instant::now());
+            }
+
+            let repeated_interrupt = pending_interrupts > 1 || was_interrupted;
+            if repeated_interrupt && !timed_out && !interrupt_forced_kill {
+                send_kill_signal(child, process_group_id)?;
+                interrupt_forced_kill = true;
             }
         }
 
@@ -1544,14 +1590,14 @@ fn run_monitored_child(
                 .map(|timeout| started_at.elapsed() >= timeout)
                 .unwrap_or(false)
         {
-            send_kill_signal(child)?;
+            send_kill_signal(child, process_group_id)?;
             timed_out = true;
         }
 
         if interrupted && !timed_out && !interrupt_forced_kill {
             if let Some(interrupt_at) = interrupt_sent_at {
                 if interrupt_at.elapsed() >= INTERRUPT_GRACE_PERIOD {
-                    send_kill_signal(child)?;
+                    send_kill_signal(child, process_group_id)?;
                     interrupt_forced_kill = true;
                 }
             }
@@ -1567,10 +1613,32 @@ fn run_monitored_child(
         thread::sleep(POLL_INTERVAL);
     };
 
-    let capture_summary = match capture_handle.join() {
-        Ok(Ok(summary)) => summary,
-        Ok(Err(source)) => return Err(anyhow!("failed to capture process output: {source}")),
-        Err(_) => return Err(anyhow!("stream capture thread panicked")),
+    let capture_wait_started = Instant::now();
+    let mut capture_force_kill_sent = false;
+    let capture_summary = loop {
+        match capture_rx.recv_timeout(POLL_INTERVAL) {
+            Ok(Ok(summary)) => break summary,
+            Ok(Err(source)) => return Err(anyhow!("failed to capture process output: {source}")),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!(
+                    "stream capture thread disconnected before returning capture summary"
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !capture_force_kill_sent
+                    && capture_wait_started.elapsed() >= CAPTURE_DRAIN_GRACE_PERIOD
+                {
+                    send_kill_signal(child, process_group_id)?;
+                    capture_force_kill_sent = true;
+                }
+
+                if capture_wait_started.elapsed() >= CAPTURE_DRAIN_MAX_WAIT {
+                    return Err(anyhow!(
+                        "timed out draining captured output; descendant process may be holding stdout/stderr open"
+                    ));
+                }
+            }
+        }
     };
 
     let termination = if timed_out {
@@ -1589,37 +1657,55 @@ fn run_monitored_child(
 }
 
 #[cfg(unix)]
-fn send_termination_signal(child: &Child) -> Result<()> {
-    send_unix_signal(child, Signal::SIGTERM)
+fn send_termination_signal(child: &Child, process_group_id: Option<i32>) -> Result<()> {
+    send_unix_signal_to_pid(child.id() as i32, Signal::SIGTERM)?;
+    if let Some(group_id) = process_group_id.filter(|group_id| *group_id > 0) {
+        send_unix_signal_to_process_group(group_id, Signal::SIGTERM)?;
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn send_termination_signal(child: &mut Child) -> Result<()> {
+fn send_termination_signal(child: &mut Child, _process_group_id: Option<i32>) -> Result<()> {
     child
         .kill()
         .map_err(|source| anyhow!("failed to terminate child process: {source}"))
 }
 
 #[cfg(unix)]
-fn send_kill_signal(child: &Child) -> Result<()> {
-    send_unix_signal(child, Signal::SIGKILL)
+fn send_kill_signal(child: &Child, process_group_id: Option<i32>) -> Result<()> {
+    send_unix_signal_to_pid(child.id() as i32, Signal::SIGKILL)?;
+    if let Some(group_id) = process_group_id.filter(|group_id| *group_id > 0) {
+        send_unix_signal_to_process_group(group_id, Signal::SIGKILL)?;
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn send_kill_signal(child: &mut Child) -> Result<()> {
+fn send_kill_signal(child: &mut Child, _process_group_id: Option<i32>) -> Result<()> {
     child
         .kill()
         .map_err(|source| anyhow!("failed to kill child process: {source}"))
 }
 
 #[cfg(unix)]
-fn send_unix_signal(child: &Child, signal: Signal) -> Result<()> {
-    let pid = Pid::from_raw(child.id() as i32);
+fn send_unix_signal_to_pid(pid_raw: i32, signal: Signal) -> Result<()> {
+    let pid = Pid::from_raw(pid_raw);
     match kill(pid, signal) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
         Err(source) => Err(anyhow!(
-            "failed to send {signal:?} to child {}: {source}",
-            child.id()
+            "failed to send {signal:?} to child process {pid_raw}: {source}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn send_unix_signal_to_process_group(process_group_id: i32, signal: Signal) -> Result<()> {
+    let process_group = Pid::from_raw(-process_group_id);
+    match kill(process_group, signal) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(source) => Err(anyhow!(
+            "failed to send {signal:?} to process group {process_group_id}: {source}"
         )),
     }
 }
@@ -2343,9 +2429,11 @@ fn print_human_plan(plan: &ExecutionPlan, _output: &OutputOptions) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
         apply_replica_sync_back, build_api_cli_args, build_execution_plan,
@@ -2354,9 +2442,9 @@ mod tests {
         detect_out_of_profile_requests, doctor_rows, execution_status,
         execution_status_from_exit_status, extract_bearer_token, load_replica_ignore_config,
         materialize_workspace_for_execution, resolve_api_route, resolve_execution_path,
-        run_monitored_child, select_default_mode, should_exclude_default_replica_path,
-        should_use_color, ApiCommandRequest, BridgeTarget, Cli, CommandArgs, Commands,
-        PennyPromptBridgeRequest, ReplicaSyncChange, RunTermination,
+        run_monitored_child, run_monitored_child_with_signal_poller, select_default_mode,
+        should_exclude_default_replica_path, should_use_color, ApiCommandRequest, BridgeTarget,
+        Cli, CommandArgs, Commands, PennyPromptBridgeRequest, ReplicaSyncChange, RunTermination,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -3233,8 +3321,8 @@ mod tests {
         let stdout = child.stdout.take().expect("take stdout");
         let stderr = child.stderr.take().expect("take stderr");
 
-        let result =
-            run_monitored_child(&mut child, stdout, stderr, &capture_config, 1).expect("monitor");
+        let result = run_monitored_child(&mut child, stdout, stderr, &capture_config, 1, None)
+            .expect("monitor");
 
         assert_eq!(result.termination, RunTermination::Timeout);
         assert_eq!(
@@ -3244,6 +3332,95 @@ mod tests {
         assert_eq!(
             fs::read_to_string(capture_config.stdout_log_path()).expect("read stdout"),
             "before-timeout"
+        );
+    }
+
+    #[test]
+    fn monitored_child_repeated_interrupt_forces_fast_kill() {
+        let artifacts_dir = unique_tmp_dir("clawcrate_cli_interrupt_escalation");
+        let capture_config = super::CaptureConfig {
+            artifacts_dir,
+            max_output_bytes: 1024,
+        };
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn interrupt child");
+        let stdout = child.stdout.take().expect("take stdout");
+        let stderr = child.stderr.take().expect("take stderr");
+
+        let mut polls = 0usize;
+        let started = Instant::now();
+        let result = run_monitored_child_with_signal_poller(
+            &mut child,
+            stdout,
+            stderr,
+            &capture_config,
+            0,
+            None,
+            &mut || {
+                polls += 1;
+                if polls <= 2 {
+                    1
+                } else {
+                    0
+                }
+            },
+        )
+        .expect("monitor");
+
+        assert_eq!(result.termination, RunTermination::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "repeated interrupt should avoid full grace wait"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn monitored_child_cleans_up_inherited_pipe_descendants() {
+        let artifacts_dir = unique_tmp_dir("clawcrate_cli_pipe_inheritance_cleanup");
+        let capture_config = super::CaptureConfig {
+            artifacts_dir,
+            max_output_bytes: 1024,
+        };
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sh -c 'sleep 5' & printf 'done'")
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn inherited-pipe child");
+        let process_group_id = child.id() as i32;
+        let stdout = child.stdout.take().expect("take stdout");
+        let stderr = child.stderr.take().expect("take stderr");
+
+        let started = Instant::now();
+        let result = run_monitored_child_with_signal_poller(
+            &mut child,
+            stdout,
+            stderr,
+            &capture_config,
+            0,
+            Some(process_group_id),
+            &mut || 0usize,
+        )
+        .expect("monitor");
+
+        assert_eq!(result.termination, RunTermination::Exited);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "capture drain should not block for full descendant sleep"
+        );
+        assert_eq!(
+            fs::read_to_string(capture_config.stdout_log_path()).expect("read stdout"),
+            "done"
         );
     }
 }

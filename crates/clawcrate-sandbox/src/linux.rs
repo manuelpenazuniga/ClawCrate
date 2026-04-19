@@ -1,4 +1,6 @@
 use std::io;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -148,6 +150,8 @@ impl LinuxSandbox {
         command.stdin(Stdio::null());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
         command.env_clear();
         command.envs(prepared.scrubbed_env.iter().cloned());
 
