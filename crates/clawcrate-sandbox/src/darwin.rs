@@ -1,5 +1,6 @@
 use std::fs;
 use std::io;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -120,6 +121,7 @@ impl DarwinSandbox {
         command.stdin(Stdio::null());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
+        command.process_group(0);
         command.env_clear();
         command.envs(prepared.scrubbed_env.iter().cloned());
 
