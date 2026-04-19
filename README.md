@@ -205,6 +205,7 @@ clawcrate [--verbose] [--no-color] run [--profile PROFILE] [--replica | --direct
 clawcrate [--verbose] [--no-color] plan [--profile PROFILE] [--replica | --direct] -- COMMAND...
 clawcrate [--verbose] [--no-color] doctor
 clawcrate [--verbose] [--no-color] api [--bind ADDR] [--token TOKEN]
+clawcrate [--verbose] [--no-color] bridge pennyprompt [--pretty]
 ```
 
 | Flag | Effect |
@@ -218,6 +219,7 @@ clawcrate [--verbose] [--no-color] api [--bind ADDR] [--token TOKEN]
 | `--no-color` | Disable ANSI colors in human-readable output |
 | `api --bind <addr>` | Start local HTTP API (default `127.0.0.1:8787`) |
 | `api --token <token>` | Set bearer token for API auth (or use `CLAWCRATE_API_TOKEN`) |
+| `bridge pennyprompt` | One-shot JSON adapter for PennyPrompt shell dispatch |
 
 `clawcrate run` forwards `SIGINT`/`SIGTERM` to the sandboxed child and still writes final artifacts (`result.json`, logs, `fs-diff.json`) before exit. It also enforces a runtime timeout based on profile `resources.max_cpu_seconds`.
 
