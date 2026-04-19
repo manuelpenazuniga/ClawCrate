@@ -54,6 +54,10 @@ fn detect_seccomp(paths: &LinuxProbePaths) -> bool {
         return !actions.is_empty();
     }
 
+    if paths.seccomp_legacy.is_dir() {
+        return true;
+    }
+
     read_trimmed_file(&paths.seccomp_legacy)
         .and_then(|value| value.parse::<u64>().ok())
         .is_some_and(|value| value > 0)
@@ -265,7 +269,7 @@ mod tests {
         let user_ns = tmp.join("max_user_namespaces");
 
         write(&kernel, "5.4.0\n");
-        write(&seccomp_legacy, "2\n");
+        fs::create_dir_all(&seccomp_legacy).expect("create seccomp legacy directory");
         write(&user_ns, "0\n");
 
         let paths = LinuxProbePaths {
@@ -280,5 +284,55 @@ mod tests {
         let capabilities = probe_linux_capabilities_with_paths(&paths);
         assert!(capabilities.seccomp_available);
         assert!(!capabilities.user_namespaces);
+    }
+
+    #[test]
+    fn probe_reports_seccomp_via_legacy_file_when_actions_file_missing() {
+        let tmp = unique_tmp_dir("clawcrate_linux_probe_seccomp_legacy_file");
+        let kernel = tmp.join("osrelease");
+        let seccomp_actions = tmp.join("actions_avail_missing");
+        let seccomp_legacy = tmp.join("seccomp_legacy");
+        let user_ns = tmp.join("max_user_namespaces");
+
+        write(&kernel, "4.19.0\n");
+        write(&seccomp_legacy, "2\n");
+        write(&user_ns, "1\n");
+
+        let paths = LinuxProbePaths {
+            kernel_osrelease: kernel,
+            seccomp_actions_avail: seccomp_actions,
+            seccomp_legacy,
+            user_max_user_namespaces: user_ns,
+            landlock_abi_paths: vec![tmp.join("missing_abi_file")],
+            kernel_config_path: None,
+        };
+
+        let capabilities = probe_linux_capabilities_with_paths(&paths);
+        assert!(capabilities.seccomp_available);
+        assert!(capabilities.user_namespaces);
+    }
+
+    #[test]
+    fn probe_reports_seccomp_unavailable_when_actions_and_legacy_are_missing() {
+        let tmp = unique_tmp_dir("clawcrate_linux_probe_seccomp_missing");
+        let kernel = tmp.join("osrelease");
+        let seccomp_actions = tmp.join("actions_avail_missing");
+        let seccomp_legacy = tmp.join("seccomp_missing");
+        let user_ns = tmp.join("max_user_namespaces");
+
+        write(&kernel, "4.14.0\n");
+        write(&user_ns, "0\n");
+
+        let paths = LinuxProbePaths {
+            kernel_osrelease: kernel,
+            seccomp_actions_avail: seccomp_actions,
+            seccomp_legacy,
+            user_max_user_namespaces: user_ns,
+            landlock_abi_paths: vec![tmp.join("missing_abi_file")],
+            kernel_config_path: None,
+        };
+
+        let capabilities = probe_linux_capabilities_with_paths(&paths);
+        assert!(!capabilities.seccomp_available);
     }
 }
