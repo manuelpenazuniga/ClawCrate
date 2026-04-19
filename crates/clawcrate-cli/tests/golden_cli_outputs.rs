@@ -53,10 +53,38 @@ fn run_clawcrate_text(args: &[&str], cwd: &Path, home: &Path) -> String {
 }
 
 fn normalize_plan_json(mut plan: Value) -> String {
+    let cwd = plan["cwd"].as_str().map(|value| value.to_string());
+    if let Some(cwd) = cwd.as_deref() {
+        relativize_plan_profile_paths_to_cwd(&mut plan, cwd);
+    }
     plan["id"] = json!("<EXECUTION_ID>");
     plan["cwd"] = json!("<EXECUTION_CWD>");
     plan["created_at"] = json!("<CREATED_AT>");
     serde_json::to_string_pretty(&plan).expect("serialize normalized plan")
+}
+
+fn relativize_plan_profile_paths_to_cwd(plan: &mut Value, cwd: &str) {
+    let Some(profile) = plan.get_mut("profile").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for field in ["fs_read", "fs_write"] {
+        let Some(paths) = profile.get_mut(field).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for path in paths.iter_mut() {
+            let Some(value) = path.as_str() else {
+                continue;
+            };
+            if value == cwd || value == format!("{cwd}/.") {
+                *path = json!(".");
+                continue;
+            }
+            let prefix = format!("{cwd}/");
+            if let Some(rest) = value.strip_prefix(&prefix) {
+                *path = json!(format!("./{rest}"));
+            }
+        }
+    }
 }
 
 fn normalize_doctor_json(mut doctor: Value) -> String {
