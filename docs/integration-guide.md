@@ -68,6 +68,40 @@ Authentication:
 - header `Authorization: Bearer <token>`
 - token source: `--token` or `CLAWCRATE_API_TOKEN`
 
+## PennyPrompt Bridge (P2)
+
+For one-shot shell dispatch integration, use:
+
+```bash
+echo '{"action":"run","profile":"build","command":["cargo","test"]}' | clawcrate bridge pennyprompt
+```
+
+Bridge input JSON:
+
+```json
+{
+  "action": "run",
+  "profile": "build",
+  "replica": false,
+  "direct": false,
+  "approve_out_of_profile": false,
+  "command": ["cargo", "test"]
+}
+```
+
+Supported `action` values:
+
+- `run`
+- `plan`
+- `doctor`
+
+Bridge output is JSON with:
+
+- `ok` (boolean)
+- `action`
+- `data` (delegated ClawCrate JSON payload on success)
+- `error` (structured failure details when delegated command fails)
+
 ## Collect artifacts
 
 Given `result.artifacts_dir`, consume:
