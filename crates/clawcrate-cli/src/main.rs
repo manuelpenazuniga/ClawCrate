@@ -28,7 +28,7 @@ use clawcrate_sandbox::linux_probe::probe_linux_capabilities;
 use clawcrate_sandbox::macos_probe::probe_macos_capabilities;
 use clawcrate_types::{
     Actor, AuditEvent, AuditEventKind, DefaultMode, ExecutionPlan, ExecutionResult, NetLevel,
-    Platform, Status, SystemCapabilities, WorkspaceMode,
+    Platform, ResolvedProfile, Status, SystemCapabilities, WorkspaceMode,
 };
 use comfy_table::{Cell, Table};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -999,6 +999,19 @@ fn resolve_execution_path(cwd: &Path, path: &Path) -> PathBuf {
     }
 }
 
+fn normalize_profile_filesystem_paths(profile: &mut ResolvedProfile, execution_cwd: &Path) {
+    profile.fs_read = profile
+        .fs_read
+        .iter()
+        .map(|path| resolve_execution_path(execution_cwd, path))
+        .collect();
+    profile.fs_write = profile
+        .fs_write
+        .iter()
+        .map(|path| resolve_execution_path(execution_cwd, path))
+        .collect();
+}
+
 fn maybe_start_filtered_egress_proxy(
     net: &NetLevel,
     env: &mut Vec<(String, String)>,
@@ -1644,7 +1657,7 @@ fn build_execution_plan(
     cwd: &Path,
     args: &CommandArgs,
 ) -> Result<ExecutionPlan> {
-    let profile = match args.profile.as_deref() {
+    let mut profile = match args.profile.as_deref() {
         Some(explicit) => resolver.resolve(explicit),
         None => resolver.resolve_auto(cwd),
     }
@@ -1657,6 +1670,7 @@ fn build_execution_plan(
         WorkspaceMode::Direct => cwd.to_path_buf(),
         WorkspaceMode::Replica { copy, .. } => copy.clone(),
     };
+    normalize_profile_filesystem_paths(&mut profile, &execution_cwd);
 
     Ok(ExecutionPlan {
         id: execution_id,
@@ -2790,6 +2804,107 @@ mod tests {
             WorkspaceMode::Direct => {
                 panic!("--replica should override profile default direct mode")
             }
+        }
+    }
+
+    #[test]
+    fn build_execution_plan_normalizes_profile_paths_in_direct_mode() {
+        let resolver = ProfileResolver::default();
+        let cwd = unique_tmp_dir("clawcrate_cli_plan_normalized_direct");
+
+        let args = CommandArgs {
+            profile: Some("install".to_string()),
+            replica: false,
+            direct: true,
+            json: false,
+            approve_out_of_profile: false,
+            command: vec!["npm".to_string(), "install".to_string()],
+        };
+
+        let plan = build_execution_plan(&resolver, &cwd, &args).expect("build execution plan");
+        assert!(matches!(plan.mode, WorkspaceMode::Direct));
+        assert!(plan.profile.fs_read.iter().any(|path| path == &cwd));
+        assert!(plan
+            .profile
+            .fs_write
+            .iter()
+            .any(|path| path == &cwd.join("node_modules")));
+        assert!(plan
+            .profile
+            .fs_write
+            .iter()
+            .any(|path| path == &cwd.join(".venv")));
+        assert!(plan
+            .profile
+            .fs_write
+            .iter()
+            .any(|path| path == &cwd.join("target")));
+
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            assert!(plan
+                .profile
+                .fs_read
+                .iter()
+                .any(|path| path == &home.join(".npm")));
+            assert!(plan
+                .profile
+                .fs_write
+                .iter()
+                .any(|path| path == &home.join(".npm")));
+            assert!(plan
+                .profile
+                .fs_write
+                .iter()
+                .any(|path| path == &home.join(".cache/pip")));
+        }
+    }
+
+    #[test]
+    fn build_execution_plan_normalizes_profile_paths_in_replica_mode() {
+        let resolver = ProfileResolver::default();
+        let cwd = unique_tmp_dir("clawcrate_cli_plan_normalized_replica");
+
+        let args = CommandArgs {
+            profile: Some("install".to_string()),
+            replica: false,
+            direct: false,
+            json: false,
+            approve_out_of_profile: false,
+            command: vec!["npm".to_string(), "install".to_string()],
+        };
+
+        let plan = build_execution_plan(&resolver, &cwd, &args).expect("build execution plan");
+        let copy = match &plan.mode {
+            WorkspaceMode::Replica { copy, .. } => copy.clone(),
+            WorkspaceMode::Direct => panic!("install should default to replica"),
+        };
+
+        assert_eq!(plan.cwd, copy);
+        assert!(plan.profile.fs_read.iter().any(|path| path == &copy));
+        assert!(plan
+            .profile
+            .fs_write
+            .iter()
+            .any(|path| path == &copy.join("node_modules")));
+        assert!(plan
+            .profile
+            .fs_write
+            .iter()
+            .any(|path| path == &copy.join(".venv")));
+
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            assert!(plan
+                .profile
+                .fs_read
+                .iter()
+                .any(|path| path == &home.join(".cargo")));
+            assert!(plan
+                .profile
+                .fs_write
+                .iter()
+                .any(|path| path == &home.join(".cargo/registry")));
         }
     }
 
