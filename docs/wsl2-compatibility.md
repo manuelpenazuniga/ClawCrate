@@ -57,9 +57,9 @@ WSL2 behavior varies by Windows version and WSL kernel build. Do not assume pari
 Even when capabilities appear available in WSL2, current repo state must be considered:
 
 - Linux enforcement internals are still tracked as active work in `#69`.
-- WSL2 has no dedicated CI lane yet (`#49`), so regressions are harder to detect.
+- WSL2 now has a dedicated CI execution path (`.github/workflows/wsl2-ci.yml`), currently configured as non-blocking while support is still experimental.
 
-Result: WSL2 should be treated as experimental until both `#69` and `#49` are complete.
+Result: WSL2 should be treated as experimental until real Linux enforcement (`#69`) and stable WSL2 CI confidence are both in place.
 
 ## Recommended Operational Policy (Current)
 
@@ -72,14 +72,19 @@ Result: WSL2 should be treated as experimental until both `#69` and `#49` are co
 
 ## Known Unsupported / Not Yet Validated
 
-- No repository CI job currently validates WSL2 behavior.
 - No formal support claim for production WSL2 security posture at this stage.
 - Capability parity across Windows releases and custom WSL kernels is not guaranteed.
 
-## Next Step (P3-02)
+## Minimum Supported Behavior Baseline (Current)
 
-Issue `#49` should establish:
+Current WSL2 baseline is defined by the `WSL2 Compatibility` workflow:
 
-- a repeatable WSL2 CI lane
-- minimum passing capability baseline
-- explicit pass/fail criteria for WSL2 support claims
+1. WSL environment starts on `windows-latest` runner.
+2. Rust toolchain installs inside WSL user space.
+3. Workspace passes:
+   - `cargo fmt --all -- --check`
+   - `cargo clippy --workspace --all-targets -- -D warnings`
+   - `cargo test --workspace`
+4. `clawcrate doctor --json` runs in WSL2 and uploads `wsl2-doctor.json` artifact.
+
+This lane is intentionally non-blocking right now (`continue-on-error: true`) to collect stability data while support remains experimental.

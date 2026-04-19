@@ -1,0 +1,98 @@
+name: WSL2 Compatibility
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wsl2-baseline:
+    name: WSL2 Baseline (non-blocking)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    continue-on-error: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select WSL distro and resolve workspace path
+        shell: pwsh
+        run: |
+          wsl --status
+          $distros = @(
+            wsl -l -q |
+            ForEach-Object { ($_ -replace "`0", "").Trim() } |
+            Where-Object {
+              -not [string]::IsNullOrWhiteSpace($_) -and
+              $_ -notmatch "^docker-desktop(-data)?$"
+            }
+          )
+          if ($distros.Count -eq 0) {
+            Write-Warning "No usable Linux distro found in WSL. Skipping WSL2 lane on this runner image."
+            "WSL_READY=false" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 0
+          }
+          $wslDistro = $distros[0]
+          "WSL_READY=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "WSL_DISTRO=$wslDistro" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $wslWorkspace = (wsl -d "$wslDistro" wslpath -a "$env:GITHUB_WORKSPACE").Trim()
+          if ([string]::IsNullOrWhiteSpace($wslWorkspace)) {
+            throw "Failed to resolve WSL workspace path"
+          }
+          "WSL_WORKSPACE=$wslWorkspace" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install WSL dependencies and Rust toolchain
+        if: env.WSL_READY == 'true'
+        shell: pwsh
+        run: |
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; sudo apt-get update; sudo apt-get install -y build-essential pkg-config curl ca-certificates"
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; if ! command -v rustup >/dev/null 2>&1; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; fi"
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; source \$HOME/.cargo/env; rustup toolchain install stable --profile minimal; rustup default stable; rustup component add rustfmt clippy"
+
+      - name: WSL2 doctor snapshot
+        if: env.WSL_READY == 'true'
+        shell: pwsh
+        run: |
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo run -p clawcrate-cli -- doctor --json > wsl2-doctor.json"
+
+      - name: WSL2 cargo fmt
+        if: env.WSL_READY == 'true'
+        shell: pwsh
+        run: |
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo fmt --all -- --check"
+
+      - name: WSL2 cargo clippy
+        if: env.WSL_READY == 'true'
+        shell: pwsh
+        run: |
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo clippy --workspace --all-targets -- -D warnings"
+
+      - name: WSL2 cargo test
+        if: env.WSL_READY == 'true'
+        shell: pwsh
+        run: |
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo test --workspace"
+
+      - name: WSL2 lane skipped on this runner image
+        if: env.WSL_READY != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "WSL2 lane skipped: no usable Linux distro found in the runner image."
+
+      - name: Upload WSL2 doctor artifact
+        if: env.WSL_READY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl2-doctor-json
+          path: wsl2-doctor.json
+          if-no-files-found: error
