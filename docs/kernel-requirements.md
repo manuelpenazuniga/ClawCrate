@@ -105,6 +105,7 @@ Current position:
 - treat WSL2 as experimental
 - validate capability signals via `doctor --json`
 - do not assume Landlock/seccomp parity with native Linux kernels
+- monitor the dedicated WSL2 CI lane (`.github/workflows/wsl2-ci.yml`) for regression signals
 
 Detailed constraints/workarounds report:
 
