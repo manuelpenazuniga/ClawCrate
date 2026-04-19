@@ -19,7 +19,7 @@ impl Default for DarwinSandboxPaths {
     fn default() -> Self {
         Self {
             sandbox_exec: PathBuf::from("/usr/bin/sandbox-exec"),
-            temp_root: std::env::temp_dir().join("clawcrate").join("sbpl"),
+            temp_root: default_sbpl_temp_root(),
         }
     }
 }
@@ -125,24 +125,29 @@ impl DarwinSandbox {
 
         let child = command.spawn().map_err(DarwinSandboxError::Spawn)?;
         Ok(DarwinSandboxedChild {
-            child,
+            child: Some(child),
             sbpl_profile_path: sbpl_path,
         })
     }
 }
 
 pub struct DarwinSandboxedChild {
-    child: Child,
+    child: Option<Child>,
     sbpl_profile_path: PathBuf,
 }
 
 impl DarwinSandboxedChild {
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.child
+            .as_ref()
+            .expect("child process handle should be present")
+            .id()
     }
 
     pub fn child_mut(&mut self) -> &mut Child {
-        &mut self.child
+        self.child
+            .as_mut()
+            .expect("child process handle should be present")
     }
 
     pub fn sbpl_profile_path(&self) -> &Path {
@@ -150,15 +155,29 @@ impl DarwinSandboxedChild {
     }
 
     pub fn wait(&mut self) -> Result<std::process::ExitStatus, io::Error> {
-        let status = self.child.wait()?;
+        let status = self
+            .child
+            .as_mut()
+            .expect("child process handle should be present")
+            .wait()?;
         cleanup_sbpl_profile(&self.sbpl_profile_path);
         Ok(status)
     }
 
-    pub fn wait_with_output(self) -> Result<std::process::Output, io::Error> {
-        let output = self.child.wait_with_output()?;
+    pub fn wait_with_output(mut self) -> Result<std::process::Output, io::Error> {
+        let output = self
+            .child
+            .take()
+            .expect("child process handle should be present")
+            .wait_with_output()?;
         cleanup_sbpl_profile(&self.sbpl_profile_path);
         Ok(output)
+    }
+}
+
+impl Drop for DarwinSandboxedChild {
+    fn drop(&mut self) {
+        cleanup_sbpl_profile(&self.sbpl_profile_path);
     }
 }
 
@@ -170,7 +189,19 @@ fn cleanup_sbpl_profile(path: &Path) {
     }
 }
 
+fn default_sbpl_temp_root() -> PathBuf {
+    let user_component = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .map(|value| sanitize_identifier_component(&value, 64, "unknown-user"))
+        .unwrap_or_else(|_| format!("pid-{}", std::process::id()));
+    std::env::temp_dir()
+        .join("clawcrate")
+        .join("sbpl")
+        .join(user_component)
+}
+
 fn unique_sbpl_path(temp_root: &Path, execution_id: &str) -> PathBuf {
+    let execution_id = sanitize_identifier_component(execution_id, 64, "exec");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -180,6 +211,26 @@ fn unique_sbpl_path(temp_root: &Path, execution_id: &str) -> PathBuf {
         std::process::id(),
         nanos
     ))
+}
+
+fn sanitize_identifier_component(value: &str, max_len: usize, fallback: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len().min(max_len));
+    for ch in value.chars() {
+        if sanitized.len() >= max_len {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    let sanitized = sanitized.trim_matches('_').to_string();
+    if sanitized.is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn home_from_env(env: &[(String, String)]) -> Option<PathBuf> {
@@ -514,5 +565,79 @@ exec \"$@\"\n",
 
         let result = sandbox.launch(&prepared);
         assert!(matches!(result, Err(DarwinSandboxError::EmptyCommand)));
+    }
+
+    #[test]
+    fn default_temp_root_is_scoped_below_sbpl_with_user_component() {
+        let temp_root = DarwinSandboxPaths::default().temp_root;
+        let mut components = temp_root.components().rev();
+        let user_component = components
+            .next()
+            .expect("user-scoped temp root should have trailing component");
+        let sbpl_component = components
+            .next()
+            .expect("temp root should include sbpl component");
+        assert_eq!(sbpl_component.as_os_str(), "sbpl");
+        assert!(!user_component.as_os_str().is_empty());
+        assert_ne!(user_component.as_os_str(), "sbpl");
+    }
+
+    #[test]
+    fn sbpl_filename_sanitizes_execution_id() {
+        let tmp = unique_tmp_dir("clawcrate_darwin_sanitize_exec_id");
+        let path = super::unique_sbpl_path(&tmp, "../evil id:💥/../../");
+        let file_name = path
+            .file_name()
+            .expect("sbpl path should have a filename")
+            .to_string_lossy()
+            .to_string();
+        assert!(file_name.starts_with("sbpl_"));
+        assert!(file_name.ends_with(".sb"));
+        assert!(!file_name.contains('/'));
+        assert!(!file_name.contains(':'));
+        assert!(!file_name.contains(' '));
+        assert!(!file_name.contains(".."));
+        assert!(!file_name.contains("💥"));
+    }
+
+    #[test]
+    fn drop_cleans_up_sbpl_profile_without_wait() {
+        let tmp = unique_tmp_dir("clawcrate_darwin_drop_cleanup");
+        let fake_sandbox_exec = tmp.join("sandbox-exec");
+        let script = "#!/bin/sh\n\
+set -eu\n\
+if [ \"$1\" != \"-f\" ]; then exit 11; fi\n\
+shift 2\n\
+if [ \"$1\" != \"--\" ]; then exit 12; fi\n\
+shift\n\
+exec \"$@\"\n";
+        fs::write(&fake_sandbox_exec, script).expect("write fake sandbox-exec");
+        make_executable(&fake_sandbox_exec);
+
+        let sandbox = DarwinSandbox::new_with_paths(DarwinSandboxPaths {
+            sandbox_exec: fake_sandbox_exec,
+            temp_root: tmp.join("sbpl"),
+        });
+
+        let mut plan = test_plan(vec!["/bin/true".to_string()], NetLevel::None);
+        let workspace = tmp.join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace for drop cleanup test");
+        plan.cwd = workspace;
+        let prepared = sandbox.prepare_with_env(
+            &plan,
+            vec![
+                ("HOME".to_string(), "/tmp/home-runner".to_string()),
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ],
+        );
+
+        let child = sandbox.launch(&prepared).expect("launch should succeed");
+        let sbpl_path = child.sbpl_profile_path().to_path_buf();
+        assert!(sbpl_path.exists(), "SBPL file should exist after spawn");
+        drop(child);
+        assert!(
+            !sbpl_path.exists(),
+            "SBPL file should be removed when child handle is dropped"
+        );
     }
 }
