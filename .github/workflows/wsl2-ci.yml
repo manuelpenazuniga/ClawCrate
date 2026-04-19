@@ -25,11 +25,36 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Resolve WSL workspace path
+      - name: Select WSL distro and resolve workspace path
         shell: pwsh
         run: |
           wsl --status
-          $wslWorkspace = (wsl wslpath -a "$env:GITHUB_WORKSPACE").Trim()
+          $distros = @(
+            wsl -l -q |
+            ForEach-Object { ($_ -replace "`0", "").Trim() } |
+            Where-Object {
+              -not [string]::IsNullOrWhiteSpace($_) -and
+              $_ -notmatch "^docker-desktop(-data)?$"
+            }
+          )
+          if ($distros.Count -eq 0) {
+            Write-Host "No Linux distro found in WSL; installing Ubuntu..."
+            wsl --install -d Ubuntu
+            $distros = @(
+              wsl -l -q |
+              ForEach-Object { ($_ -replace "`0", "").Trim() } |
+              Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_) -and
+                $_ -notmatch "^docker-desktop(-data)?$"
+              }
+            )
+          }
+          if ($distros.Count -eq 0) {
+            throw "No usable WSL distro available after install attempt"
+          }
+          $wslDistro = $distros[0]
+          "WSL_DISTRO=$wslDistro" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $wslWorkspace = (wsl -d "$wslDistro" wslpath -a "$env:GITHUB_WORKSPACE").Trim()
           if ([string]::IsNullOrWhiteSpace($wslWorkspace)) {
             throw "Failed to resolve WSL workspace path"
           }
@@ -38,29 +63,29 @@ jobs:
       - name: Install WSL dependencies and Rust toolchain
         shell: pwsh
         run: |
-          wsl -e bash -lc "set -euo pipefail; sudo apt-get update; sudo apt-get install -y build-essential pkg-config curl ca-certificates"
-          wsl -e bash -lc "set -euo pipefail; if ! command -v rustup >/dev/null 2>&1; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; fi"
-          wsl -e bash -lc "set -euo pipefail; source \$HOME/.cargo/env; rustup toolchain install stable --profile minimal; rustup default stable; rustup component add rustfmt clippy"
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; sudo apt-get update; sudo apt-get install -y build-essential pkg-config curl ca-certificates"
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; if ! command -v rustup >/dev/null 2>&1; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; fi"
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; source \$HOME/.cargo/env; rustup toolchain install stable --profile minimal; rustup default stable; rustup component add rustfmt clippy"
 
       - name: WSL2 doctor snapshot
         shell: pwsh
         run: |
-          wsl -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo run -p clawcrate-cli -- doctor --json > wsl2-doctor.json"
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo run -p clawcrate-cli -- doctor --json > wsl2-doctor.json"
 
       - name: WSL2 cargo fmt
         shell: pwsh
         run: |
-          wsl -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo fmt --all -- --check"
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo fmt --all -- --check"
 
       - name: WSL2 cargo clippy
         shell: pwsh
         run: |
-          wsl -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo clippy --workspace --all-targets -- -D warnings"
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo clippy --workspace --all-targets -- -D warnings"
 
       - name: WSL2 cargo test
         shell: pwsh
         run: |
-          wsl -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo test --workspace"
+          wsl -d "${env:WSL_DISTRO}" -e bash -lc "set -euo pipefail; cd '${env:WSL_WORKSPACE}'; source \$HOME/.cargo/env; cargo test --workspace"
 
       - name: Upload WSL2 doctor artifact
         uses: actions/upload-artifact@v4
