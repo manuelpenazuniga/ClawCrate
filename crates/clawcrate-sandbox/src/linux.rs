@@ -178,6 +178,7 @@ fn prepare_linux_landlock_context(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn probe_linux_landlock_abi() -> io::Result<i32> {
     // SAFETY: syscall arguments follow landlock_create_ruleset ABI query contract.
     let abi = unsafe {
@@ -250,6 +251,7 @@ fn nearest_existing_landlock_anchor(path: &Path) -> io::Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn open_linux_landlock_path(path: &Path) -> io::Result<OwnedFd> {
     let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
         io::Error::new(
@@ -384,8 +386,8 @@ impl LinuxSandbox {
         command.env_clear();
         command.envs(prepared.scrubbed_env.iter().cloned());
         #[cfg(target_os = "linux")]
-        let landlock_context = prepare_linux_landlock_context(prepared)
-            .map_err(|source| LinuxSandboxError::Spawn(source))?;
+        let landlock_context =
+            prepare_linux_landlock_context(prepared).map_err(LinuxSandboxError::Spawn)?;
         #[cfg(target_os = "linux")]
         configure_linux_rlimit_pre_exec(&mut command, &prepared.resource_limits);
         #[cfg(target_os = "linux")]
