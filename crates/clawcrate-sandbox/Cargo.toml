@@ -15,5 +15,8 @@ clawcrate-types = { path = "../clawcrate-types" }
 nix = { version = "0.29", features = ["resource"] }
 thiserror = "2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+
 [dev-dependencies]
 chrono = { version = "0.4", features = ["serde"] }
