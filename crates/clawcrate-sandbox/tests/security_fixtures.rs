@@ -1,6 +1,12 @@
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 #[cfg(target_os = "macos")]
@@ -95,6 +101,22 @@ impl LinuxEnforcer for RejectRlimitEnforcer {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn unique_tmp_path(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}_{nanos}_{}", std::process::id()))
+}
+
+#[cfg(target_os = "linux")]
+fn python3_path_for_linux_fixtures() -> Option<&'static str> {
+    ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).exists())
 }
 
 #[test]
@@ -220,6 +242,162 @@ fn fixture_network_policy_is_materialized_in_linux_prepare() {
         ],
     );
     assert_eq!(prepared_open.net, NetLevel::Open);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_linux_landlock_denies_write_outside_allowed_workspace() {
+    let fixtures = fixture_paths();
+    let workspace = unique_tmp_path("clawcrate_fixture_landlock_workspace");
+    fs::create_dir_all(&workspace).expect("create temporary workspace");
+    let denied_path = unique_tmp_path("clawcrate_fixture_landlock_denied");
+
+    let mut plan = fixture_plan(
+        &fixtures,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "printf 'ok' > allowed.txt && printf 'denied' > {}",
+                denied_path.display()
+            ),
+        ],
+        NetLevel::None,
+    );
+    plan.cwd = workspace.clone();
+    plan.profile.fs_read = vec![workspace.clone()];
+    plan.profile.fs_write = vec![workspace.clone()];
+
+    let sandbox = LinuxSandbox::new();
+    let prepared = sandbox.prepare_with_env(
+        &plan,
+        vec![
+            (
+                "HOME".to_string(),
+                fixtures.home_root.to_string_lossy().to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ],
+    );
+
+    let output = sandbox
+        .launch(&prepared)
+        .expect("launch fixture command")
+        .wait_with_output()
+        .expect("wait for fixture command");
+
+    assert!(
+        !output.status.success(),
+        "writing outside allowed workspace should be denied"
+    );
+    let allowed = fs::read_to_string(workspace.join("allowed.txt")).expect("read allowed output");
+    assert_eq!(allowed, "ok");
+    assert!(!denied_path.exists(), "denied path should not be created");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_linux_seccomp_denies_socket_when_network_is_none() {
+    let Some(python3) = python3_path_for_linux_fixtures() else {
+        return;
+    };
+
+    let fixtures = fixture_paths();
+    let workspace = unique_tmp_path("clawcrate_fixture_seccomp_workspace");
+    fs::create_dir_all(&workspace).expect("create temporary workspace");
+
+    let mut plan = fixture_plan(
+        &fixtures,
+        vec![
+            python3.to_string(),
+            "-c".to_string(),
+            "import socket; socket.socket()".to_string(),
+        ],
+        NetLevel::None,
+    );
+    plan.cwd = workspace.clone();
+    plan.profile.fs_read = vec![workspace.clone()];
+    plan.profile.fs_write = vec![workspace.clone()];
+
+    let sandbox = LinuxSandbox::new();
+    let prepared = sandbox.prepare_with_env(
+        &plan,
+        vec![
+            (
+                "HOME".to_string(),
+                fixtures.home_root.to_string_lossy().to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ],
+    );
+
+    let output = sandbox
+        .launch(&prepared)
+        .expect("launch fixture command")
+        .wait_with_output()
+        .expect("wait for fixture command");
+
+    assert!(
+        !output.status.success(),
+        "socket syscall should be denied when network level is none"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Operation not permitted") || stderr.contains("PermissionError"),
+        "unexpected seccomp deny stderr: {stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_linux_rlimit_file_size_denies_large_file_writes() {
+    let fixtures = fixture_paths();
+    let workspace = unique_tmp_path("clawcrate_fixture_rlimit_workspace");
+    fs::create_dir_all(&workspace).expect("create temporary workspace");
+
+    let mut plan = fixture_plan(
+        &fixtures,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "dd if=/dev/zero of=too-big.bin bs=512 count=8".to_string(),
+        ],
+        NetLevel::None,
+    );
+    plan.cwd = workspace.clone();
+    plan.profile.fs_read = vec![workspace.clone()];
+    plan.profile.fs_write = vec![workspace.clone()];
+    plan.profile.resources.max_output_bytes = 1024;
+
+    let sandbox = LinuxSandbox::new();
+    let prepared = sandbox.prepare_with_env(
+        &plan,
+        vec![
+            (
+                "HOME".to_string(),
+                fixtures.home_root.to_string_lossy().to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ],
+    );
+
+    let output = sandbox
+        .launch(&prepared)
+        .expect("launch fixture command")
+        .wait_with_output()
+        .expect("wait for fixture command");
+
+    assert!(
+        !output.status.success(),
+        "large writes should be denied by RLIMIT_FSIZE"
+    );
+    let written_size = fs::metadata(workspace.join("too-big.bin"))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    assert!(
+        written_size <= 1024,
+        "file should not exceed RLIMIT_FSIZE; got {written_size} bytes"
+    );
 }
 
 #[cfg(target_os = "macos")]
