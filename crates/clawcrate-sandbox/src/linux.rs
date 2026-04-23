@@ -10,7 +10,11 @@ use clawcrate_types::{ExecutionPlan, NetLevel, ResourceLimits};
 #[cfg(target_os = "linux")]
 use nix::{errno::Errno, libc};
 #[cfg(target_os = "linux")]
-use std::collections::BTreeSet;
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+#[cfg(target_os = "linux")]
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
+use std::convert::TryInto;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
@@ -109,6 +113,12 @@ struct LinuxRlimitTarget {
 struct LinuxLandlockContext {
     write_access_mask: u64,
     allowed_write_path_fds: Vec<OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LinuxSeccompContext {
+    program: BpfProgram,
 }
 
 #[cfg(target_os = "linux")]
@@ -273,6 +283,72 @@ fn open_linux_landlock_path(path: &Path) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
 
+#[cfg(target_os = "linux")]
+fn prepare_linux_seccomp_context(
+    prepared: &PreparedLinuxSandbox,
+) -> io::Result<LinuxSeccompContext> {
+    let target_arch: TargetArch = std::env::consts::ARCH.try_into().map_err(|source| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("unsupported seccomp target architecture: {source}"),
+        )
+    })?;
+    let filter = SeccompFilter::new(
+        build_linux_seccomp_rules(&prepared.net),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        target_arch,
+    )
+    .map_err(|source| io::Error::other(format!("failed to build seccomp filter: {source}")))?;
+    let program: BpfProgram = filter.try_into().map_err(|source| {
+        io::Error::other(format!("failed to compile seccomp filter: {source}"))
+    })?;
+    Ok(LinuxSeccompContext { program })
+}
+
+#[cfg(target_os = "linux")]
+fn build_linux_seccomp_rules(net: &NetLevel) -> BTreeMap<i64, Vec<SeccompRule>> {
+    let mut rules = BTreeMap::new();
+    for syscall in linux_default_seccomp_denied_syscalls() {
+        rules.insert(*syscall, Vec::new());
+    }
+    if matches!(net, NetLevel::None) {
+        for syscall in linux_none_net_seccomp_denied_syscalls() {
+            rules.insert(*syscall, Vec::new());
+        }
+    }
+    rules
+}
+
+#[cfg(target_os = "linux")]
+fn linux_default_seccomp_denied_syscalls() -> &'static [i64] {
+    &[
+        libc::SYS_ptrace,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_reboot,
+        libc::SYS_kexec_load,
+        libc::SYS_swapon,
+        libc::SYS_swapoff,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn linux_none_net_seccomp_denied_syscalls() -> &'static [i64] {
+    &[
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_connect,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+    ]
+}
+
 pub trait LinuxEnforcer: Send + Sync {
     fn apply_rlimits(
         &self,
@@ -389,9 +465,14 @@ impl LinuxSandbox {
         let landlock_context =
             prepare_linux_landlock_context(prepared).map_err(LinuxSandboxError::Spawn)?;
         #[cfg(target_os = "linux")]
+        let seccomp_context =
+            prepare_linux_seccomp_context(prepared).map_err(LinuxSandboxError::Spawn)?;
+        #[cfg(target_os = "linux")]
         configure_linux_rlimit_pre_exec(&mut command, &prepared.resource_limits);
         #[cfg(target_os = "linux")]
         configure_linux_landlock_pre_exec(&mut command, landlock_context);
+        #[cfg(target_os = "linux")]
+        configure_linux_seccomp_pre_exec(&mut command, seccomp_context);
 
         let child = command.spawn().map_err(LinuxSandboxError::Spawn)?;
         Ok(LinuxSandboxedChild { child })
@@ -583,10 +664,37 @@ fn apply_linux_landlock_restrictions(context: &LinuxLandlockContext) -> io::Resu
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn configure_linux_seccomp_pre_exec(command: &mut Command, context: LinuxSeccompContext) {
+    // SAFETY:
+    // - The closure runs in the child post-fork/pre-exec.
+    // - The seccomp BPF program is fully materialized in the parent process.
+    // - Any failure returns `io::Error`, aborting spawn/exec in fail-closed mode.
+    unsafe {
+        command.pre_exec(move || apply_linux_seccomp_filter(&context));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn apply_linux_seccomp_filter(context: &LinuxSeccompContext) -> io::Result<()> {
+    // SAFETY: prctl contract is satisfied for PR_SET_NO_NEW_PRIVS.
+    let prctl_result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if prctl_result != 0 {
+        return Err(io::Error::from_raw_os_error(Errno::last_raw()));
+    }
+
+    seccompiler::apply_filter(context.program.as_slice())
+        .map_err(|source| io::Error::other(format!("failed to apply seccomp filter: {source}")))
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
     use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     #[cfg(target_os = "linux")]
@@ -684,6 +792,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}_{nanos}_{}", std::process::id()));
         fs::create_dir_all(&dir).expect("create temp test directory");
         dir
+    }
+
+    #[cfg(target_os = "linux")]
+    fn python3_path_for_seccomp_tests() -> Option<&'static str> {
+        ["/usr/bin/python3", "/bin/python3"]
+            .into_iter()
+            .find(|candidate| Path::new(candidate).exists())
     }
 
     #[test]
@@ -844,5 +959,79 @@ mod tests {
             fs::read_to_string(allowed_dir.join("allowed.txt")).expect("read allowed output");
         assert_eq!(allowed_content, "ok");
         assert!(!denied_file.exists(), "denied file should not be created");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_applies_seccomp_network_deny_when_profile_net_is_none() {
+        let Some(python3) = python3_path_for_seccomp_tests() else {
+            return;
+        };
+
+        let mut plan = test_plan(vec![
+            python3.to_string(),
+            "-c".to_string(),
+            "import socket; socket.socket()".to_string(),
+        ]);
+        plan.profile.net = NetLevel::None;
+
+        let sandbox = LinuxSandbox::new();
+        let prepared = sandbox.prepare_with_env(
+            &plan,
+            vec![
+                ("HOME".to_string(), "/tmp/home".to_string()),
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ],
+        );
+        let output = sandbox
+            .launch(&prepared)
+            .expect("launch command")
+            .wait_with_output()
+            .expect("wait for command");
+
+        assert!(
+            !output.status.success(),
+            "socket() should be denied by seccomp when net is none"
+        );
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert!(
+            stderr.contains("Operation not permitted") || stderr.contains("PermissionError"),
+            "unexpected socket() denial stderr: {stderr}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_keeps_socket_available_when_profile_net_is_open() {
+        let Some(python3) = python3_path_for_seccomp_tests() else {
+            return;
+        };
+
+        let mut plan = test_plan(vec![
+            python3.to_string(),
+            "-c".to_string(),
+            "import socket; socket.socket()".to_string(),
+        ]);
+        plan.profile.net = NetLevel::Open;
+
+        let sandbox = LinuxSandbox::new();
+        let prepared = sandbox.prepare_with_env(
+            &plan,
+            vec![
+                ("HOME".to_string(), "/tmp/home".to_string()),
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ],
+        );
+        let output = sandbox
+            .launch(&prepared)
+            .expect("launch command")
+            .wait_with_output()
+            .expect("wait for command");
+
+        assert!(
+            output.status.success(),
+            "net=open should keep socket() available under seccomp; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
