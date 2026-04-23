@@ -3346,7 +3346,7 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 1; done")
+            .arg("trap '' TERM; while :; do :; done")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn interrupt child");
