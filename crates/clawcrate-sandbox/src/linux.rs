@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use crate::env_scrub::{scrub_current_environment, scrub_environment};
 use clawcrate_types::{ExecutionPlan, NetLevel, ResourceLimits};
+#[cfg(target_os = "linux")]
+use nix::{errno::Errno, libc};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -43,6 +45,54 @@ pub enum LinuxSandboxError {
     Spawn(#[source] io::Error),
 }
 
+#[cfg(target_os = "linux")]
+const LINUX_RLIMIT_TARGET_COUNT: usize = 5;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct LinuxRlimitTarget {
+    resource: libc::__rlimit_resource_t,
+    desired_soft: libc::rlim_t,
+}
+
+#[cfg(target_os = "linux")]
+fn build_linux_rlimit_targets(
+    limits: &ResourceLimits,
+) -> [LinuxRlimitTarget; LINUX_RLIMIT_TARGET_COUNT] {
+    [
+        LinuxRlimitTarget {
+            resource: libc::RLIMIT_CPU,
+            desired_soft: saturating_u64_to_rlim_t(limits.max_cpu_seconds),
+        },
+        LinuxRlimitTarget {
+            resource: libc::RLIMIT_AS,
+            desired_soft: saturating_u64_to_rlim_t(memory_mb_to_bytes(limits.max_memory_mb)),
+        },
+        LinuxRlimitTarget {
+            resource: libc::RLIMIT_NOFILE,
+            desired_soft: saturating_u64_to_rlim_t(limits.max_open_files),
+        },
+        LinuxRlimitTarget {
+            resource: libc::RLIMIT_FSIZE,
+            desired_soft: saturating_u64_to_rlim_t(limits.max_output_bytes),
+        },
+        LinuxRlimitTarget {
+            resource: libc::RLIMIT_NPROC,
+            desired_soft: saturating_u64_to_rlim_t(limits.max_processes),
+        },
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn memory_mb_to_bytes(memory_mb: u64) -> u64 {
+    memory_mb.saturating_mul(1024).saturating_mul(1024)
+}
+
+#[cfg(target_os = "linux")]
+fn saturating_u64_to_rlim_t(value: u64) -> libc::rlim_t {
+    libc::rlim_t::try_from(value).unwrap_or(libc::rlim_t::MAX)
+}
+
 pub trait LinuxEnforcer: Send + Sync {
     fn apply_rlimits(
         &self,
@@ -66,8 +116,8 @@ impl LinuxEnforcer for KernelEnforcer {
         &self,
         _limits: &ResourceLimits,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Applying kernel limits in the child-before-exec phase requires unsafe process hooks.
-        // The crate currently forbids unsafe code, so this stage is wired but no-op for now.
+        // Linux rlimits are enforced in the child pre-exec hook installed in `launch`.
+        // Keep this step wired for ordering/traceability while Landlock/seccomp are integrated.
         Ok(())
     }
 
@@ -154,6 +204,8 @@ impl LinuxSandbox {
         command.process_group(0);
         command.env_clear();
         command.envs(prepared.scrubbed_env.iter().cloned());
+        #[cfg(target_os = "linux")]
+        configure_linux_rlimit_pre_exec(&mut command, &prepared.resource_limits);
 
         let child = command.spawn().map_err(LinuxSandboxError::Spawn)?;
         Ok(LinuxSandboxedChild { child })
@@ -214,6 +266,57 @@ pub fn scrub_environment_for_profile(plan: &ExecutionPlan) -> (Vec<(String, Stri
     let scrubbed =
         scrub_current_environment(&plan.profile.env_scrub, &plan.profile.env_passthrough);
     (scrubbed.kept, scrubbed.removed)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn configure_linux_rlimit_pre_exec(command: &mut Command, limits: &ResourceLimits) {
+    let targets = build_linux_rlimit_targets(limits);
+    // SAFETY:
+    // - The closure is installed before `spawn` and executed in the child post-fork/pre-exec.
+    // - It performs only `getrlimit` / `setrlimit` syscalls and plain arithmetic over precomputed
+    //   fixed-size targets, avoiding allocator use and non-async-signal-safe primitives.
+    // - Any failure returns an `io::Error`, causing spawn/exec to fail closed.
+    unsafe {
+        command.pre_exec(move || apply_linux_rlimit_targets(&targets));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn apply_linux_rlimit_targets(
+    targets: &[LinuxRlimitTarget; LINUX_RLIMIT_TARGET_COUNT],
+) -> io::Result<()> {
+    for target in targets {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+
+        // SAFETY: Arguments are valid pointers and resource IDs from libc constants.
+        if unsafe { libc::getrlimit(target.resource, &mut current) } != 0 {
+            return Err(io::Error::from_raw_os_error(Errno::last_raw()));
+        }
+
+        let effective_soft = if current.rlim_max == libc::RLIM_INFINITY {
+            target.desired_soft
+        } else {
+            target.desired_soft.min(current.rlim_max)
+        };
+        if effective_soft == current.rlim_cur {
+            continue;
+        }
+
+        let updated = libc::rlimit {
+            rlim_cur: effective_soft,
+            rlim_max: current.rlim_max,
+        };
+        // SAFETY: Arguments are valid pointers and resource IDs from libc constants.
+        if unsafe { libc::setrlimit(target.resource, &updated) } != 0 {
+            return Err(io::Error::from_raw_os_error(Errno::last_raw()));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -364,5 +467,51 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).expect("utf8 output");
         assert!(stdout.contains("HOME=/tmp/home"));
         assert!(!stdout.contains("MY_SECRET_KEY=should_be_removed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_applies_rlimits_in_child_pre_exec_path() {
+        let mut plan = test_plan(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "ulimit -t; ulimit -n".to_string(),
+        ]);
+        plan.profile.resources.max_cpu_seconds = 1;
+        plan.profile.resources.max_open_files = 64;
+
+        let sandbox = LinuxSandbox::new();
+        let prepared = sandbox.prepare_with_env(
+            &plan,
+            vec![
+                ("HOME".to_string(), "/tmp/home".to_string()),
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ],
+        );
+
+        let output = sandbox
+            .launch(&prepared)
+            .expect("launch command")
+            .wait_with_output()
+            .expect("wait for command");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8 output");
+        let mut lines = stdout.lines();
+        let cpu_seconds = lines
+            .next()
+            .expect("cpu limit line")
+            .trim()
+            .parse::<u64>()
+            .expect("cpu limit as integer");
+        let open_files = lines
+            .next()
+            .expect("open files limit line")
+            .trim()
+            .parse::<u64>()
+            .expect("open files limit as integer");
+
+        assert_eq!(cpu_seconds, 1);
+        assert_eq!(open_files, 64);
     }
 }
