@@ -1158,6 +1158,10 @@ fn detect_out_of_profile_requests(plan: &ExecutionPlan) -> Vec<String> {
         NetLevel::Filtered { allowed_domains } => {
             let hosts = extract_hosts_from_command(&plan.command);
             if hosts.is_empty() {
+                requested.push(
+                    "command appears to need network, but filtered-mode host extraction was ambiguous; explicit approval required"
+                        .to_string(),
+                );
                 return requested;
             }
 
@@ -2746,6 +2750,29 @@ mod tests {
         let requests = detect_out_of_profile_requests(&denied_plan);
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("evil.example.com"));
+    }
+
+    #[test]
+    fn approval_detection_flags_ambiguous_filtered_targets() {
+        let curl_without_scheme = mock_plan(
+            NetLevel::Filtered {
+                allowed_domains: vec!["example.com".to_string()],
+            },
+            &["curl", "example.com"],
+        );
+        let requests = detect_out_of_profile_requests(&curl_without_scheme);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("host extraction was ambiguous"));
+
+        let variable_target = mock_plan(
+            NetLevel::Filtered {
+                allowed_domains: vec!["example.com".to_string()],
+            },
+            &["curl", "$TARGET_URL"],
+        );
+        let requests = detect_out_of_profile_requests(&variable_target);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("host extraction was ambiguous"));
     }
 
     #[test]
