@@ -1,15 +1,25 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::str;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+#[cfg(not(test))]
+const MAX_ACTIVE_PROXY_HANDLERS: usize = 64;
+#[cfg(test)]
+const MAX_ACTIVE_PROXY_HANDLERS: usize = 8;
+const MAX_REQUEST_LINE_BYTES: usize = 4096;
+const MAX_HEADER_LINE_BYTES: usize = 8192;
+const MAX_HEADER_COUNT: usize = 64;
+const MAX_HEADER_BYTES_TOTAL: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EgressProxyConfig {
     pub allowed_domains: Vec<String>,
     pub enforce_sni: bool,
+    pub max_active_handlers: usize,
 }
 
 impl EgressProxyConfig {
@@ -17,6 +27,7 @@ impl EgressProxyConfig {
         Self {
             allowed_domains,
             enforce_sni: true,
+            max_active_handlers: MAX_ACTIVE_PROXY_HANDLERS,
         }
     }
 }
@@ -98,7 +109,9 @@ pub fn start_egress_proxy(
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_thread = shutdown.clone();
+    let active_handlers = Arc::new(AtomicUsize::new(0));
     let enforce_sni = config.enforce_sni;
+    let max_active_handlers = config.max_active_handlers.max(1);
 
     let join = thread::spawn(move || loop {
         if shutdown_thread.load(Ordering::SeqCst) {
@@ -106,9 +119,17 @@ pub fn start_egress_proxy(
         }
 
         match listener.accept() {
-            Ok((stream, _peer_addr)) => {
+            Ok((mut stream, _peer_addr)) => {
+                if !try_acquire_handler_slot(&active_handlers, max_active_handlers) {
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+                    let _ = write_http_response(&mut stream, 503, "Service Unavailable");
+                    continue;
+                }
+
                 let allowed = allowed_domains.clone();
+                let active_handlers_for_thread = active_handlers.clone();
                 thread::spawn(move || {
+                    let _slot_guard = ActiveHandlerSlotGuard::new(active_handlers_for_thread);
                     let _ = handle_client_connection(stream, &allowed, enforce_sni);
                 });
             }
@@ -134,6 +155,73 @@ pub fn start_egress_proxy(
     })
 }
 
+fn try_acquire_handler_slot(active_handlers: &AtomicUsize, max_active_handlers: usize) -> bool {
+    active_handlers
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            (current < max_active_handlers).then_some(current + 1)
+        })
+        .is_ok()
+}
+
+#[derive(Debug)]
+struct ActiveHandlerSlotGuard {
+    active_handlers: Arc<AtomicUsize>,
+}
+
+impl ActiveHandlerSlotGuard {
+    fn new(active_handlers: Arc<AtomicUsize>) -> Self {
+        Self { active_handlers }
+    }
+}
+
+impl Drop for ActiveHandlerSlotGuard {
+    fn drop(&mut self) {
+        self.active_handlers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+enum LimitedLineRead {
+    Eof,
+    Line(Vec<u8>),
+    TooLong,
+}
+
+fn read_limited_line(reader: &mut impl BufRead, max_bytes: usize) -> io::Result<LimitedLineRead> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(LimitedLineRead::Eof);
+            }
+            return Ok(LimitedLineRead::Line(line));
+        }
+
+        let remaining_capacity = max_bytes.saturating_sub(line.len());
+        if remaining_capacity == 0 {
+            return Ok(LimitedLineRead::TooLong);
+        }
+
+        if let Some(newline_index) = available.iter().position(|byte| *byte == b'\n') {
+            let take_len = newline_index + 1;
+            if take_len > remaining_capacity {
+                return Ok(LimitedLineRead::TooLong);
+            }
+            line.extend_from_slice(&available[..take_len]);
+            reader.consume(take_len);
+            return Ok(LimitedLineRead::Line(line));
+        }
+
+        let available_len = available.len();
+        let take_len = available_len.min(remaining_capacity);
+        line.extend_from_slice(&available[..take_len]);
+        reader.consume(take_len);
+        if take_len < available_len {
+            return Ok(LimitedLineRead::TooLong);
+        }
+    }
+}
+
 fn handle_client_connection(
     mut client: TcpStream,
     allowed_domains: &[String],
@@ -142,10 +230,22 @@ fn handle_client_connection(
     client.set_nodelay(true)?;
     let mut reader = BufReader::new(client.try_clone()?);
 
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        return Ok(());
-    }
+    let request_line_bytes = match read_limited_line(&mut reader, MAX_REQUEST_LINE_BYTES)? {
+        LimitedLineRead::Eof => return Ok(()),
+        LimitedLineRead::TooLong => {
+            write_http_response(&mut client, 400, "Bad Request")?;
+            return Ok(());
+        }
+        LimitedLineRead::Line(line) => line,
+    };
+    let request_line = match str::from_utf8(&request_line_bytes) {
+        Ok(line) => line,
+        Err(_) => {
+            write_http_response(&mut client, 400, "Bad Request")?;
+            return Ok(());
+        }
+    };
+
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
@@ -162,13 +262,32 @@ fn handle_client_connection(
         }
     };
 
+    let mut header_count = 0usize;
+    let mut header_bytes_total = 0usize;
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(());
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
+        match read_limited_line(&mut reader, MAX_HEADER_LINE_BYTES)? {
+            LimitedLineRead::Eof => return Ok(()),
+            LimitedLineRead::TooLong => {
+                write_http_response(&mut client, 431, "Request Header Fields Too Large")?;
+                return Ok(());
+            }
+            LimitedLineRead::Line(line) => {
+                header_bytes_total = header_bytes_total.saturating_add(line.len());
+                if header_bytes_total > MAX_HEADER_BYTES_TOTAL {
+                    write_http_response(&mut client, 431, "Request Header Fields Too Large")?;
+                    return Ok(());
+                }
+
+                if line == b"\r\n" || line == b"\n" {
+                    break;
+                }
+
+                header_count = header_count.saturating_add(1);
+                if header_count > MAX_HEADER_COUNT {
+                    write_http_response(&mut client, 431, "Request Header Fields Too Large")?;
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -188,14 +307,17 @@ fn handle_client_connection(
 
     write_http_response(&mut client, 200, "Connection Established")?;
 
-    let tls_preface = peek_tls_preface(&mut client)?;
-    if !tls_preface.is_empty() && enforce_sni && target_port == 443 {
-        if let Some(sni) = extract_sni_from_client_hello(&tls_preface) {
-            if !hostnames_match(&target_host, &sni) || !is_host_allowed(&sni, allowed_domains) {
-                let _ = client.shutdown(Shutdown::Both);
-                let _ = upstream.shutdown(Shutdown::Both);
-                return Ok(());
-            }
+    if enforce_sni && target_port == 443 {
+        let tls_preface = peek_tls_preface(&mut client)?;
+        let Some(sni) = extract_sni_from_client_hello(&tls_preface) else {
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = upstream.shutdown(Shutdown::Both);
+            return Ok(());
+        };
+        if !hostnames_match(&target_host, &sni) || !is_host_allowed(&sni, allowed_domains) {
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = upstream.shutdown(Shutdown::Both);
+            return Ok(());
         }
     }
 
@@ -414,12 +536,15 @@ fn parse_server_name_extension(ext: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         extract_sni_from_client_hello, is_host_allowed, parse_connect_target, start_egress_proxy,
-        EgressProxyConfig,
+        try_acquire_handler_slot, EgressProxyConfig, MAX_ACTIVE_PROXY_HANDLERS, MAX_HEADER_COUNT,
+        MAX_HEADER_LINE_BYTES,
     };
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{Shutdown, TcpListener};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn domain_matching_supports_exact_and_wildcard_rules() {
@@ -455,6 +580,7 @@ mod tests {
         let proxy = start_egress_proxy(EgressProxyConfig {
             allowed_domains: vec!["allowed.test".to_string()],
             enforce_sni: false,
+            max_active_handlers: MAX_ACTIVE_PROXY_HANDLERS,
         })
         .expect("start proxy");
 
@@ -482,6 +608,7 @@ mod tests {
         let proxy = start_egress_proxy(EgressProxyConfig {
             allowed_domains: vec!["localhost".to_string()],
             enforce_sni: false,
+            max_active_handlers: MAX_ACTIVE_PROXY_HANDLERS,
         })
         .expect("start proxy");
 
@@ -507,15 +634,151 @@ mod tests {
         proxy.shutdown();
     }
 
-    fn read_http_response_header(stream: &mut std::net::TcpStream) -> String {
+    #[test]
+    fn proxy_strict_sni_denies_missing_client_hello_preface() {
+        let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
+        let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
+        let upstream_thread = thread::spawn(move || {
+            let (_socket, _) = upstream_listener.accept().expect("accept upstream");
+        });
+
+        let proxy = start_egress_proxy(EgressProxyConfig {
+            allowed_domains: vec!["localhost".to_string()],
+            enforce_sni: true,
+            max_active_handlers: MAX_ACTIVE_PROXY_HANDLERS,
+        })
+        .expect("start proxy");
+
+        let mut stream =
+            std::net::TcpStream::connect(proxy.addr()).expect("connect to local egress proxy");
+        write!(
+            stream,
+            "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+            upstream_addr.port(),
+            upstream_addr.port()
+        )
+        .expect("write connect request");
+
+        let response = read_http_response_header(&mut stream);
+        assert!(
+            response.contains("200 Connection Established"),
+            "unexpected CONNECT response: {response}"
+        );
+
+        thread::sleep(Duration::from_millis(400));
         stream
             .set_read_timeout(Some(Duration::from_secs(1)))
             .expect("set read timeout");
+        let mut buf = [0_u8; 1];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        assert_eq!(n, 0, "strict SNI should close missing ClientHello preface");
+        let _ = stream.shutdown(Shutdown::Both);
+
+        upstream_thread.join().expect("join upstream thread");
+        proxy.shutdown();
+    }
+
+    #[test]
+    fn proxy_rejects_oversized_header_line() {
+        let proxy = start_egress_proxy(EgressProxyConfig {
+            allowed_domains: vec!["allowed.test".to_string()],
+            enforce_sni: false,
+            max_active_handlers: MAX_ACTIVE_PROXY_HANDLERS,
+        })
+        .expect("start proxy");
+
+        let mut stream =
+            std::net::TcpStream::connect(proxy.addr()).expect("connect to local egress proxy");
+        let oversized = "a".repeat(MAX_HEADER_LINE_BYTES + 128);
+        write!(
+            stream,
+            "CONNECT allowed.test:443 HTTP/1.1\r\nX-Oversized: {oversized}\r\n\r\n"
+        )
+        .expect("write connect request");
+
+        let response = read_http_response_header(&mut stream);
+        assert!(
+            response.contains("431 Request Header Fields Too Large"),
+            "unexpected oversized-header response: {response}"
+        );
+        proxy.shutdown();
+    }
+
+    #[test]
+    fn proxy_rejects_excessive_header_count() {
+        let proxy = start_egress_proxy(EgressProxyConfig {
+            allowed_domains: vec!["allowed.test".to_string()],
+            enforce_sni: false,
+            max_active_handlers: MAX_ACTIVE_PROXY_HANDLERS,
+        })
+        .expect("start proxy");
+
+        let mut stream =
+            std::net::TcpStream::connect(proxy.addr()).expect("connect to local egress proxy");
+        let mut request = String::from("CONNECT allowed.test:443 HTTP/1.1\r\n");
+        for index in 0..(MAX_HEADER_COUNT + 1) {
+            request.push_str(&format!("X-{index}: v\r\n"));
+        }
+        request.push_str("\r\n");
+        let _ = stream.write_all(request.as_bytes());
+
+        let response = read_http_response_header(&mut stream);
+        assert!(
+            response.contains("431 Request Header Fields Too Large"),
+            "unexpected excessive-header-count response: {response}"
+        );
+        proxy.shutdown();
+    }
+
+    #[test]
+    fn proxy_enforces_bounded_concurrency_under_connection_flood() {
+        let active_handlers = Arc::new(AtomicUsize::new(0));
+        let successful_acquisitions = Arc::new(AtomicUsize::new(0));
+        let max_handlers = 4usize;
+        let mut workers = Vec::new();
+
+        for _ in 0..64 {
+            let active_handlers = active_handlers.clone();
+            let successful_acquisitions = successful_acquisitions.clone();
+            workers.push(thread::spawn(move || {
+                if try_acquire_handler_slot(active_handlers.as_ref(), max_handlers) {
+                    successful_acquisitions.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().expect("join limiter worker");
+        }
+
+        assert_eq!(
+            successful_acquisitions.load(Ordering::SeqCst),
+            max_handlers,
+            "handler slot limiter should cap concurrent acquires under contention"
+        );
+    }
+
+    fn read_http_response_header(stream: &mut std::net::TcpStream) -> String {
+        let _ = stream.set_nonblocking(true);
 
         let mut bytes = Vec::new();
         let mut chunk = [0_u8; 128];
-        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-            let n = stream.read(&mut chunk).expect("read response chunk");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") && Instant::now() < deadline {
+            let n = match stream.read(&mut chunk) {
+                Ok(n) => n,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Err(error) => panic!("read response chunk: {error}"),
+            };
             if n == 0 {
                 break;
             }
@@ -525,7 +788,7 @@ mod tests {
             }
         }
 
-        stream.set_read_timeout(None).expect("clear read timeout");
+        let _ = stream.set_nonblocking(false);
         String::from_utf8_lossy(&bytes).to_string()
     }
 
