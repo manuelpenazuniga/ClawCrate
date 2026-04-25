@@ -214,15 +214,15 @@ impl ProfileResolver {
                     reason: format!("entry '{}' path must end in .yaml", entry.id),
                 });
             }
-            let path_key = entry.path.to_string_lossy().to_string();
-            if !seen_paths.insert(path_key) {
+            let normalized_path = normalize_catalog_relative_path(&entry.path);
+            if !seen_paths.insert(normalized_path.clone()) {
                 return Err(ProfileError::InvalidCatalog {
                     path: catalog_path.to_path_buf(),
                     reason: format!("duplicate profile path '{}'", entry.path.display()),
                 });
             }
 
-            let profile_path = catalog_dir.join(&entry.path);
+            let profile_path = catalog_dir.join(&normalized_path);
             self.resolve_from_path(&profile_path)?;
         }
 
@@ -541,6 +541,17 @@ fn parse_network_mode_string(raw: &str, path: &Path) -> Result<NetLevel, Profile
 
 fn normalize_string(input: &str) -> String {
     input.trim().to_ascii_lowercase()
+}
+
+fn normalize_catalog_relative_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, Component::CurDir) {
+            continue;
+        }
+        normalized.push(component.as_os_str());
+    }
+    normalized
 }
 
 fn normalize_allowed_domains(values: &[String]) -> Vec<String> {
@@ -957,5 +968,39 @@ profiles:
             .validate_community_catalog(&catalog)
             .expect_err("duplicate catalog id should fail");
         assert!(error.to_string().contains("duplicate entry id"));
+    }
+
+    #[test]
+    fn rejects_catalog_entry_with_duplicate_normalized_path_variants() {
+        let resolver = ProfileResolver::default();
+        let tmp = unique_tmp_dir("clawcrate_profiles_catalog_duplicate_path_variants");
+        let catalog = tmp.join("catalog.yaml");
+        let profile = tmp.join("one.yaml");
+
+        write(
+            &profile,
+            r#"
+name: one
+extends: safe
+"#,
+        );
+        write(
+            &catalog,
+            r#"
+version: 1
+profiles:
+  - id: one
+    title: One
+    path: one.yaml
+  - id: one-alt
+    title: One Alt
+    path: ./one.yaml
+"#,
+        );
+
+        let error = resolver
+            .validate_community_catalog(&catalog)
+            .expect_err("duplicate normalized path variants should fail");
+        assert!(error.to_string().contains("duplicate profile path"));
     }
 }
