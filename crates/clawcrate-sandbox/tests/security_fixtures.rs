@@ -4,6 +4,7 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -80,6 +81,7 @@ struct RejectRlimitEnforcer;
 impl LinuxEnforcer for RejectRlimitEnforcer {
     fn apply_rlimits(
         &self,
+        _command: &mut Command,
         _limits: &ResourceLimits,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(Box::new(io::Error::new(
@@ -90,6 +92,7 @@ impl LinuxEnforcer for RejectRlimitEnforcer {
 
     fn apply_landlock(
         &self,
+        _command: &mut Command,
         _prepared: &PreparedLinuxSandbox,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
@@ -97,6 +100,7 @@ impl LinuxEnforcer for RejectRlimitEnforcer {
 
     fn apply_seccomp(
         &self,
+        _command: &mut Command,
         _prepared: &PreparedLinuxSandbox,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
