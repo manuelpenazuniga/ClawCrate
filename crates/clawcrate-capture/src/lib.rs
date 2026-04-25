@@ -191,8 +191,15 @@ where
         Arc::clone(&budget),
     );
 
-    let stdout_stats = join_capture_thread(stdout_handle)?;
-    let stderr_stats = join_capture_thread(stderr_handle)?;
+    let stdout_result = join_capture_thread(stdout_handle);
+    let stderr_result = join_capture_thread(stderr_handle);
+
+    let (stdout_stats, stderr_stats) = match (stdout_result, stderr_result) {
+        (Ok(stdout_stats), Ok(stderr_stats)) => (stdout_stats, stderr_stats),
+        (Err(capture_error), Ok(_)) => return Err(capture_error),
+        (Ok(_), Err(capture_error)) => return Err(capture_error),
+        (Err(capture_error), Err(_)) => return Err(capture_error),
+    };
 
     let total_written_bytes = stdout_stats.written_bytes + stderr_stats.written_bytes;
     let total_dropped_bytes = stdout_stats.dropped_bytes + stderr_stats.dropped_bytes;
@@ -222,9 +229,15 @@ fn capture_child_pipes(
     stderr: ChildStderr,
     config: &CaptureConfig,
 ) -> Result<CapturedChildOutput, CaptureError> {
-    let summary = capture_streams(stdout, stderr, config)?;
-    let status = child.wait().map_err(CaptureError::WaitChild)?;
-    Ok(CapturedChildOutput { status, summary })
+    let summary = capture_streams(stdout, stderr, config);
+    let status = child.wait().map_err(CaptureError::WaitChild);
+
+    match (summary, status) {
+        (Ok(summary), Ok(status)) => Ok(CapturedChildOutput { status, summary }),
+        (Err(capture_error), Ok(_)) => Err(capture_error),
+        (Ok(_), Err(wait_error)) => Err(wait_error),
+        (Err(capture_error), Err(_wait_error)) => Err(capture_error),
+    }
 }
 
 fn spawn_capture_thread<R, W>(
@@ -410,9 +423,10 @@ fn hash_sha256(path: &Path) -> Result<String, CaptureError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{self, Cursor, Read};
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -516,6 +530,72 @@ mod tests {
     }
 
     #[test]
+    fn capture_streams_joins_remaining_thread_when_other_stream_fails() {
+        let tmp = unique_tmp_dir("clawcrate_capture_join_failure_path");
+        let config = CaptureConfig {
+            artifacts_dir: tmp.clone(),
+            max_output_bytes: 1024,
+        };
+
+        let started_at = SystemTime::now();
+        let result = capture_streams(
+            FailingReader::new(io::ErrorKind::Other, "synthetic stdout failure"),
+            DelayedEofReader::new(b"stderr-data".to_vec(), Duration::from_millis(200)),
+            &config,
+        );
+        let elapsed = started_at.elapsed().expect("elapsed wall-clock time");
+
+        assert!(
+            matches!(
+                result,
+                Err(super::CaptureError::StreamIo {
+                    stream: "stdout",
+                    ..
+                })
+            ),
+            "expected stdout stream IO failure, got: {result:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "capture_streams returned before joining delayed sibling stream thread: {elapsed:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(config.stderr_log_path()).expect("read stderr log"),
+            "stderr-data"
+        );
+    }
+
+    #[test]
+    fn capture_child_output_waits_and_reaps_even_when_capture_setup_fails() {
+        let tmp = unique_tmp_dir("clawcrate_capture_child_reap_failure_path");
+        let occupied_path = tmp.join("occupied-file");
+        fs::write(&occupied_path, "occupied").expect("write occupied path");
+        let config = CaptureConfig {
+            artifacts_dir: occupied_path,
+            max_output_bytes: 1024,
+        };
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 0.2");
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        let child = command.spawn().expect("spawn shell");
+
+        let started_at = SystemTime::now();
+        let result = capture_child_output(child, &config);
+        let elapsed = started_at.elapsed().expect("elapsed wall-clock time");
+
+        assert!(
+            matches!(result, Err(super::CaptureError::CreateArtifactsDir(_))),
+            "expected artifacts-dir creation error, got: {result:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "capture_child_output returned before child wait/reap on failure path: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn snapshot_paths_captures_nested_files_with_hashes() {
         let tmp = unique_tmp_dir("clawcrate_snapshot_nested");
         let nested = tmp.join("workspace").join("src");
@@ -579,5 +659,57 @@ mod tests {
 
         let snapshot = snapshot_paths(&[missing, existing]).expect("snapshot with missing root");
         assert_eq!(snapshot.entries.len(), 1);
+    }
+
+    struct FailingReader {
+        kind: io::ErrorKind,
+        message: &'static str,
+    }
+
+    impl FailingReader {
+        fn new(kind: io::ErrorKind, message: &'static str) -> Self {
+            Self { kind, message }
+        }
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.kind, self.message))
+        }
+    }
+
+    struct DelayedEofReader {
+        chunk: Vec<u8>,
+        delay: Duration,
+        stage: u8,
+    }
+
+    impl DelayedEofReader {
+        fn new(chunk: Vec<u8>, delay: Duration) -> Self {
+            Self {
+                chunk,
+                delay,
+                stage: 0,
+            }
+        }
+    }
+
+    impl Read for DelayedEofReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.stage {
+                0 => {
+                    let len = self.chunk.len().min(buf.len());
+                    buf[..len].copy_from_slice(&self.chunk[..len]);
+                    self.stage = 1;
+                    Ok(len)
+                }
+                1 => {
+                    std::thread::sleep(self.delay);
+                    self.stage = 2;
+                    Ok(0)
+                }
+                _ => Ok(0),
+            }
+        }
     }
 }
