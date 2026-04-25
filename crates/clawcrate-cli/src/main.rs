@@ -2238,18 +2238,54 @@ fn handle_pennyprompt_bridge(config: PennyPromptBridgeArgs) -> Result<()> {
     io::stdin().read_to_string(&mut input).map_err(|source| {
         anyhow!("failed to read PennyPrompt bridge payload from stdin: {source}")
     })?;
-    if input.trim().is_empty() {
-        return Err(anyhow!(
-            "missing PennyPrompt bridge payload: provide JSON on stdin"
-        ));
+    let response = build_pennyprompt_bridge_response_with_executor(&input, execute_cli_json);
+
+    if config.pretty {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!("{}", serde_json::to_string(&response)?);
     }
 
-    let request: PennyPromptBridgeRequest = serde_json::from_str(&input)
-        .map_err(|source| anyhow!("invalid PennyPrompt bridge payload JSON: {source}"))?;
-    let action = normalize_action(&request.action);
-    let delegated_args = build_pennyprompt_cli_args(&action, &request)?;
+    Ok(())
+}
 
-    let response = match execute_cli_json(&delegated_args) {
+fn normalize_action(action: &str) -> String {
+    action.trim().to_ascii_lowercase()
+}
+
+fn build_pennyprompt_bridge_response_with_executor<F>(
+    input: &str,
+    executor: F,
+) -> PennyPromptBridgeResponse
+where
+    F: Fn(&[String]) -> std::result::Result<serde_json::Value, ApiCommandError>,
+{
+    if input.trim().is_empty() {
+        return pennyprompt_validation_error_response(
+            "unknown".to_string(),
+            "missing PennyPrompt bridge payload: provide JSON on stdin".to_string(),
+        );
+    }
+
+    let request = match serde_json::from_str::<PennyPromptBridgeRequest>(input) {
+        Ok(request) => request,
+        Err(source) => {
+            return pennyprompt_validation_error_response(
+                "unknown".to_string(),
+                format!("invalid PennyPrompt bridge payload JSON: {source}"),
+            );
+        }
+    };
+
+    let action = normalize_action(&request.action);
+    let delegated_args = match build_pennyprompt_cli_args(&action, &request) {
+        Ok(args) => args,
+        Err(error) => {
+            return pennyprompt_validation_error_response(action, error.to_string());
+        }
+    };
+
+    match executor(&delegated_args) {
         Ok(data) => PennyPromptBridgeResponse {
             ok: true,
             action,
@@ -2267,19 +2303,24 @@ fn handle_pennyprompt_bridge(config: PennyPromptBridgeArgs) -> Result<()> {
                 stderr: error.stderr,
             }),
         },
-    };
-
-    if config.pretty {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-    } else {
-        println!("{}", serde_json::to_string(&response)?);
     }
-
-    Ok(())
 }
 
-fn normalize_action(action: &str) -> String {
-    action.trim().to_ascii_lowercase()
+fn pennyprompt_validation_error_response(
+    action: String,
+    message: String,
+) -> PennyPromptBridgeResponse {
+    PennyPromptBridgeResponse {
+        ok: false,
+        action,
+        data: None,
+        error: Some(PennyPromptBridgeError {
+            message,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        }),
+    }
 }
 
 fn build_pennyprompt_cli_args(
@@ -2544,7 +2585,8 @@ mod tests {
 
     use super::{
         api_route_uses_delegated_worker, apply_replica_sync_back, build_api_cli_args,
-        build_execution_plan, build_pennyprompt_cli_args, collect_syncable_replica_changes,
+        build_execution_plan, build_pennyprompt_bridge_response_with_executor,
+        build_pennyprompt_cli_args, collect_syncable_replica_changes,
         command_appears_to_need_network, constant_time_eq, copy_workspace_with_default_exclusions,
         detect_out_of_profile_requests, doctor_rows, execution_status,
         execution_status_from_exit_status, extract_bearer_token, extract_host_from_reference,
@@ -2863,6 +2905,69 @@ mod tests {
             command: vec!["echo".to_string()],
         };
         assert!(build_pennyprompt_cli_args("unknown", &request).is_err());
+    }
+
+    #[test]
+    fn pennyprompt_bridge_returns_structured_error_for_unsupported_action() {
+        let input = r#"{"action":"unsupported","command":["echo","hi"]}"#;
+        let response = build_pennyprompt_bridge_response_with_executor(input, |_args| {
+            panic!("executor should not run for unsupported actions");
+        });
+
+        assert!(!response.ok);
+        assert_eq!(response.action, "unsupported");
+        let error = response.error.expect("structured error response");
+        assert!(error.message.contains("unsupported PennyPrompt action"));
+        assert_eq!(error.exit_code, None);
+        assert!(error.stdout.is_empty());
+        assert!(error.stderr.is_empty());
+    }
+
+    #[test]
+    fn pennyprompt_bridge_returns_structured_error_for_invalid_payload_combinations() {
+        let replica_direct_input =
+            r#"{"action":"run","replica":true,"direct":true,"command":["echo","hi"]}"#;
+        let replica_direct =
+            build_pennyprompt_bridge_response_with_executor(replica_direct_input, |_args| {
+                panic!("executor should not run for invalid payload");
+            });
+        assert!(!replica_direct.ok);
+        assert_eq!(replica_direct.action, "run");
+        let error = replica_direct.error.expect("structured error");
+        assert!(error
+            .message
+            .contains("`replica` and `direct` cannot be enabled together"));
+
+        let missing_command_input = r#"{"action":"plan"}"#;
+        let missing_command =
+            build_pennyprompt_bridge_response_with_executor(missing_command_input, |_args| {
+                panic!("executor should not run for missing command");
+            });
+        assert!(!missing_command.ok);
+        assert_eq!(missing_command.action, "plan");
+        let error = missing_command.error.expect("structured error");
+        assert!(error
+            .message
+            .contains("`command` must contain at least one element"));
+    }
+
+    #[test]
+    fn pennyprompt_bridge_validation_errors_serialize_as_json_response() {
+        let malformed = build_pennyprompt_bridge_response_with_executor("not-json", |_args| {
+            panic!("executor should not run for malformed JSON");
+        });
+        let serialized =
+            serde_json::to_string(&malformed).expect("bridge error response must serialize");
+        let value: serde_json::Value =
+            serde_json::from_str(&serialized).expect("serialized response must be valid JSON");
+        assert_eq!(
+            value.get("ok").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            value.get("action").and_then(serde_json::Value::as_str),
+            Some("unknown")
+        );
     }
 
     #[test]
