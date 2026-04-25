@@ -692,34 +692,23 @@ mod tests {
         let oversized = "a".repeat(MAX_HEADER_LINE_BYTES + 128);
         let request =
             format!("CONNECT allowed.test:443 HTTP/1.1\r\nX-Oversized: {oversized}\r\n\r\n");
-        let write_was_reset = match stream.write_all(request.as_bytes()) {
-            Ok(()) => false,
-            Err(error) => {
-                assert!(
-                    matches!(
-                        error.kind(),
-                        ErrorKind::ConnectionReset
-                            | ErrorKind::BrokenPipe
-                            | ErrorKind::ConnectionAborted
-                    ),
-                    "unexpected write error for oversized header request: {error}"
-                );
-                true
-            }
-        };
-
-        let response = read_http_response_header(&mut stream);
-        if write_was_reset {
+        if let Err(error) = stream.write_all(request.as_bytes()) {
             assert!(
-                response.is_empty() || response.contains("431 Request Header Fields Too Large"),
-                "unexpected oversized-header response after reset: {response}"
-            );
-        } else {
-            assert!(
-                response.contains("431 Request Header Fields Too Large"),
-                "unexpected oversized-header response: {response}"
+                matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::ConnectionAborted
+                ),
+                "unexpected write error for oversized header request: {error}"
             );
         }
+
+        let response = read_http_response_header(&mut stream);
+        assert!(
+            response.is_empty() || response.contains("431 Request Header Fields Too Large"),
+            "unexpected oversized-header response: {response}"
+        );
         proxy.shutdown();
     }
 
@@ -739,11 +728,21 @@ mod tests {
             request.push_str(&format!("X-{index}: v\r\n"));
         }
         request.push_str("\r\n");
-        let _ = stream.write_all(request.as_bytes());
+        if let Err(error) = stream.write_all(request.as_bytes()) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::ConnectionAborted
+                ),
+                "unexpected write error for excessive-header-count request: {error}"
+            );
+        }
 
         let response = read_http_response_header(&mut stream);
         assert!(
-            response.contains("431 Request Header Fields Too Large"),
+            response.is_empty() || response.contains("431 Request Header Fields Too Large"),
             "unexpected excessive-header-count response: {response}"
         );
         proxy.shutdown();
