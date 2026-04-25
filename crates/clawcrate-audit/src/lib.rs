@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use clawcrate_types::{AuditEvent, ExecutionPlan, ExecutionResult};
@@ -166,7 +166,7 @@ pub struct SqliteAuditIndex {
 impl SqliteAuditIndex {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SqliteAuditIndexError> {
         let db_path = path.as_ref().to_path_buf();
-        if let Some(parent) = db_path.parent() {
+        if let Some(parent) = sqlite_db_parent_dir(&db_path) {
             fs::create_dir_all(parent).map_err(|source| {
                 SqliteAuditIndexError::CreateParentDir {
                     path: parent.to_path_buf(),
@@ -420,15 +420,31 @@ pub enum SqliteAuditIndexError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to read audit event line {line} in {path}: {source}")]
+    ReadNdjsonLine {
+        path: PathBuf,
+        line: usize,
+        #[source]
+        source: io::Error,
+    },
+}
+
+fn sqlite_db_parent_dir(path: &Path) -> Option<&Path> {
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() {
+        None
+    } else {
+        Some(parent)
+    }
 }
 
 fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, SqliteAuditIndexError> {
-    let content =
-        fs::read_to_string(path).map_err(|source| SqliteAuditIndexError::ReadArtifact {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    serde_json::from_str(&content).map_err(|source| SqliteAuditIndexError::ParseJson {
+    let file = File::open(path).map_err(|source| SqliteAuditIndexError::ReadArtifact {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let reader = BufReader::new(file);
+    serde_json::from_reader(reader).map_err(|source| SqliteAuditIndexError::ParseJson {
         path: path.to_path_buf(),
         source,
     })
@@ -438,18 +454,23 @@ fn read_ndjson_audit_events(path: &Path) -> Result<Vec<AuditEvent>, SqliteAuditI
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content =
-        fs::read_to_string(path).map_err(|source| SqliteAuditIndexError::ReadArtifact {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let file = File::open(path).map_err(|source| SqliteAuditIndexError::ReadArtifact {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let reader = BufReader::new(file);
 
     let mut events = Vec::new();
-    for (index, line) in content.lines().enumerate() {
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|source| SqliteAuditIndexError::ReadNdjsonLine {
+            path: path.to_path_buf(),
+            line: index + 1,
+            source,
+        })?;
         if line.trim().is_empty() {
             continue;
         }
-        let event = serde_json::from_str::<AuditEvent>(line).map_err(|source| {
+        let event = serde_json::from_str::<AuditEvent>(&line).map_err(|source| {
             SqliteAuditIndexError::ParseNdjsonLine {
                 path: path.to_path_buf(),
                 line: index + 1,
@@ -487,7 +508,8 @@ fn audit_event_kind_label(event: &clawcrate_types::AuditEventKind) -> &'static s
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use chrono::Utc;
@@ -501,6 +523,8 @@ mod tests {
     use super::{
         ArtifactWriter, SqliteAuditIndex, AUDIT_NDJSON, FS_DIFF_JSON, PLAN_JSON, RESULT_JSON,
     };
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct FsDiffFixture {
@@ -707,5 +731,51 @@ mod tests {
             .expect("index artifacts");
         assert!(!indexed.has_result);
         assert_eq!(indexed.event_count, 0);
+    }
+
+    #[test]
+    fn sqlite_index_open_supports_bare_filename_path() {
+        let _lock = CWD_LOCK.lock().expect("lock cwd test");
+        let original_cwd = std::env::current_dir().expect("read current cwd");
+        let root = unique_tmp_dir("clawcrate_audit_sqlite_bare_filename");
+        std::env::set_current_dir(&root).expect("switch cwd to test dir");
+
+        let open_result = SqliteAuditIndex::open(PathBuf::from("audit-index.sqlite3"));
+        std::env::set_current_dir(&original_cwd).expect("restore cwd after test");
+
+        let index = open_result.expect("open sqlite index with bare filename path");
+        assert_eq!(index.db_path(), Path::new("audit-index.sqlite3"));
+        assert!(root.join("audit-index.sqlite3").exists());
+    }
+
+    #[test]
+    fn sqlite_indexer_handles_large_plan_and_ndjson_artifacts() {
+        let root = unique_tmp_dir("clawcrate_audit_sqlite_large_artifacts");
+        let writer = ArtifactWriter::new(&root, "exec-large").expect("create writer");
+        let mut plan = test_plan();
+        plan.id = "exec-large".to_string();
+        plan.command = (0..8_000).map(|index| format!("arg-{index}")).collect();
+        writer.write_plan(&plan).expect("write large plan");
+
+        for index in 0..1_500 {
+            writer
+                .append_audit_event(&AuditEvent {
+                    timestamp: Utc::now(),
+                    event: AuditEventKind::ProcessStarted {
+                        pid: 10_000 + index,
+                        command: vec!["echo".to_string(), format!("event-{index}")],
+                    },
+                })
+                .expect("append large audit event set");
+        }
+
+        let db_path = root.join("audit-index-large.sqlite3");
+        let mut index = SqliteAuditIndex::open(&db_path).expect("open sqlite index");
+        let indexed = index
+            .index_artifacts_dir(writer.artifacts_dir())
+            .expect("index large artifacts");
+
+        assert_eq!(indexed.execution_id, "exec-large");
+        assert_eq!(indexed.event_count, 1_500);
     }
 }
