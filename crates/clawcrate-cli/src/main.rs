@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1842,12 +1842,18 @@ struct ApiCommandRequest {
     command: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum ApiRoute {
     Health,
     Doctor,
     Plan,
     Run,
+}
+
+#[derive(Debug)]
+struct ApiDelegatedRequest {
+    request: Request,
+    route: ApiRoute,
 }
 
 #[derive(Debug, Serialize)]
@@ -1858,16 +1864,40 @@ struct ApiCommandError {
     stderr: String,
 }
 
+const API_MAX_WORKERS: usize = 4;
+const API_MAX_QUEUE_DEPTH: usize = 16;
+
 fn handle_api(args: ApiArgs, output: &OutputOptions) -> Result<()> {
     let token = resolve_api_token(&args)?;
     let server = Server::http(&args.bind)
         .map_err(|source| anyhow!("failed to bind local API on {}: {source}", args.bind))?;
+    let (delegated_tx, delegated_rx) =
+        mpsc::sync_channel::<ApiDelegatedRequest>(API_MAX_QUEUE_DEPTH);
+    let delegated_rx = Arc::new(Mutex::new(delegated_rx));
+
+    for _ in 0..API_MAX_WORKERS {
+        let delegated_rx = Arc::clone(&delegated_rx);
+        let output = *output;
+        thread::spawn(move || loop {
+            let delegated = {
+                let receiver = match delegated_rx.lock() {
+                    Ok(receiver) => receiver,
+                    Err(_) => return,
+                };
+                match receiver.recv() {
+                    Ok(request) => request,
+                    Err(_) => return,
+                }
+            };
+            handle_api_delegated_route(delegated.request, delegated.route, &output);
+        });
+    }
 
     verbose_log(output, 1, format!("api server listening on {}", args.bind));
     println!("clawcrate api listening on http://{}", args.bind);
 
     for request in server.incoming_requests() {
-        handle_api_request(request, &token, output);
+        dispatch_api_request(request, &token, output, &delegated_tx);
     }
 
     Ok(())
@@ -1888,7 +1918,12 @@ fn resolve_api_token(args: &ApiArgs) -> Result<String> {
     Ok(token)
 }
 
-fn handle_api_request(mut request: Request, token: &str, output: &OutputOptions) {
+fn dispatch_api_request(
+    request: Request,
+    token: &str,
+    output: &OutputOptions,
+    delegated_tx: &mpsc::SyncSender<ApiDelegatedRequest>,
+) {
     if !request_authorized(request.headers(), token) {
         respond_api_json(
             request,
@@ -1903,15 +1938,53 @@ fn handle_api_request(mut request: Request, token: &str, output: &OutputOptions)
         return;
     };
 
+    if !api_route_uses_delegated_worker(route) {
+        respond_api_json(
+            request,
+            200,
+            &serde_json::json!({
+                "status": "ok",
+                "version": env!("CARGO_PKG_VERSION")
+            }),
+        );
+        return;
+    }
+
+    match delegated_tx.try_send(ApiDelegatedRequest { request, route }) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(ApiDelegatedRequest { request, .. })) => {
+            verbose_log(
+                output,
+                1,
+                "api delegated request queue is full; returning 503",
+            );
+            respond_api_json(
+                request,
+                503,
+                &serde_json::json!({ "error": "server busy", "detail": "too many in-flight API requests" }),
+            );
+        }
+        Err(mpsc::TrySendError::Disconnected(ApiDelegatedRequest { request, .. })) => {
+            respond_api_json(
+                request,
+                503,
+                &serde_json::json!({ "error": "server unavailable" }),
+            );
+        }
+    }
+}
+
+fn api_route_uses_delegated_worker(route: ApiRoute) -> bool {
+    matches!(route, ApiRoute::Doctor | ApiRoute::Plan | ApiRoute::Run)
+}
+
+fn handle_api_delegated_route(mut request: Request, route: ApiRoute, output: &OutputOptions) {
     match route {
         ApiRoute::Health => {
             respond_api_json(
                 request,
-                200,
-                &serde_json::json!({
-                    "status": "ok",
-                    "version": env!("CARGO_PKG_VERSION")
-                }),
+                500,
+                &serde_json::json!({ "error": "invalid delegated route" }),
             );
         }
         ApiRoute::Doctor => {
@@ -2031,8 +2104,19 @@ fn extract_bearer_token(headers: &[Header]) -> Option<String> {
 fn request_authorized(headers: &[Header], expected_token: &str) -> bool {
     extract_bearer_token(headers)
         .as_deref()
-        .map(|token| token == expected_token)
+        .map(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()))
         .unwrap_or(false)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for idx in 0..max_len {
+        let left_byte = left.get(idx).copied().unwrap_or(0);
+        let right_byte = right.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
 }
 
 fn respond_api_with_cli_json(request: Request, args: &[String], output: &OutputOptions) {
@@ -2092,17 +2176,23 @@ fn execute_cli_json(args: &[String]) -> std::result::Result<serde_json::Value, A
 }
 
 fn respond_api_json<T: Serialize>(request: Request, status_code: u16, payload: &T) {
-    let body = match serde_json::to_string(payload) {
-        Ok(value) => value,
-        Err(source) => {
-            format!(r#"{{"error":"failed to serialize API response","detail":"{source}"}}"#)
-        }
-    };
-    let mut response = Response::from_string(body).with_status_code(StatusCode(status_code));
+    let body = serialize_api_payload(payload);
+    let mut response = Response::from_data(body).with_status_code(StatusCode(status_code));
     if let Ok(header) = Header::from_bytes("Content-Type", "application/json; charset=utf-8") {
         response.add_header(header);
     }
     let _ = request.respond(response);
+}
+
+fn serialize_api_payload<T: Serialize>(payload: &T) -> Vec<u8> {
+    match serde_json::to_vec(payload) {
+        Ok(body) => body,
+        Err(source) => serde_json::to_vec(&serde_json::json!({
+            "error": "failed to serialize API response",
+            "detail": source.to_string(),
+        }))
+        .unwrap_or_else(|_| b"{\"error\":\"failed to serialize API response\"}".to_vec()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2453,16 +2543,17 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
-        apply_replica_sync_back, build_api_cli_args, build_execution_plan,
-        build_pennyprompt_cli_args, collect_syncable_replica_changes,
-        command_appears_to_need_network, copy_workspace_with_default_exclusions,
+        api_route_uses_delegated_worker, apply_replica_sync_back, build_api_cli_args,
+        build_execution_plan, build_pennyprompt_cli_args, collect_syncable_replica_changes,
+        command_appears_to_need_network, constant_time_eq, copy_workspace_with_default_exclusions,
         detect_out_of_profile_requests, doctor_rows, execution_status,
         execution_status_from_exit_status, extract_bearer_token, extract_host_from_reference,
-        load_replica_ignore_config, materialize_workspace_for_execution, resolve_api_route,
-        resolve_execution_path, run_monitored_child, run_monitored_child_with_signal_poller,
-        select_default_mode, should_exclude_default_replica_path, should_use_color,
-        ApiCommandRequest, BridgeTarget, Cli, CommandArgs, Commands, PennyPromptBridgeRequest,
-        ReplicaSyncChange, RunTermination,
+        load_replica_ignore_config, materialize_workspace_for_execution, request_authorized,
+        resolve_api_route, resolve_execution_path, run_monitored_child,
+        run_monitored_child_with_signal_poller, select_default_mode, serialize_api_payload,
+        should_exclude_default_replica_path, should_use_color, ApiCommandRequest, ApiRoute,
+        BridgeTarget, Cli, CommandArgs, Commands, PennyPromptBridgeRequest, ReplicaSyncChange,
+        RunTermination,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -2630,6 +2721,63 @@ mod tests {
         let missing = Header::from_bytes("X-Other", "value").expect("create random header");
         let headers = vec![missing, header];
         assert_eq!(extract_bearer_token(&headers).as_deref(), Some("token-123"));
+    }
+
+    #[test]
+    fn request_authorized_requires_exact_token_match() {
+        let header = Header::from_bytes("Authorization", "Bearer token-123")
+            .expect("create authorization header");
+        let headers = vec![header];
+
+        assert!(request_authorized(&headers, "token-123"));
+        assert!(!request_authorized(&headers, "token-1234"));
+        assert!(!request_authorized(&headers, "token-124"));
+        assert!(!request_authorized(&headers, "token-12"));
+    }
+
+    #[test]
+    fn constant_time_compare_handles_length_and_content_mismatches() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"ab", b"abc"));
+    }
+
+    #[test]
+    fn health_route_bypasses_delegated_worker_queue() {
+        assert!(!api_route_uses_delegated_worker(ApiRoute::Health));
+        assert!(api_route_uses_delegated_worker(ApiRoute::Doctor));
+        assert!(api_route_uses_delegated_worker(ApiRoute::Plan));
+        assert!(api_route_uses_delegated_worker(ApiRoute::Run));
+    }
+
+    #[test]
+    fn api_payload_serialization_fallback_is_valid_json() {
+        struct FailingPayload;
+
+        impl serde::Serialize for FailingPayload {
+            fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom(
+                    "intentional serialization failure",
+                ))
+            }
+        }
+
+        let serialized = serialize_api_payload(&FailingPayload);
+        let value: serde_json::Value =
+            serde_json::from_slice(&serialized).expect("fallback payload must be valid json");
+
+        assert_eq!(
+            value.get("error").and_then(serde_json::Value::as_str),
+            Some("failed to serialize API response")
+        );
+        assert_eq!(
+            value.get("detail").and_then(serde_json::Value::as_str),
+            Some("intentional serialization failure")
+        );
     }
 
     #[test]
