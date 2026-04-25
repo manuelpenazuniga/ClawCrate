@@ -2,7 +2,9 @@
 
 This note captures the current compatibility assessment for running ClawCrate under WSL2.
 
-Status: post-alpha exploratory guidance. WSL2 is not part of current alpha support guarantees.
+Status (as of 2026-04-25): post-alpha exploratory guidance.
+WSL2 is not part of current alpha support guarantees.
+Fail-safe posture remains in effect until Linux enforcement work in `#69` is complete.
 
 ## Scope
 
@@ -20,7 +22,7 @@ Related issues:
 
 ## Assessment Method
 
-Use `clawcrate doctor --json` inside WSL2 and gate behavior from reported capabilities:
+Use `clawcrate doctor --json` inside WSL2 to collect diagnostics:
 
 - `landlock_abi`
 - `seccomp_available`
@@ -32,6 +34,9 @@ Example:
 ```bash
 clawcrate doctor --json | jq .
 ```
+
+Important: these fields are compatibility signals only. They are not a security
+readiness verdict while `#69` is open.
 
 ## Capability Expectations in WSL2
 
@@ -59,16 +64,22 @@ Even when capabilities appear available in WSL2, current repo state must be cons
 - Linux enforcement internals are still tracked as active work in `#69`.
 - WSL2 now has a dedicated CI execution path (`.github/workflows/wsl2-ci.yml`), currently configured as non-blocking while support is still experimental.
 
-Result: WSL2 should be treated as experimental until real Linux enforcement (`#69`) and stable WSL2 CI confidence are both in place.
+Result:
+
+- Until `#69` lands, treat WSL2 as restricted/experimental regardless of
+  `landlock_abi` or `seccomp_available` values.
+- Non-null capability probes do not override this restriction.
+- CI results from `wsl2-ci` are for drift/signal collection, not a security guarantee.
 
 ## Recommended Operational Policy (Current)
 
-1. Run `clawcrate doctor --json` at startup and gate execution policy.
-2. If `landlock_abi == null` or `seccomp_available == false`, restrict usage to lower-risk flows:
+1. Apply a default restricted policy for all WSL2 runs while `#69` remains open.
+2. Run `clawcrate doctor --json` for observability and troubleshooting, not as a pass/fail trust gate.
+3. If `landlock_abi == null` or `seccomp_available == false`, further restrict usage to lower-risk flows:
    - prefer `plan` over `run` for untrusted inputs
    - prefer `safe`/`build` with minimal write scope
    - use Replica mode for higher-risk operations
-3. For strict security boundaries, prefer native Linux or VM isolation until WSL2 baseline is CI-validated.
+4. For strict security boundaries, prefer native Linux or VM isolation until Linux enforcement (`#69`) is implemented and validated.
 
 ## Known Unsupported / Not Yet Validated
 
@@ -88,3 +99,8 @@ Current WSL2 baseline is defined by the `WSL2 Compatibility` workflow:
 4. `clawcrate doctor --json` runs in WSL2 and uploads `wsl2-doctor.json` artifact.
 
 This lane is intentionally non-blocking right now (`continue-on-error: true`) to collect stability data while support remains experimental.
+
+Interpretation rule:
+
+- Passing `WSL2 Compatibility` indicates runtime compatibility signal only.
+- It does not certify sandbox enforcement guarantees on WSL2 prior to `#69`.
