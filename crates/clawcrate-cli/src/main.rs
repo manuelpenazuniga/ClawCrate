@@ -1249,9 +1249,12 @@ fn extract_host_from_reference(value: &str) -> Option<String> {
         }
     }
 
-    if let Some(rest) = trimmed.strip_prefix("git@") {
-        let (host, _path) = rest.split_once(':')?;
-        return Some(normalize_host(host));
+    if !trimmed.contains("://") {
+        if let Some((authority, _path)) = trimmed.split_once(':') {
+            if authority.contains('@') {
+                return Some(normalize_host(authority));
+            }
+        }
     }
 
     None
@@ -1262,6 +1265,11 @@ fn split_host_port(input: &str) -> Option<&str> {
     if host_port.is_empty() {
         return None;
     }
+
+    let host_port = host_port
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(host_port);
 
     if let Some(rest) = host_port.strip_prefix('[') {
         let (host, _tail) = rest.split_once(']')?;
@@ -1289,8 +1297,13 @@ fn domain_allowed(host: &str, allowed_domains: &[String]) -> bool {
 }
 
 fn normalize_host(input: &str) -> String {
-    input
+    let without_userinfo = input
         .trim()
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(input.trim());
+
+    without_userinfo
         .trim_start_matches('[')
         .trim_end_matches(']')
         .trim_end_matches('.')
@@ -2444,11 +2457,12 @@ mod tests {
         build_pennyprompt_cli_args, collect_syncable_replica_changes,
         command_appears_to_need_network, copy_workspace_with_default_exclusions,
         detect_out_of_profile_requests, doctor_rows, execution_status,
-        execution_status_from_exit_status, extract_bearer_token, load_replica_ignore_config,
-        materialize_workspace_for_execution, resolve_api_route, resolve_execution_path,
-        run_monitored_child, run_monitored_child_with_signal_poller, select_default_mode,
-        should_exclude_default_replica_path, should_use_color, ApiCommandRequest, BridgeTarget,
-        Cli, CommandArgs, Commands, PennyPromptBridgeRequest, ReplicaSyncChange, RunTermination,
+        execution_status_from_exit_status, extract_bearer_token, extract_host_from_reference,
+        load_replica_ignore_config, materialize_workspace_for_execution, resolve_api_route,
+        resolve_execution_path, run_monitored_child, run_monitored_child_with_signal_poller,
+        select_default_mode, should_exclude_default_replica_path, should_use_color,
+        ApiCommandRequest, BridgeTarget, Cli, CommandArgs, Commands, PennyPromptBridgeRequest,
+        ReplicaSyncChange, RunTermination,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -2718,6 +2732,26 @@ mod tests {
             "echo".to_string(),
             "hello".to_string()
         ]));
+    }
+
+    #[test]
+    fn extract_host_parses_userinfo_and_scp_like_references() {
+        assert_eq!(
+            extract_host_from_reference("ssh://git@github.com/owner/repo.git"),
+            Some("github.com".to_string())
+        );
+        assert_eq!(
+            extract_host_from_reference("https://user:token@registry.npmjs.org/package"),
+            Some("registry.npmjs.org".to_string())
+        );
+        assert_eq!(
+            extract_host_from_reference("git@github.com:owner/repo.git"),
+            Some("github.com".to_string())
+        );
+        assert_eq!(
+            extract_host_from_reference("alice@github.com:owner/repo.git"),
+            Some("github.com".to_string())
+        );
     }
 
     #[test]
