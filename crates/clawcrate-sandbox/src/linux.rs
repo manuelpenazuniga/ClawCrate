@@ -352,14 +352,17 @@ fn linux_none_net_seccomp_denied_syscalls() -> &'static [i64] {
 pub trait LinuxEnforcer: Send + Sync {
     fn apply_rlimits(
         &self,
+        command: &mut Command,
         limits: &ResourceLimits,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     fn apply_landlock(
         &self,
+        command: &mut Command,
         prepared: &PreparedLinuxSandbox,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     fn apply_seccomp(
         &self,
+        command: &mut Command,
         prepared: &PreparedLinuxSandbox,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
@@ -370,27 +373,43 @@ pub struct KernelEnforcer;
 impl LinuxEnforcer for KernelEnforcer {
     fn apply_rlimits(
         &self,
-        _limits: &ResourceLimits,
+        command: &mut Command,
+        limits: &ResourceLimits,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Linux rlimits are enforced in the child pre-exec hook installed in `launch`.
-        // Keep this step wired for ordering/traceability while Landlock/seccomp are integrated.
+        #[cfg(target_os = "linux")]
+        configure_linux_rlimit_pre_exec(command, limits);
+        #[cfg(not(target_os = "linux"))]
+        let _ = (command, limits);
         Ok(())
     }
 
     fn apply_landlock(
         &self,
-        _prepared: &PreparedLinuxSandbox,
+        command: &mut Command,
+        prepared: &PreparedLinuxSandbox,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Linux Landlock enforcement is applied in the child pre-exec hook installed in `launch`.
-        // Keep this step wired for ordering/traceability while seccomp is integrated.
+        #[cfg(target_os = "linux")]
+        {
+            let context = prepare_linux_landlock_context(prepared)?;
+            configure_linux_landlock_pre_exec(command, context);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (command, prepared);
         Ok(())
     }
 
     fn apply_seccomp(
         &self,
-        _prepared: &PreparedLinuxSandbox,
+        command: &mut Command,
+        prepared: &PreparedLinuxSandbox,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Seccomp filter materialization is introduced in M2-02 with the prepare path.
+        #[cfg(target_os = "linux")]
+        {
+            let context = prepare_linux_seccomp_context(prepared)?;
+            configure_linux_seccomp_pre_exec(command, context);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (command, prepared);
         Ok(())
     }
 }
@@ -449,8 +468,6 @@ impl LinuxSandbox {
             return Err(LinuxSandboxError::EmptyCommand);
         }
 
-        apply_enforcement_steps(self.enforcer.as_ref(), prepared)?;
-
         let mut command = Command::new(&prepared.command[0]);
         command.args(&prepared.command[1..]);
         command.current_dir(&prepared.cwd);
@@ -461,18 +478,7 @@ impl LinuxSandbox {
         command.process_group(0);
         command.env_clear();
         command.envs(prepared.scrubbed_env.iter().cloned());
-        #[cfg(target_os = "linux")]
-        let landlock_context =
-            prepare_linux_landlock_context(prepared).map_err(LinuxSandboxError::Spawn)?;
-        #[cfg(target_os = "linux")]
-        let seccomp_context =
-            prepare_linux_seccomp_context(prepared).map_err(LinuxSandboxError::Spawn)?;
-        #[cfg(target_os = "linux")]
-        configure_linux_rlimit_pre_exec(&mut command, &prepared.resource_limits);
-        #[cfg(target_os = "linux")]
-        configure_linux_landlock_pre_exec(&mut command, landlock_context);
-        #[cfg(target_os = "linux")]
-        configure_linux_seccomp_pre_exec(&mut command, seccomp_context);
+        apply_enforcement_steps(self.enforcer.as_ref(), &mut command, prepared)?;
 
         let child = command.spawn().map_err(LinuxSandboxError::Spawn)?;
         Ok(LinuxSandboxedChild { child })
@@ -503,24 +509,25 @@ impl LinuxSandboxedChild {
 
 pub(crate) fn apply_enforcement_steps(
     enforcer: &dyn LinuxEnforcer,
+    command: &mut Command,
     prepared: &PreparedLinuxSandbox,
 ) -> Result<(), LinuxSandboxError> {
     enforcer
-        .apply_rlimits(&prepared.resource_limits)
+        .apply_rlimits(command, &prepared.resource_limits)
         .map_err(|source| LinuxSandboxError::Enforcement {
             step: EnforcementStep::Rlimits,
             source,
         })?;
 
     enforcer
-        .apply_landlock(prepared)
+        .apply_landlock(command, prepared)
         .map_err(|source| LinuxSandboxError::Enforcement {
             step: EnforcementStep::Landlock,
             source,
         })?;
 
     enforcer
-        .apply_seccomp(prepared)
+        .apply_seccomp(command, prepared)
         .map_err(|source| LinuxSandboxError::Enforcement {
             step: EnforcementStep::Seccomp,
             source,
@@ -696,6 +703,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::path::Path;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
     #[cfg(target_os = "linux")]
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -723,6 +731,7 @@ mod tests {
     impl LinuxEnforcer for MockEnforcer {
         fn apply_rlimits(
             &self,
+            _command: &mut Command,
             _limits: &ResourceLimits,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.calls
@@ -734,6 +743,7 @@ mod tests {
 
         fn apply_landlock(
             &self,
+            _command: &mut Command,
             _prepared: &PreparedLinuxSandbox,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.calls
@@ -745,6 +755,7 @@ mod tests {
 
         fn apply_seccomp(
             &self,
+            _command: &mut Command,
             _prepared: &PreparedLinuxSandbox,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.calls
@@ -826,8 +837,10 @@ mod tests {
         let plan = test_plan(vec!["/bin/echo".to_string(), "ok".to_string()]);
         let sandbox = LinuxSandbox::new_with_enforcer(mock.clone());
         let prepared = sandbox.prepare_with_env(&plan, vec![]);
+        let mut command = Command::new("/bin/echo");
 
-        apply_enforcement_steps(mock.as_ref(), &prepared).expect("apply enforcement steps");
+        apply_enforcement_steps(mock.as_ref(), &mut command, &prepared)
+            .expect("apply enforcement steps");
         assert_eq!(
             mock.snapshot(),
             vec![
