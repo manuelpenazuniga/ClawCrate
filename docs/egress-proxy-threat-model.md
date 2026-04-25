@@ -40,6 +40,9 @@ clawcrate-cli
 sandboxed child process
   ├─ HTTP_PROXY / HTTPS_PROXY / ALL_PROXY -> 127.0.0.1:<port>
   ├─ network policy: deny direct egress when backend can enforce loopback-only
+  ├─ DNS path depends on client behavior:
+  │    - proxy-aware clients send hostnames to proxy (preferred)
+  │    - non-proxy DNS lookups may still hit local resolver metadata path
   └─ outbound attempts -> local proxy -> remote target (if policy allows)
 ```
 
@@ -59,6 +62,7 @@ Add network policy structures in `clawcrate-types`:
   - decision (`allowed|denied`)
   - deny reason
   - timing and bytes transferred
+  - transport type (`connect-tunnel` or `plain-http`)
 
 ## Trust Boundaries
 
@@ -70,6 +74,8 @@ Add network policy structures in `clawcrate-types`:
 - **Kernel sandbox backend (Landlock/seccomp/Seatbelt)**: trusted enforcement plane.
 - **Remote DNS + remote servers**: untrusted.
 - **Profile policy file**: trusted after parse/validation.
+- **Run artifact store (`plan.json`, `result.json`, `audit.ndjson`)**: trusted only within
+  ClawCrate-controlled write boundary; untrusted if world/group writable.
 
 ## Boundary transitions
 
@@ -78,6 +84,20 @@ Add network policy structures in `clawcrate-types`:
 3. Untrusted process -> proxy listener (potential parser abuse).
 4. Proxy -> internet (untrusted network I/O).
 5. Proxy decisions -> audit artifacts (integrity required).
+
+## Audit Integrity Boundary
+
+`audit.ndjson` is authoritative only when all of the following are true:
+
+- Artifact directory is created by ClawCrate with restrictive permissions.
+- Sandboxed command cannot write or replace `audit.ndjson`.
+- Audit writes are append-only from trusted process components.
+
+Expected policy posture:
+
+- Sandbox writes to artifact directory should be denied by default.
+- If deployment cannot enforce that boundary, mark audit trust as degraded in
+  `result.json` and avoid over-claiming tamper resistance.
 
 ## Security Model
 
@@ -88,6 +108,7 @@ Add network policy structures in `clawcrate-types`:
 - If proxy fails to start/health-check, command does not start.
 - If proxy crashes mid-run, child is terminated and run is marked failed.
 - All allow/deny decisions are emitted to `audit.ndjson`.
+- Audit claims are valid only up to local host compromise boundaries.
 
 ## Important caveat (platform capability)
 
@@ -116,14 +137,60 @@ Deny conditions:
 - IP literal when `allow_ip_literals=false`
 - proxy auth token invalid
 
+## Proxy Policy Flow (Plain HTTP)
+
+`allow_plain_http` controls whether non-CONNECT HTTP requests are allowed in
+filtered mode.
+
+- `allow_plain_http=false` (default): deny plain HTTP bootstrap paths.
+- `allow_plain_http=true`: proxy may permit HTTP methods (for example
+  `GET http://host/path HTTP/1.1`) after allowlist checks.
+
+When plain HTTP is allowed, policy checks still apply:
+
+1. Parse absolute-form request target and `Host` header.
+2. Resolve effective authority (`host:port`) and verify allowlist match.
+3. Deny IP literals when `allow_ip_literals=false`.
+4. Forward upstream only after policy pass.
+5. Emit `EgressDecision` with `transport=plain-http`.
+
+Notes:
+
+- This enables domain-gated HTTP, not payload-level content filtering.
+- Header/body values must not be persisted in audit logs.
+
+## DNS Leakage Assumptions and Mitigations
+
+Filtered mode reduces direct egress risk, but DNS metadata can still leak in
+specific client and host configurations.
+
+Primary leakage scenario:
+
+- The sandboxed process performs local DNS lookups (for example via a loopback
+  resolver such as `127.0.0.53`) before proxy mediation.
+
+Assumptions:
+
+- ClawCrate does not claim DNS privacy against the local host resolver path.
+- Loopback-only egress controls limit remote bypass, but do not inherently hide
+  query metadata from local resolver infrastructure.
+
+Mitigations:
+
+- Prefer proxy-aware clients that delegate hostname resolution to the proxy.
+- Keep `filtered` default `FailClosed` when bypass constraints cannot be
+  enforced.
+- Emit audit signals when policy-relevant requests are denied/allowed, and
+  document that audit coverage is request-level, not full resolver telemetry.
+
 ## Threat Model (STRIDE-style)
 
 | Threat | Example | Risk | Mitigation |
 |---|---|---|---|
 | Spoofing | process forges proxy control/auth | Medium | random per-run token, loopback bind only, reject unauth requests |
-| Tampering | policy mutation during run | Medium | immutable in-memory snapshot, hash policy in plan/audit |
+| Tampering | policy mutation during run; local overwrite of audit files | Medium | immutable in-memory snapshot, hash policy in plan/audit, artifact dir write isolation |
 | Repudiation | actor denies blocked exfil attempt | Medium | append-only audit events with timestamps + decision reason |
-| Information disclosure | proxy logs secrets | High | never log headers/body/env values, redact sensitive fields |
+| Information disclosure | proxy logs secrets; local resolver sees queried domains | High | never log headers/body/env values, redact sensitive fields, document DNS metadata limits |
 | Denial of service | malformed streams exhaust proxy | High | read/write timeouts, conn limits, bounded buffers |
 | Elevation of privilege | bypass proxy via direct connect | High | loopback-only kernel net policy where available; else fail closed by default |
 
@@ -135,6 +202,7 @@ Deny conditions:
 | proxy bind failure | abort before launch (non-zero) |
 | proxy startup timeout | abort before launch (non-zero) |
 | proxy crash while child running | terminate child, write error result + audit |
+| artifact write failure (`audit.ndjson`) | fail run as `SandboxError` (or explicit degraded audit state if policy allows) |
 | domain not allowed | deny request, keep process alive unless command fails itself |
 | upstream DNS/connect timeout | fail that request; command behavior depends on tool retry logic |
 | unknown protocol via proxy | deny (default) |
@@ -146,6 +214,8 @@ Deny conditions:
 - Wildcard allowlists can be over-broad if not curated.
 - Some tooling may not honor proxy env vars; this is safe only when direct egress is kernel-blocked.
 - HTTP (non-TLS) exposes host/path metadata to proxy logs; logging must stay minimal.
+- Local resolver infrastructure may still observe queried hostnames in some
+  client/network stacks.
 
 ## Implementation Plan for P1-02
 
