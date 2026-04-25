@@ -749,16 +749,16 @@ fn maybe_sync_back_replica(
         return Ok(());
     }
 
-    if !io::stdin().is_terminal() {
+    if !is_replica_sync_back_interactive(io::stdin().is_terminal(), io::stdout().is_terminal()) {
         println!(
-            "Replica sync-back skipped (non-interactive stdin). Pending changes remain in {}",
+            "Replica sync-back skipped (non-interactive stdio). Pending changes remain in {}",
             copy.display()
         );
         verbose_log(
             output,
             1,
             format!(
-                "replica sync-back skipped for execution {} due to non-interactive stdin",
+                "replica sync-back skipped for execution {} due to non-interactive stdio",
                 plan.id
             ),
         );
@@ -808,6 +808,10 @@ fn maybe_sync_back_replica(
         AuditEventKind::ReplicaSyncBack { approved, changes },
     )?;
     Ok(())
+}
+
+fn is_replica_sync_back_interactive(stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+    stdin_is_terminal && stdout_is_terminal
 }
 
 fn collect_syncable_replica_changes(
@@ -885,14 +889,14 @@ fn apply_replica_sync_back(
             }
             FsChangeKind::Deleted => {
                 if source_path.exists() {
-                    if source_path.is_dir() {
-                        std::fs::remove_dir_all(&source_path).map_err(|source_error| {
+                    let metadata =
+                        std::fs::symlink_metadata(&source_path).map_err(|source_error| {
                             anyhow!(
-                                "failed to remove sync-back directory {}: {source_error}",
+                                "failed to inspect sync-back delete path {}: {source_error}",
                                 source_path.display()
                             )
                         })?;
-                    } else {
+                    if !metadata.file_type().is_dir() {
                         std::fs::remove_file(&source_path).map_err(|source_error| {
                             anyhow!(
                                 "failed to remove sync-back file {}: {source_error}",
@@ -2590,12 +2594,12 @@ mod tests {
         command_appears_to_need_network, constant_time_eq, copy_workspace_with_default_exclusions,
         detect_out_of_profile_requests, doctor_rows, execution_status,
         execution_status_from_exit_status, extract_bearer_token, extract_host_from_reference,
-        load_replica_ignore_config, materialize_workspace_for_execution, request_authorized,
-        resolve_api_route, resolve_execution_path, run_monitored_child,
-        run_monitored_child_with_signal_poller, select_default_mode, serialize_api_payload,
-        should_exclude_default_replica_path, should_use_color, ApiCommandRequest, ApiRoute,
-        BridgeTarget, Cli, CommandArgs, Commands, PennyPromptBridgeRequest, ReplicaSyncChange,
-        RunTermination,
+        is_replica_sync_back_interactive, load_replica_ignore_config,
+        materialize_workspace_for_execution, request_authorized, resolve_api_route,
+        resolve_execution_path, run_monitored_child, run_monitored_child_with_signal_poller,
+        select_default_mode, serialize_api_payload, should_exclude_default_replica_path,
+        should_use_color, ApiCommandRequest, ApiRoute, BridgeTarget, Cli, CommandArgs, Commands,
+        PennyPromptBridgeRequest, ReplicaSyncChange, RunTermination,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -3580,6 +3584,33 @@ mod tests {
             "new"
         );
         assert!(!source.join("remove.txt").exists());
+    }
+
+    #[test]
+    fn replica_sync_back_interactive_requires_both_stdin_and_stdout_terminals() {
+        assert!(is_replica_sync_back_interactive(true, true));
+        assert!(!is_replica_sync_back_interactive(false, true));
+        assert!(!is_replica_sync_back_interactive(true, false));
+        assert!(!is_replica_sync_back_interactive(false, false));
+    }
+
+    #[test]
+    fn apply_replica_sync_back_does_not_remove_directories_for_deleted_changes() {
+        let source = unique_tmp_dir("clawcrate_cli_sync_delete_dir_source");
+        let copy = unique_tmp_dir("clawcrate_cli_sync_delete_dir_copy");
+        fs::create_dir_all(source.join("keep-dir")).expect("create source directory");
+        fs::write(source.join("keep-dir/file.txt"), "keep").expect("write keep file");
+        fs::create_dir_all(copy.join("keep-dir")).expect("create copy directory");
+
+        let changes = vec![ReplicaSyncChange {
+            relative_path: PathBuf::from("keep-dir"),
+            kind: FsChangeKind::Deleted,
+        }];
+
+        apply_replica_sync_back(&source, &copy, &changes).expect("apply sync-back");
+
+        assert!(source.join("keep-dir").is_dir());
+        assert!(source.join("keep-dir/file.txt").is_file());
     }
 
     #[test]
