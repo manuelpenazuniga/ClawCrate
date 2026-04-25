@@ -45,6 +45,38 @@ bash scripts/release.sh package \
 bash scripts/release.sh checksums --dist-dir /tmp/clawcrate-dist-local
 ```
 
+Script hardening spot checks (`#109`):
+
+```bash
+# cut_release.sh rejects missing --tag value before shifting args
+if bash scripts/cut_release.sh --tag --skip-verify; then
+  echo "unexpected success"
+  exit 1
+fi
+
+# release.sh cleans temporary package dir on failure
+cargo build -p clawcrate-cli
+tmp_root="$(mktemp -d)"
+readonly_dist="$tmp_root/readonly-dist"
+mkdir -p "$readonly_dist"
+chmod 0555 "$readonly_dist"
+before_tmp_dirs="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'clawcrate-release.*' | sort)"
+if bash scripts/release.sh package \
+  --target x86_64-unknown-linux-musl \
+  --binary target/debug/clawcrate \
+  --dist-dir "$readonly_dist"; then
+  echo "unexpected success"
+  exit 1
+fi
+after_tmp_dirs="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'clawcrate-release.*' | sort)"
+if [ "$before_tmp_dirs" != "$after_tmp_dirs" ]; then
+  echo "unexpected leftover clawcrate-release temp directory"
+  exit 1
+fi
+chmod 0755 "$readonly_dist"
+rm -rf "$tmp_root"
+```
+
 ## 3. Update Changelog
 
 - Update `[Unreleased]` in [`CHANGELOG.md`](../CHANGELOG.md).

@@ -71,14 +71,18 @@ package_cmd() {
   fi
 
   mkdir -p "$dist_dir"
-  local tmp_dir
-  tmp_dir="$(mktemp -d)"
+  local archive_path="$dist_dir/clawcrate-${target}.tar.gz"
 
-  cp "$binary" "$tmp_dir/clawcrate"
-  chmod 0755 "$tmp_dir/clawcrate"
-  tar -C "$tmp_dir" -czf "$dist_dir/clawcrate-${target}.tar.gz" clawcrate
-  rm -rf "$tmp_dir"
-  echo "packaged: $dist_dir/clawcrate-${target}.tar.gz"
+  (
+    tmp_dir=""
+    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/clawcrate-release.XXXXXX")"
+    trap 'rm -rf "$tmp_dir"' EXIT
+
+    cp "$binary" "$tmp_dir/clawcrate"
+    chmod 0755 "$tmp_dir/clawcrate"
+    tar -C "$tmp_dir" -czf "$archive_path" clawcrate
+  )
+  echo "packaged: $archive_path"
 }
 
 checksums_cmd() {
