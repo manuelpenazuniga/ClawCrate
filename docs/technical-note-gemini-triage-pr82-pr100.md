@@ -55,8 +55,13 @@ All follow-up issues created from this triage wave are now closed:
 
 ## Deferred / Non-Blocking Items
 
-Deferred recommendations are tracked separately in issue `#113` to keep
-security-correctness and behavioral hardening work prioritized.
+Deferred recommendations are tracked in:
+
+- issue `#113`
+- `docs/technical-note-gemini-deferred-pr82-pr100.md`
+
+This keeps security-correctness and behavioral hardening work prioritized while
+preserving a clear cleanup backlog.
 
 ## Completion Check
 
@@ -64,4 +69,4 @@ Done criteria from issue `#112`:
 
 - Issues `#101`-`#111` triaged and resolved in the tracker: complete.
 - Deferred/non-critical recommendations split into dedicated note: complete via
-  `#113`.
+  `#113` and `docs/technical-note-gemini-deferred-pr82-pr100.md`.
