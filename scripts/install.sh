@@ -172,7 +172,18 @@ echo "    install dir: $INSTALL_DIR"
 fetch_to_file "$BASE_URL/$ASSET_NAME" "$ARCHIVE_PATH"
 fetch_to_file "$BASE_URL/SHA256SUMS" "$CHECKSUMS_PATH"
 
-expected_sum="$(grep "  $ASSET_NAME\$" "$CHECKSUMS_PATH" | awk '{print $1}' | head -n1)"
+expected_sum="$(
+  awk -v asset="$ASSET_NAME" '
+    NF >= 2 {
+      filename = $2
+      sub(/^[*]/, "", filename)
+      if (filename == asset) {
+        print $1
+        exit
+      }
+    }
+  ' "$CHECKSUMS_PATH"
+)"
 if [ -z "$expected_sum" ]; then
   echo "error: checksum entry not found for $ASSET_NAME" >&2
   exit 1

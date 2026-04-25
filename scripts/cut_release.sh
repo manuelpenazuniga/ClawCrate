@@ -20,6 +20,11 @@ SKIP_VERIFY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tag)
+      if [[ $# -lt 2 || -z "${2:-}" || "$2" == --* ]]; then
+        echo "error: --tag requires a value" >&2
+        usage >&2
+        exit 1
+      fi
       TAG="${2:-}"
       shift 2
       ;;
@@ -74,6 +79,9 @@ if [[ -n "$(git status --porcelain)" ]]; then
   echo "error: working tree is not clean; commit/stash changes first" >&2
   exit 1
 fi
+
+echo "==> Fetching origin/main for synchronization check"
+git fetch origin main --prune >/dev/null
 
 local_main="$(git rev-parse main)"
 remote_main="$(git rev-parse origin/main)"
