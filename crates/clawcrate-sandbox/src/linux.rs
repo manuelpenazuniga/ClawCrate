@@ -702,14 +702,11 @@ fn seccomp_apply_error_as_io_error(source: SeccompApplyError) -> io::Error {
     // Keep pre_exec failure conversion allocator-free: emit deterministic raw errno values instead
     // of formatted strings so the child post-fork path remains async-signal-safe.
     let errno = match source {
-        SeccompApplyError::Prctl(error) | SeccompApplyError::Seccomp(error) => {
-            error.raw_os_error().unwrap_or(libc::EINVAL)
-        }
+        SeccompApplyError::Prctl(error) => error.raw_os_error().unwrap_or(libc::EINVAL),
+        SeccompApplyError::Seccomp(error) => error.raw_os_error().unwrap_or(libc::EINVAL),
         SeccompApplyError::ThreadSync(_) => libc::EBUSY,
-        SeccompApplyError::EmptyFilter | SeccompApplyError::Backend(_) => libc::EINVAL,
-        #[cfg(feature = "json")]
-        SeccompApplyError::JsonFrontend(_) => libc::EINVAL,
-        _ => libc::EINVAL,
+        SeccompApplyError::EmptyFilter => libc::EINVAL,
+        SeccompApplyError::Backend(_) => libc::EINVAL,
     };
     io::Error::from_raw_os_error(errno)
 }
@@ -1072,19 +1069,19 @@ mod tests {
     #[test]
     fn seccomp_error_mapping_returns_deterministic_raw_errno_values() {
         let prctl_error = seccomp_apply_error_as_io_error(seccompiler::Error::Prctl(
-            std::io::Error::from_raw_os_error(libc::EPERM),
+            std::io::Error::from_raw_os_error(nix::libc::EPERM),
         ));
-        assert_eq!(prctl_error.raw_os_error(), Some(libc::EPERM));
+        assert_eq!(prctl_error.raw_os_error(), Some(nix::libc::EPERM));
 
         let seccomp_error = seccomp_apply_error_as_io_error(seccompiler::Error::Seccomp(
-            std::io::Error::from_raw_os_error(libc::EACCES),
+            std::io::Error::from_raw_os_error(nix::libc::EACCES),
         ));
-        assert_eq!(seccomp_error.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(seccomp_error.raw_os_error(), Some(nix::libc::EACCES));
 
         let thread_sync_error = seccomp_apply_error_as_io_error(seccompiler::Error::ThreadSync(42));
-        assert_eq!(thread_sync_error.raw_os_error(), Some(libc::EBUSY));
+        assert_eq!(thread_sync_error.raw_os_error(), Some(nix::libc::EBUSY));
 
         let empty_filter_error = seccomp_apply_error_as_io_error(seccompiler::Error::EmptyFilter);
-        assert_eq!(empty_filter_error.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(empty_filter_error.raw_os_error(), Some(nix::libc::EINVAL));
     }
 }
