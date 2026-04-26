@@ -1160,16 +1160,26 @@ fn detect_out_of_profile_requests(plan: &ExecutionPlan) -> Vec<String> {
         }
         NetLevel::Open => {}
         NetLevel::Filtered { allowed_domains } => {
-            let hosts = extract_hosts_from_command(&plan.command);
-            if hosts.is_empty() {
+            let extracted_hosts = extract_hosts_from_command(&plan.command);
+            if extracted_hosts.had_ambiguous_targets {
                 requested.push(
                     "command appears to need network, but filtered-mode host extraction was ambiguous; explicit approval required"
                         .to_string(),
                 );
+            }
+
+            if extracted_hosts.hosts.is_empty() {
+                if requested.is_empty() {
+                    requested.push(
+                        "command appears to need network, but filtered-mode host extraction was ambiguous; explicit approval required"
+                            .to_string(),
+                    );
+                }
                 return requested;
             }
 
-            let denied = hosts
+            let denied = extracted_hosts
+                .hosts
                 .into_iter()
                 .filter(|host| !domain_allowed(host, allowed_domains))
                 .collect::<Vec<_>>();
@@ -1231,20 +1241,44 @@ fn command_appears_to_need_network(command: &[String]) -> bool {
     }
 }
 
-fn extract_hosts_from_command(command: &[String]) -> Vec<String> {
+#[derive(Debug, Default)]
+struct CommandHostExtraction {
+    hosts: Vec<String>,
+    had_ambiguous_targets: bool,
+}
+
+fn extract_hosts_from_command(command: &[String]) -> CommandHostExtraction {
     let mut hosts = BTreeSet::new();
+    let mut had_ambiguous_targets = false;
     for arg in command {
         if let Some(host) = extract_host_from_reference(arg) {
             hosts.insert(host);
+            continue;
+        }
+
+        if is_ambiguous_network_reference(arg) {
+            had_ambiguous_targets = true;
         }
     }
-    hosts.into_iter().collect()
+
+    CommandHostExtraction {
+        hosts: hosts.into_iter().collect(),
+        had_ambiguous_targets,
+    }
 }
 
 fn extract_host_from_reference(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
+    }
+
+    if let Some((_, assigned_value)) = trimmed.split_once('=') {
+        if !assigned_value.is_empty() {
+            if let Some(host) = extract_host_from_reference(assigned_value) {
+                return Some(host);
+            }
+        }
     }
 
     for prefix in ["https://", "http://", "ssh://"] {
@@ -1262,6 +1296,46 @@ fn extract_host_from_reference(value: &str) -> Option<String> {
     }
 
     None
+}
+
+fn is_ambiguous_network_reference(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let candidate = trimmed
+        .rsplit_once('=')
+        .map(|(_, rhs)| rhs.trim())
+        .filter(|rhs| !rhs.is_empty())
+        .unwrap_or(trimmed);
+
+    if candidate.starts_with('-') {
+        return false;
+    }
+
+    if candidate.starts_with('$') || candidate.contains("${") {
+        return true;
+    }
+
+    if candidate.contains("://") {
+        return true;
+    }
+
+    if candidate.contains('@') && candidate.contains(':') {
+        return true;
+    }
+
+    if candidate.eq_ignore_ascii_case("localhost") || candidate.parse::<std::net::IpAddr>().is_ok()
+    {
+        return true;
+    }
+
+    if candidate.contains('/') || candidate.contains('\\') {
+        return false;
+    }
+
+    candidate.contains('.') && candidate.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
 fn split_host_port(input: &str) -> Option<&str> {
@@ -3016,6 +3090,10 @@ mod tests {
             extract_host_from_reference("alice@github.com:owner/repo.git"),
             Some("github.com".to_string())
         );
+        assert_eq!(
+            extract_host_from_reference("--registry=https://registry.npmjs.org/"),
+            Some("registry.npmjs.org".to_string())
+        );
     }
 
     #[test]
@@ -3069,6 +3147,23 @@ mod tests {
             &["curl", "$TARGET_URL"],
         );
         let requests = detect_out_of_profile_requests(&variable_target);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("host extraction was ambiguous"));
+    }
+
+    #[test]
+    fn approval_detection_flags_mixed_valid_and_ambiguous_filtered_targets() {
+        let mixed_targets = mock_plan(
+            NetLevel::Filtered {
+                allowed_domains: vec!["registry.npmjs.org".to_string()],
+            },
+            &[
+                "curl",
+                "https://registry.npmjs.org/some-package",
+                "$FALLBACK_URL",
+            ],
+        );
+        let requests = detect_out_of_profile_requests(&mixed_targets);
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("host extraction was ambiguous"));
     }
