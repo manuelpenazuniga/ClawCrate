@@ -125,7 +125,10 @@ impl DarwinSandbox {
         command.env_clear();
         command.envs(prepared.scrubbed_env.iter().cloned());
 
-        let child = command.spawn().map_err(DarwinSandboxError::Spawn)?;
+        let child = command.spawn().map_err(|source| {
+            cleanup_sbpl_profile(&sbpl_path);
+            DarwinSandboxError::Spawn(source)
+        })?;
         Ok(DarwinSandboxedChild {
             child: Some(child),
             sbpl_profile_path: sbpl_path,
@@ -640,6 +643,42 @@ exec \"$@\"\n";
         assert!(
             !sbpl_path.exists(),
             "SBPL file should be removed when child handle is dropped"
+        );
+    }
+
+    #[test]
+    fn launch_cleans_up_sbpl_profile_when_spawn_fails() {
+        let tmp = unique_tmp_dir("clawcrate_darwin_spawn_failure_cleanup");
+        let temp_root = tmp.join("sbpl");
+        let sandbox = DarwinSandbox::new_with_paths(DarwinSandboxPaths {
+            sandbox_exec: tmp.join("missing-sandbox-exec"),
+            temp_root: temp_root.clone(),
+        });
+
+        let mut plan = test_plan(vec!["/bin/true".to_string()], NetLevel::None);
+        let workspace = tmp.join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace for spawn failure test");
+        plan.cwd = workspace;
+        let prepared = sandbox.prepare_with_env(
+            &plan,
+            vec![
+                ("HOME".to_string(), "/tmp/home-runner".to_string()),
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ],
+        );
+
+        let result = sandbox.launch(&prepared);
+        assert!(
+            matches!(result, Err(DarwinSandboxError::Spawn(_))),
+            "launch should fail with spawn error when sandbox-exec binary is missing"
+        );
+
+        let entries = fs::read_dir(&temp_root)
+            .expect("read SBPL temp root after spawn failure")
+            .count();
+        assert_eq!(
+            entries, 0,
+            "SBPL temp root should not retain leaked profiles after spawn failure"
         );
     }
 }
