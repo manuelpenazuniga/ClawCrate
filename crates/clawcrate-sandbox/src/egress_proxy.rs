@@ -602,7 +602,23 @@ mod tests {
         let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
         let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
         let upstream_thread = thread::spawn(move || {
-            let (_socket, _) = upstream_listener.accept().expect("accept upstream");
+            let (mut socket, _) = upstream_listener.accept().expect("accept upstream");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("set upstream read timeout");
+            let mut buffer = [0_u8; 256];
+            loop {
+                match socket.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(error)
+                        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                    {
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
         });
 
         let proxy = start_egress_proxy(EgressProxyConfig {
@@ -614,13 +630,14 @@ mod tests {
 
         let mut stream =
             std::net::TcpStream::connect(proxy.addr()).expect("connect to local egress proxy");
-        write!(
-            stream,
+        let request = format!(
             "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
             upstream_addr.port(),
             upstream_addr.port()
-        )
-        .expect("write connect request");
+        );
+        stream
+            .write_all(request.as_bytes())
+            .expect("write connect request");
 
         let response = read_http_response_header(&mut stream);
         assert!(
