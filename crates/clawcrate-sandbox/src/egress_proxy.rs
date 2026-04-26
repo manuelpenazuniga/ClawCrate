@@ -543,6 +543,7 @@ mod tests {
     use std::net::{Shutdown, TcpListener};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::{Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -577,6 +578,7 @@ mod tests {
 
     #[test]
     fn proxy_denies_disallowed_connect_targets() {
+        let _guard = proxy_network_test_lock();
         let proxy = start_egress_proxy(EgressProxyConfig {
             allowed_domains: vec!["allowed.test".to_string()],
             enforce_sni: false,
@@ -599,6 +601,7 @@ mod tests {
 
     #[test]
     fn proxy_allows_connect_to_allowed_domain() {
+        let _guard = proxy_network_test_lock();
         let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
         let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
         let upstream_thread = thread::spawn(move || {
@@ -639,7 +642,7 @@ mod tests {
             .write_all(request.as_bytes())
             .expect("write connect request");
 
-        let response = read_http_response_header(&mut stream);
+        let response = read_http_response_header_with_timeout(&mut stream, Duration::from_secs(3));
         assert!(
             response.contains("200 Connection Established"),
             "unexpected CONNECT response: {response}"
@@ -653,6 +656,7 @@ mod tests {
 
     #[test]
     fn proxy_strict_sni_denies_missing_client_hello_preface() {
+        let _guard = proxy_network_test_lock();
         let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
         let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
         let upstream_thread = thread::spawn(move || {
@@ -693,7 +697,7 @@ mod tests {
             .write_all(request.as_bytes())
             .expect("write connect request");
 
-        let response = read_http_response_header(&mut stream);
+        let response = read_http_response_header_with_timeout(&mut stream, Duration::from_secs(3));
         assert!(
             response.contains("200 Connection Established"),
             "unexpected CONNECT response: {response}"
@@ -714,6 +718,7 @@ mod tests {
 
     #[test]
     fn proxy_rejects_oversized_header_line() {
+        let _guard = proxy_network_test_lock();
         let proxy = start_egress_proxy(EgressProxyConfig {
             allowed_domains: vec!["allowed.test".to_string()],
             enforce_sni: false,
@@ -748,6 +753,7 @@ mod tests {
 
     #[test]
     fn proxy_rejects_excessive_header_count() {
+        let _guard = proxy_network_test_lock();
         let proxy = start_egress_proxy(EgressProxyConfig {
             allowed_domains: vec!["allowed.test".to_string()],
             enforce_sni: false,
@@ -784,6 +790,7 @@ mod tests {
 
     #[test]
     fn proxy_enforces_bounded_concurrency_under_connection_flood() {
+        let _guard = proxy_network_test_lock();
         let active_handlers = Arc::new(AtomicUsize::new(0));
         let successful_acquisitions = Arc::new(AtomicUsize::new(0));
         let max_handlers = 4usize;
@@ -811,11 +818,25 @@ mod tests {
     }
 
     fn read_http_response_header(stream: &mut std::net::TcpStream) -> String {
+        read_http_response_header_with_timeout(stream, Duration::from_secs(1))
+    }
+
+    fn proxy_network_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("acquire proxy network test lock")
+    }
+
+    fn read_http_response_header_with_timeout(
+        stream: &mut std::net::TcpStream,
+        timeout: Duration,
+    ) -> String {
         let _ = stream.set_nonblocking(true);
 
         let mut bytes = Vec::new();
         let mut chunk = [0_u8; 128];
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + timeout;
         while !bytes.windows(4).any(|window| window == b"\r\n\r\n") && Instant::now() < deadline {
             let n = match stream.read(&mut chunk) {
                 Ok(n) => n,
