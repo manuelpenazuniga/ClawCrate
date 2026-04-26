@@ -223,17 +223,17 @@ fn read_limited_line(reader: &mut impl BufRead, max_bytes: usize) -> io::Result<
 }
 
 fn handle_client_connection(
-    mut client: TcpStream,
+    client: TcpStream,
     allowed_domains: &[String],
     enforce_sni: bool,
 ) -> io::Result<()> {
-    client.set_nodelay(true)?;
-    let mut reader = BufReader::new(client.try_clone()?);
+    let mut reader = BufReader::new(client);
+    reader.get_mut().set_nodelay(true)?;
 
     let request_line_bytes = match read_limited_line(&mut reader, MAX_REQUEST_LINE_BYTES)? {
         LimitedLineRead::Eof => return Ok(()),
         LimitedLineRead::TooLong => {
-            write_http_response(&mut client, 400, "Bad Request")?;
+            write_http_response(reader.get_mut(), 400, "Bad Request")?;
             return Ok(());
         }
         LimitedLineRead::Line(line) => line,
@@ -241,7 +241,7 @@ fn handle_client_connection(
     let request_line = match str::from_utf8(&request_line_bytes) {
         Ok(line) => line,
         Err(_) => {
-            write_http_response(&mut client, 400, "Bad Request")?;
+            write_http_response(reader.get_mut(), 400, "Bad Request")?;
             return Ok(());
         }
     };
@@ -250,14 +250,14 @@ fn handle_client_connection(
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
     if !method.eq_ignore_ascii_case("CONNECT") {
-        write_http_response(&mut client, 405, "Method Not Allowed")?;
+        write_http_response(reader.get_mut(), 405, "Method Not Allowed")?;
         return Ok(());
     }
 
     let (target_host, target_port) = match parse_connect_target(target) {
         Some(value) => value,
         None => {
-            write_http_response(&mut client, 400, "Bad Request")?;
+            write_http_response(reader.get_mut(), 400, "Bad Request")?;
             return Ok(());
         }
     };
@@ -268,13 +268,13 @@ fn handle_client_connection(
         match read_limited_line(&mut reader, MAX_HEADER_LINE_BYTES)? {
             LimitedLineRead::Eof => return Ok(()),
             LimitedLineRead::TooLong => {
-                write_http_response(&mut client, 431, "Request Header Fields Too Large")?;
+                write_http_response(reader.get_mut(), 431, "Request Header Fields Too Large")?;
                 return Ok(());
             }
             LimitedLineRead::Line(line) => {
                 header_bytes_total = header_bytes_total.saturating_add(line.len());
                 if header_bytes_total > MAX_HEADER_BYTES_TOTAL {
-                    write_http_response(&mut client, 431, "Request Header Fields Too Large")?;
+                    write_http_response(reader.get_mut(), 431, "Request Header Fields Too Large")?;
                     return Ok(());
                 }
 
@@ -284,7 +284,7 @@ fn handle_client_connection(
 
                 header_count = header_count.saturating_add(1);
                 if header_count > MAX_HEADER_COUNT {
-                    write_http_response(&mut client, 431, "Request Header Fields Too Large")?;
+                    write_http_response(reader.get_mut(), 431, "Request Header Fields Too Large")?;
                     return Ok(());
                 }
             }
@@ -292,39 +292,51 @@ fn handle_client_connection(
     }
 
     if !is_host_allowed(&target_host, allowed_domains) {
-        write_http_response(&mut client, 403, "Forbidden")?;
+        write_http_response(reader.get_mut(), 403, "Forbidden")?;
         return Ok(());
     }
 
     let upstream = match TcpStream::connect((target_host.as_str(), target_port)) {
         Ok(stream) => stream,
         Err(_) => {
-            write_http_response(&mut client, 502, "Bad Gateway")?;
+            write_http_response(reader.get_mut(), 502, "Bad Gateway")?;
             return Ok(());
         }
     };
     upstream.set_nodelay(true)?;
 
-    write_http_response(&mut client, 200, "Connection Established")?;
+    write_http_response(reader.get_mut(), 200, "Connection Established")?;
+    let prefetched_client_bytes = take_buffered_bytes(&mut reader);
 
     if enforce_sni && target_port == 443 {
-        let tls_preface = peek_tls_preface(&mut client)?;
+        let mut tls_preface = prefetched_client_bytes.clone();
+        if tls_preface.len() < 4096 {
+            tls_preface.extend_from_slice(&peek_tls_preface(reader.get_mut())?);
+        }
         let Some(sni) = extract_sni_from_client_hello(&tls_preface) else {
-            let _ = client.shutdown(Shutdown::Both);
+            let _ = reader.get_mut().shutdown(Shutdown::Both);
             let _ = upstream.shutdown(Shutdown::Both);
             return Ok(());
         };
         if !hostnames_match(&target_host, &sni) || !is_host_allowed(&sni, allowed_domains) {
-            let _ = client.shutdown(Shutdown::Both);
+            let _ = reader.get_mut().shutdown(Shutdown::Both);
             let _ = upstream.shutdown(Shutdown::Both);
             return Ok(());
         }
     }
 
-    tunnel_bidirectional(client, upstream)
+    tunnel_bidirectional(reader.into_inner(), upstream, prefetched_client_bytes)
 }
 
-fn tunnel_bidirectional(mut client: TcpStream, mut upstream: TcpStream) -> io::Result<()> {
+fn tunnel_bidirectional(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    prefetched_client_bytes: Vec<u8>,
+) -> io::Result<()> {
+    if !prefetched_client_bytes.is_empty() {
+        upstream.write_all(&prefetched_client_bytes)?;
+    }
+
     let mut client_read = client.try_clone()?;
     let mut upstream_write = upstream.try_clone()?;
     let forward = thread::spawn(move || {
@@ -336,6 +348,14 @@ fn tunnel_bidirectional(mut client: TcpStream, mut upstream: TcpStream) -> io::R
     let _ = client.shutdown(Shutdown::Write);
     let _ = forward.join();
     Ok(())
+}
+
+fn take_buffered_bytes(reader: &mut BufReader<TcpStream>) -> Vec<u8> {
+    let buffered = reader.buffer().to_vec();
+    if !buffered.is_empty() {
+        reader.consume(buffered.len());
+    }
+    buffered
 }
 
 fn peek_tls_preface(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
@@ -655,6 +675,75 @@ mod tests {
     }
 
     #[test]
+    fn proxy_preserves_pipelined_tls_preface_after_connect_headers() {
+        let _guard = proxy_network_test_lock();
+        let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
+        let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
+        let expected_preface = make_client_hello("localhost");
+        let expected_len = expected_preface.len();
+        let upstream_thread = thread::spawn(move || {
+            let (mut socket, _) = upstream_listener.accept().expect("accept upstream");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set upstream read timeout");
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 512];
+            while received.len() < expected_len {
+                match socket.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => received.extend_from_slice(&buffer[..n]),
+                    Err(error)
+                        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("read upstream payload: {error}"),
+                }
+            }
+            received
+        });
+
+        let proxy = start_egress_proxy(EgressProxyConfig {
+            allowed_domains: vec!["localhost".to_string()],
+            enforce_sni: false,
+            max_active_handlers: MAX_ACTIVE_PROXY_HANDLERS,
+        })
+        .expect("start proxy");
+
+        let mut stream =
+            std::net::TcpStream::connect(proxy.addr()).expect("connect to local egress proxy");
+        let request = format!(
+            "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+            upstream_addr.port(),
+            upstream_addr.port()
+        );
+        let mut payload = request.into_bytes();
+        payload.extend_from_slice(&expected_preface);
+        stream.write_all(&payload).expect("write pipelined payload");
+
+        let response = read_http_response_header_with_timeout(&mut stream, Duration::from_secs(3));
+        assert!(
+            response.contains("200 Connection Established"),
+            "unexpected CONNECT response: {response}"
+        );
+        let _ = stream.shutdown(Shutdown::Both);
+
+        let received = upstream_thread.join().expect("join upstream thread");
+        assert!(
+            received.len() >= expected_preface.len(),
+            "upstream received insufficient preface bytes: got {}, expected at least {}",
+            received.len(),
+            expected_preface.len()
+        );
+        assert_eq!(
+            &received[..expected_preface.len()],
+            expected_preface.as_slice(),
+            "pipelined TLS preface bytes must be preserved across CONNECT boundary"
+        );
+        proxy.shutdown();
+    }
+
+    #[test]
     fn proxy_strict_sni_denies_missing_client_hello_preface() {
         let _guard = proxy_network_test_lock();
         let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
@@ -823,9 +912,10 @@ mod tests {
 
     fn proxy_network_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("acquire proxy network test lock")
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     fn read_http_response_header_with_timeout(
