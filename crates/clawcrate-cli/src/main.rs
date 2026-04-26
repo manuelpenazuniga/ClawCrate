@@ -1680,7 +1680,7 @@ where
 #[cfg(unix)]
 fn send_termination_signal(child: &Child, process_group_id: Option<i32>) -> Result<()> {
     send_unix_signal_to_pid(child.id() as i32, Signal::SIGTERM)?;
-    if let Some(group_id) = process_group_id.filter(|group_id| *group_id > 0) {
+    if let Some(group_id) = eligible_process_group_id(process_group_id) {
         send_unix_signal_to_process_group(group_id, Signal::SIGTERM)?;
     }
     Ok(())
@@ -1696,7 +1696,7 @@ fn send_termination_signal(child: &mut Child, _process_group_id: Option<i32>) ->
 #[cfg(unix)]
 fn send_kill_signal(child: &Child, process_group_id: Option<i32>) -> Result<()> {
     send_unix_signal_to_pid(child.id() as i32, Signal::SIGKILL)?;
-    if let Some(group_id) = process_group_id.filter(|group_id| *group_id > 0) {
+    if let Some(group_id) = eligible_process_group_id(process_group_id) {
         send_unix_signal_to_process_group(group_id, Signal::SIGKILL)?;
     }
     Ok(())
@@ -1729,6 +1729,11 @@ fn send_unix_signal_to_process_group(process_group_id: i32, signal: Signal) -> R
             "failed to send {signal:?} to process group {process_group_id}: {source}"
         )),
     }
+}
+
+#[cfg(unix)]
+fn eligible_process_group_id(process_group_id: Option<i32>) -> Option<i32> {
+    process_group_id.filter(|group_id| *group_id > 1)
 }
 
 fn execution_status(status: &ExitStatus, termination: RunTermination) -> Status {
@@ -2587,6 +2592,8 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    #[cfg(unix)]
+    use super::eligible_process_group_id;
     use super::{
         api_route_uses_delegated_worker, apply_replica_sync_back, build_api_cli_args,
         build_execution_plan, build_pennyprompt_bridge_response_with_executor,
@@ -3723,6 +3730,17 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "repeated interrupt should avoid full grace wait"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eligible_process_group_id_rejects_non_safe_group_targets() {
+        assert_eq!(eligible_process_group_id(None), None);
+        assert_eq!(eligible_process_group_id(Some(-7)), None);
+        assert_eq!(eligible_process_group_id(Some(0)), None);
+        assert_eq!(eligible_process_group_id(Some(1)), None);
+        assert_eq!(eligible_process_group_id(Some(2)), Some(2));
+        assert_eq!(eligible_process_group_id(Some(99)), Some(99));
     }
 
     #[cfg(unix)]
