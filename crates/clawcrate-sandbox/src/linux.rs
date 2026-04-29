@@ -583,13 +583,14 @@ fn apply_linux_rlimit_targets(
         } else {
             target.desired_soft.min(current.rlim_max)
         };
-        if effective_soft == current.rlim_cur {
+        let effective_hard = effective_soft;
+        if effective_soft == current.rlim_cur && effective_hard == current.rlim_max {
             continue;
         }
 
         let updated = libc::rlimit {
             rlim_cur: effective_soft,
-            rlim_max: current.rlim_max,
+            rlim_max: effective_hard,
         };
         // SAFETY: Arguments are valid pointers and resource IDs from libc constants.
         if unsafe { libc::setrlimit(target.resource, &updated) } != 0 {
@@ -903,7 +904,7 @@ mod tests {
         let mut plan = test_plan(vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            "ulimit -t; ulimit -n".to_string(),
+            "ulimit -St; ulimit -Sn; ulimit -Ht; ulimit -Hn".to_string(),
         ]);
         plan.profile.resources.max_cpu_seconds = 1;
         plan.profile.resources.max_open_files = 64;
@@ -926,21 +927,27 @@ mod tests {
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout).expect("utf8 output");
         let mut lines = stdout.lines();
-        let cpu_seconds = lines
+        let soft_cpu_seconds = lines
             .next()
-            .expect("cpu limit line")
-            .trim()
-            .parse::<u64>()
-            .expect("cpu limit as integer");
-        let open_files = lines
+            .expect("soft cpu limit line")
+            .trim();
+        let soft_open_files = lines
             .next()
-            .expect("open files limit line")
-            .trim()
-            .parse::<u64>()
-            .expect("open files limit as integer");
+            .expect("soft open files limit line")
+            .trim();
+        let hard_cpu_seconds = lines
+            .next()
+            .expect("hard cpu limit line")
+            .trim();
+        let hard_open_files = lines
+            .next()
+            .expect("hard open files limit line")
+            .trim();
 
-        assert_eq!(cpu_seconds, 1);
-        assert_eq!(open_files, 64);
+        assert_eq!(soft_cpu_seconds, "1");
+        assert_eq!(soft_open_files, "64");
+        assert_eq!(hard_cpu_seconds, "1");
+        assert_eq!(hard_open_files, "64");
     }
 
     #[cfg(target_os = "linux")]
