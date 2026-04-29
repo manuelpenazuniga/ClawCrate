@@ -63,6 +63,10 @@ pub enum LinuxSandboxError {
 
 #[cfg(target_os = "linux")]
 const LINUX_RLIMIT_TARGET_COUNT: usize = 5;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+type LinuxRlimitResource = libc::__rlimit_resource_t;
+#[cfg(all(target_os = "linux", not(target_env = "gnu")))]
+type LinuxRlimitResource = libc::c_int;
 #[cfg(target_os = "linux")]
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 #[cfg(target_os = "linux")]
@@ -106,7 +110,7 @@ const LANDLOCK_ACCESS_FS_BASE_WRITE: u64 = LANDLOCK_ACCESS_FS_WRITE_FILE
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 struct LinuxRlimitTarget {
-    resource: libc::__rlimit_resource_t,
+    resource: LinuxRlimitResource,
     desired_soft: libc::rlim_t,
 }
 
@@ -144,23 +148,23 @@ fn build_linux_rlimit_targets(
 ) -> [LinuxRlimitTarget; LINUX_RLIMIT_TARGET_COUNT] {
     [
         LinuxRlimitTarget {
-            resource: libc::RLIMIT_CPU,
+            resource: libc::RLIMIT_CPU as LinuxRlimitResource,
             desired_soft: saturating_u64_to_rlim_t(limits.max_cpu_seconds),
         },
         LinuxRlimitTarget {
-            resource: libc::RLIMIT_AS,
+            resource: libc::RLIMIT_AS as LinuxRlimitResource,
             desired_soft: saturating_u64_to_rlim_t(memory_mb_to_bytes(limits.max_memory_mb)),
         },
         LinuxRlimitTarget {
-            resource: libc::RLIMIT_NOFILE,
+            resource: libc::RLIMIT_NOFILE as LinuxRlimitResource,
             desired_soft: saturating_u64_to_rlim_t(limits.max_open_files),
         },
         LinuxRlimitTarget {
-            resource: libc::RLIMIT_FSIZE,
+            resource: libc::RLIMIT_FSIZE as LinuxRlimitResource,
             desired_soft: saturating_u64_to_rlim_t(limits.max_output_bytes),
         },
         LinuxRlimitTarget {
-            resource: libc::RLIMIT_NPROC,
+            resource: libc::RLIMIT_NPROC as LinuxRlimitResource,
             desired_soft: saturating_u64_to_rlim_t(limits.max_processes),
         },
     ]
