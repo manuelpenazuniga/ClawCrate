@@ -77,8 +77,17 @@ fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "error: working tree is not clean; commit/stash changes first" >&2
+  echo "hint: current dirty entries:" >&2
+  git status --short >&2
   exit 1
 fi
+
+for required_path in scripts/release.sh scripts/install.sh .github/workflows/release.yml; do
+  if [[ ! -f "$required_path" ]]; then
+    echo "error: required release artifact path is missing: $required_path" >&2
+    exit 1
+  fi
+done
 
 echo "==> Fetching origin/main for synchronization check"
 git fetch origin main --prune >/dev/null
@@ -93,6 +102,11 @@ fi
 
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   echo "error: tag '$TAG' already exists locally" >&2
+  exit 1
+fi
+
+if [[ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]]; then
+  echo "error: tag '$TAG' already exists on origin" >&2
   exit 1
 fi
 
