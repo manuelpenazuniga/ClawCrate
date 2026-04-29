@@ -92,8 +92,11 @@ bash scripts/cut_release.sh --tag v0.1.0-alpha.0 --push
 
 What it enforces:
 - clean working tree
+- explicit dirty-entry output when tree is not clean
 - `main` branch only
 - local `main` equals `origin/main`
+- remote tag collision check (fails if tag already exists on `origin`)
+- required release artifact paths exist (`scripts/release.sh`, `scripts/install.sh`, `.github/workflows/release.yml`)
 - local quality gate (`fmt`, `clippy`, `test`)
 - annotated tag creation
 - optional remote push
