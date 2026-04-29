@@ -10,7 +10,9 @@ use clawcrate_types::{ExecutionPlan, NetLevel, ResourceLimits};
 #[cfg(target_os = "linux")]
 use nix::{errno::Errno, libc};
 #[cfg(target_os = "linux")]
-use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+use seccompiler::{
+    BpfProgram, Error as SeccompApplyError, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
+};
 #[cfg(target_os = "linux")]
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "linux")]
@@ -692,8 +694,21 @@ fn apply_linux_seccomp_filter(context: &LinuxSeccompContext) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(Errno::last_raw()));
     }
 
-    seccompiler::apply_filter(context.program.as_slice())
-        .map_err(|source| io::Error::other(format!("failed to apply seccomp filter: {source}")))
+    seccompiler::apply_filter(context.program.as_slice()).map_err(seccomp_apply_error_as_io_error)
+}
+
+#[cfg(target_os = "linux")]
+fn seccomp_apply_error_as_io_error(source: SeccompApplyError) -> io::Error {
+    // Keep pre_exec failure conversion allocator-free: emit deterministic raw errno values instead
+    // of formatted strings so the child post-fork path remains async-signal-safe.
+    let errno = match source {
+        SeccompApplyError::Prctl(error) => error.raw_os_error().unwrap_or(libc::EINVAL),
+        SeccompApplyError::Seccomp(error) => error.raw_os_error().unwrap_or(libc::EINVAL),
+        SeccompApplyError::ThreadSync(_) => libc::EBUSY,
+        SeccompApplyError::EmptyFilter => libc::EINVAL,
+        SeccompApplyError::Backend(_) => libc::EINVAL,
+    };
+    io::Error::from_raw_os_error(errno)
 }
 
 #[cfg(test)]
@@ -713,6 +728,8 @@ mod tests {
         Actor, DefaultMode, ExecutionPlan, NetLevel, ResolvedProfile, ResourceLimits, WorkspaceMode,
     };
 
+    #[cfg(target_os = "linux")]
+    use super::seccomp_apply_error_as_io_error;
     use super::{
         apply_enforcement_steps, EnforcementStep, LinuxEnforcer, LinuxSandbox, PreparedLinuxSandbox,
     };
@@ -1046,5 +1063,25 @@ mod tests {
             "net=open should keep socket() available under seccomp; stderr={}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_error_mapping_returns_deterministic_raw_errno_values() {
+        let prctl_error = seccomp_apply_error_as_io_error(seccompiler::Error::Prctl(
+            std::io::Error::from_raw_os_error(nix::libc::EPERM),
+        ));
+        assert_eq!(prctl_error.raw_os_error(), Some(nix::libc::EPERM));
+
+        let seccomp_error = seccomp_apply_error_as_io_error(seccompiler::Error::Seccomp(
+            std::io::Error::from_raw_os_error(nix::libc::EACCES),
+        ));
+        assert_eq!(seccomp_error.raw_os_error(), Some(nix::libc::EACCES));
+
+        let thread_sync_error = seccomp_apply_error_as_io_error(seccompiler::Error::ThreadSync(42));
+        assert_eq!(thread_sync_error.raw_os_error(), Some(nix::libc::EBUSY));
+
+        let empty_filter_error = seccomp_apply_error_as_io_error(seccompiler::Error::EmptyFilter);
+        assert_eq!(empty_filter_error.raw_os_error(), Some(nix::libc::EINVAL));
     }
 }
