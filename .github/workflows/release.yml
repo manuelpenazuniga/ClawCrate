@@ -108,3 +108,52 @@ jobs:
             dist/clawcrate-*.tar.gz
             dist/SHA256SUMS
             scripts/install.sh
+
+  installer-smoke:
+    name: Installer smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Resolve tag
+        id: release_meta
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download install script from release
+        run: |
+          curl -fsSL \
+            "https://github.com/${{ github.repository }}/releases/download/${{ steps.release_meta.outputs.tag }}/install.sh" \
+            -o /tmp/clawcrate-install.sh
+          chmod +x /tmp/clawcrate-install.sh
+
+      - name: Install from published release
+        env:
+          CLAWCRATE_INSTALL_DIR: ${{ runner.temp }}/clawcrate-bin
+        run: |
+          /tmp/clawcrate-install.sh \
+            --repo "${{ github.repository }}" \
+            --version "${{ steps.release_meta.outputs.tag }}" \
+            --install-dir "${CLAWCRATE_INSTALL_DIR}"
+
+      - name: Verify version and doctor
+        env:
+          CLAWCRATE_INSTALL_DIR: ${{ runner.temp }}/clawcrate-bin
+        run: |
+          "${CLAWCRATE_INSTALL_DIR}/clawcrate" --version
+          "${CLAWCRATE_INSTALL_DIR}/clawcrate" doctor --json > "${RUNNER_TEMP}/doctor-${{ matrix.os }}.json"
+
+      - name: Upload doctor artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-doctor-${{ matrix.os }}
+          path: ${{ runner.temp }}/doctor-${{ matrix.os }}.json
