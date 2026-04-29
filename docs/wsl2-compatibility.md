@@ -4,7 +4,8 @@ This note captures the current compatibility assessment for running ClawCrate un
 
 Status (as of 2026-04-25): post-alpha exploratory guidance.
 WSL2 is not part of current alpha support guarantees.
-Fail-safe posture remains in effect until Linux enforcement work in `#69` is complete.
+Fail-safe posture remains in effect while WSL2 support is still experimental.
+Historical note: Linux enforcement issue `#69` is closed.
 
 ## Scope
 
@@ -18,7 +19,6 @@ Related issues:
 
 - `#48` (this spike and constraints report)
 - `#49` (WSL2 CI lane + baseline validation)
-- `#69` (real Linux enforcement implementation gap)
 
 ## Assessment Method
 
@@ -36,7 +36,7 @@ clawcrate doctor --json | jq .
 ```
 
 Important: these fields are compatibility signals only. They are not a security
-readiness verdict while `#69` is open.
+readiness verdict.
 
 ## Capability Expectations in WSL2
 
@@ -61,25 +61,25 @@ WSL2 behavior varies by Windows version and WSL kernel build. Do not assume pari
 
 Even when capabilities appear available in WSL2, current repo state must be considered:
 
-- Linux enforcement internals are still tracked as active work in `#69`.
+- Linux enforcement internals are implemented on native Linux.
 - WSL2 now has a dedicated CI execution path (`.github/workflows/wsl2-ci.yml`), currently configured as non-blocking while support is still experimental.
 
 Result:
 
-- Until `#69` lands, treat WSL2 as restricted/experimental regardless of
-  `landlock_abi` or `seccomp_available` values.
+- Treat WSL2 as restricted/experimental regardless of `landlock_abi` or
+  `seccomp_available` values.
 - Non-null capability probes do not override this restriction.
 - CI results from `wsl2-ci` are for drift/signal collection, not a security guarantee.
 
 ## Recommended Operational Policy (Current)
 
-1. Apply a default restricted policy for all WSL2 runs while `#69` remains open.
+1. Apply a default restricted policy for all WSL2 runs while support remains experimental.
 2. Run `clawcrate doctor --json` for observability and troubleshooting, not as a pass/fail trust gate.
 3. If `landlock_abi == null` or `seccomp_available == false`, further restrict usage to lower-risk flows:
    - prefer `plan` over `run` for untrusted inputs
    - prefer `safe`/`build` with minimal write scope
    - use Replica mode for higher-risk operations
-4. For strict security boundaries, prefer native Linux or VM isolation until Linux enforcement (`#69`) is implemented and validated.
+4. For strict security boundaries, prefer native Linux or VM isolation until WSL2 support is promoted beyond experimental status.
 
 ## Known Unsupported / Not Yet Validated
 
@@ -103,4 +103,4 @@ This lane is intentionally non-blocking right now (`continue-on-error: true`) to
 Interpretation rule:
 
 - Passing `WSL2 Compatibility` indicates runtime compatibility signal only.
-- It does not certify sandbox enforcement guarantees on WSL2 prior to `#69`.
+- It does not certify production-grade sandbox enforcement guarantees on WSL2.
