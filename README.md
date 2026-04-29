@@ -297,9 +297,9 @@ Run `clawcrate doctor` to check your system's capabilities.
 ## Roadmap
 
 - [x] Project specification (v3.1.1)
-- [ ] **Alpha** — `run`, `plan`, `doctor`. Profiles. Dual-platform sandbox. Replica mode. Artifacts.
+- [ ] **Alpha** — `run`, `plan`, `doctor`, `api`, `bridge pennyprompt`. Profiles. Dual-platform sandbox. Replica mode. Artifacts.
 - [ ] **P1** — Egress proxy (network filtering by domain). Approval workflow. Community profiles.
-- [ ] **P2** — SQLite audit storage. HTTP API. PennyPrompt integration.
+- [ ] **P2** — SQLite audit storage. API/bridge hardening and expanded integration contracts.
 - [ ] **v1.0** — Production hardening. Windows (WSL2). Plugin system.
 
 ## Contributing
