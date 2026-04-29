@@ -89,14 +89,13 @@ uuid = { version = "1", features = ["v7"] }
 
 # Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
-landlock = "0.4"
-seccompiler = "0.4"
+seccompiler = "0.5"
 ```
 
 ### What is NOT in the stack
 
-- No tokio in alpha (no async needed — fork/exec is sync, I/O is piped). Tokio enters in P1 for the egress proxy.
-- No SQLite in alpha. Artifacts are plain files on disk.
+- No tokio in runtime. Egress proxy uses `std::net` + threads.
+- Artifacts are plain files on disk. SQLite index is optional post-alpha (`CLAWCRATE_AUDIT_SQLITE=1`) and does not replace file artifacts.
 - No Docker, containers, or VM dependencies.
 - No wasmtime. WASI does not support native runtimes (Python, Node, git).
 - No notify/inotify for fs-diff. We use snapshot pre/post with walkdir.
@@ -357,7 +356,7 @@ pub struct SandboxedChild {
 Handles stdout/stderr capture and filesystem diff.
 
 **stdout/stderr capture:**
-- Read from pipes in a background thread (or async with tokio in P1)
+- Read from pipes in background threads
 - Write to `stdout.log` and `stderr.log` in artifacts dir
 - Optionally tee to terminal (default for interactive use)
 - Respect `max_output_bytes` from resource limits — truncate if exceeded
@@ -479,7 +478,7 @@ Follow this order exactly. Each phase builds on the previous. Do not skip ahead.
 - Implement `LinuxSandbox::probe()`: detect Landlock ABI, seccomp, kernel version
 - Implement `LinuxSandbox::prepare()`: build Landlock ruleset + seccomp filter from `ResolvedProfile`
 - Implement `LinuxSandbox::launch()`: fork → rlimits → Landlock → seccomp → exec. Pipe stdout/stderr.
-- Landlock rules: use `landlock` crate with `CompatLevel::BestEffort`. Map `fs_read` → `AccessFs::from_read(abi)`, `fs_write` → separate `ReadWrite` (NOT `from_all` — least privilege).
+- Landlock rules: use direct syscall path (`landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self`) to control FD lifecycle and error handling.
 - seccomp: use `seccompiler`. Default profile allows: read, write, open, close, stat, fstat, mmap, mprotect, munmap, brk, ioctl, access, pipe, select, poll, dup, fork, vfork, execve, exit, getpid, getuid, getcwd, chdir, rename, unlink, mkdir, rmdir, socket (if net=Open), connect (if net=Open), clock_gettime, futex, and similar safe syscalls. Block: ptrace, mount, umount, reboot, kexec_load, swapon, swapoff, init_module, delete_module.
 - Tests (Linux only): fixture that tries `cat ~/.ssh/id_rsa` → EACCES. Fixture that tries `strace` → EPERM.
 
