@@ -9,6 +9,8 @@ Alpha command surface:
 - `clawcrate plan`
 - `clawcrate run`
 - `clawcrate doctor`
+- `clawcrate api`
+- `clawcrate bridge pennyprompt`
 
 Alpha architecture constraints:
 
