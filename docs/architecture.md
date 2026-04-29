@@ -90,8 +90,8 @@ Current backend path:
 
 Important current state:
 
-- Enforcement steps are wired but currently no-op in `KernelEnforcer`.
-- Tracked as technical gap in issue `#69` ("Implement real Linux enforcement").
+- Linux enforcement is active in runtime (`rlimits`, `landlock`, `seccomp`) and applied in launch pre-exec flow.
+- Historical note: issue `#69` ("Implement real Linux enforcement") is closed.
 
 ## macOS backend
 

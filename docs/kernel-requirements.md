@@ -33,10 +33,8 @@ In the current alpha codebase, Linux launch stages are wired as:
 - `landlock`
 - `seccomp`
 
-But the default `KernelEnforcer` implementation is currently no-op for those steps.
-Tracked in issue `#69` ("Implement real Linux enforcement").
-
-That means Linux capability detection is present, but full enforcement remains an active gap.
+These stages are implemented and enforced during Linux launch.
+Historical note: issue `#69` ("Implement real Linux enforcement") is closed.
 
 ## macOS
 
@@ -71,7 +69,7 @@ These limits map profile resources to:
 - file size
 - process count (platform conditional)
 
-Integration into platform launch behavior is in progress and should be interpreted alongside issue `#69`.
+Integration into platform launch behavior is implemented in current `main`.
 
 ## Replica Mode and Secret Handling
 
