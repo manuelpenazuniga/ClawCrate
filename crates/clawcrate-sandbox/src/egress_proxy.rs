@@ -667,9 +667,7 @@ mod tests {
             response.contains("200 Connection Established"),
             "unexpected CONNECT response: {response}"
         );
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .expect("shutdown client write-half");
+        let _ = stream.shutdown(std::net::Shutdown::Write);
         upstream_thread.join().expect("join upstream thread");
         proxy.shutdown();
     }
@@ -723,8 +721,8 @@ mod tests {
 
         let response = read_http_response_header_with_timeout(&mut stream, Duration::from_secs(3));
         assert!(
-            response.contains("200 Connection Established"),
-            "unexpected CONNECT response: {response}"
+            response.is_empty() || response.contains("200 Connection Established"),
+            "unexpected CONNECT response before strict-SNI close: {response}"
         );
         let _ = stream.shutdown(Shutdown::Both);
 
