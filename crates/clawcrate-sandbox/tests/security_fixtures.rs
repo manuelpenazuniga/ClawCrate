@@ -2,6 +2,8 @@
 use std::fs;
 use std::io;
 #[cfg(target_os = "linux")]
+use std::os::unix::fs::symlink;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -138,10 +140,20 @@ impl TempPathGuard {
 #[cfg(target_os = "linux")]
 impl Drop for TempPathGuard {
     fn drop(&mut self) {
-        if self.path.is_dir() {
-            let _ = fs::remove_dir_all(&self.path);
-        } else {
-            let _ = fs::remove_file(&self.path);
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_dir() {
+                    let _ = fs::remove_dir_all(&self.path);
+                } else {
+                    let _ = fs::remove_file(&self.path);
+                }
+            }
+            Err(error) => {
+                if error.kind() != io::ErrorKind::NotFound {
+                    let _ = error;
+                }
+            }
         }
     }
 }
@@ -337,6 +349,35 @@ fn fixture_linux_landlock_denies_write_outside_allowed_workspace() {
     assert!(
         !denied_path.path().exists(),
         "denied path should not be created"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn temp_path_guard_removes_symlink_without_deleting_target_directory() {
+    let target_dir = TempPathGuard::new("clawcrate_fixture_temp_guard_target");
+    fs::create_dir_all(target_dir.path()).expect("create target directory");
+
+    let symlink_guard = TempPathGuard::new("clawcrate_fixture_temp_guard_symlink");
+    let symlink_path = symlink_guard.path().to_path_buf();
+    symlink(target_dir.path(), &symlink_path).expect("create symlink path");
+    assert!(
+        fs::symlink_metadata(&symlink_path)
+            .expect("symlink metadata")
+            .file_type()
+            .is_symlink(),
+        "test setup should create symlink"
+    );
+
+    drop(symlink_guard);
+
+    assert!(
+        fs::symlink_metadata(&symlink_path).is_err(),
+        "symlink path should be removed by guard drop"
+    );
+    assert!(
+        target_dir.path().is_dir(),
+        "guard cleanup should not delete symlink target"
     );
 }
 
