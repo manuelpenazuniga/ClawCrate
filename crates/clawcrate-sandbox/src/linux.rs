@@ -1,6 +1,8 @@
 use std::io;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
