@@ -50,10 +50,10 @@ npm test runs normally. Your secrets never left the vault.
 
 ```bash
 # Install (macOS)
-curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/ClawCrate/main/scripts/install.sh | sh
+curl -fsSL https://github.com/manuelpenazuniga/ClawCrate/releases/latest/download/install.sh | sh
 
 # Install (Linux)
-curl -fsSL https://raw.githubusercontent.com/manuelpenazuniga/ClawCrate/main/scripts/install.sh | sh
+curl -fsSL https://github.com/manuelpenazuniga/ClawCrate/releases/latest/download/install.sh | sh
 
 # Run your first sandboxed command
 clawcrate run --profile safe -- echo "hello from the sandbox"
