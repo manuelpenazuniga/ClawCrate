@@ -157,8 +157,19 @@ Parser behavior includes:
 - invalid `default_mode` values fail profile load
 - missing profile file fails with explicit path error
 
+## Path Resolution Semantics
+
+- `filesystem.read` and `filesystem.write` support absolute paths, relative paths, and `~`/`~/...`.
+- Relative paths are resolved from the execution cwd (`ExecutionPlan.cwd`).
+- `~` expansion uses `HOME` from the execution environment.
+- The CLI planner normalizes these paths, and both sandbox backends normalize again during `prepare` (defense in depth when plans are materialized outside CLI).
+
 ## Notes on Filesystem Deny
 
-- `fs_deny` is currently consumed in macOS SBPL profile generation.
+- `filesystem.deny` (`fs_deny`) is consumed in macOS SBPL profile generation.
+- On macOS, deny entries are normalized before SBPL regex generation:
+  - absolute patterns are kept as-is
+  - relative patterns are resolved from execution cwd
+  - `~`/`~/...` patterns expand from `HOME`
 - Linux intra-workspace deny behavior depends on Landlock implementation status.
 - For sensitive file filtering in alpha, use Replica mode + default exclusions + `.clawcrateignore`.
