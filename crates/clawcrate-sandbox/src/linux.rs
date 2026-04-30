@@ -1,7 +1,7 @@
 use std::io;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
@@ -23,8 +23,6 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(target_os = "linux")]
-use std::path::Path;
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -38,6 +36,42 @@ pub struct PreparedLinuxSandbox {
     pub resource_limits: ResourceLimits,
     pub scrubbed_env: Vec<(String, String)>,
     pub scrubbed_keys: Vec<String>,
+}
+
+fn home_from_env_pairs(env: &[(String, String)]) -> Option<PathBuf> {
+    env.iter()
+        .find_map(|(key, value)| (key == "HOME" && !value.is_empty()).then(|| PathBuf::from(value)))
+}
+
+fn expand_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if path_str == "~" {
+        if let Some(home_path) = home {
+            return home_path.to_path_buf();
+        }
+    }
+    if let Some(rest) = path_str.strip_prefix("~/") {
+        if let Some(home_path) = home {
+            return home_path.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn resolve_prepared_path(cwd: &Path, path: &Path, home: Option<&Path>) -> PathBuf {
+    let expanded = expand_home_path(path, home);
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    }
+}
+
+fn normalize_prepared_paths(cwd: &Path, paths: &[PathBuf], home: Option<&Path>) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .map(|path| resolve_prepared_path(cwd, path, home))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,13 +486,14 @@ impl LinuxSandbox {
             &plan.profile.env_scrub,
             &plan.profile.env_passthrough,
         );
+        let home = home_from_env_pairs(&scrubbed.kept);
 
         PreparedLinuxSandbox {
             execution_id: plan.id.clone(),
             command: plan.command.clone(),
             cwd: plan.cwd.clone(),
-            fs_read: plan.profile.fs_read.clone(),
-            fs_write: plan.profile.fs_write.clone(),
+            fs_read: normalize_prepared_paths(&plan.cwd, &plan.profile.fs_read, home.as_deref()),
+            fs_write: normalize_prepared_paths(&plan.cwd, &plan.profile.fs_write, home.as_deref()),
             net: plan.profile.net.clone(),
             resource_limits: plan.profile.resources.clone(),
             scrubbed_env: scrubbed.kept,
@@ -871,6 +906,41 @@ mod tests {
         assert!(prepared
             .scrubbed_keys
             .contains(&"MY_SECRET_KEY".to_string()));
+    }
+
+    #[test]
+    fn prepare_normalizes_profile_paths_for_backend_enforcement() {
+        let sandbox = LinuxSandbox::default();
+        let mut plan = test_plan(vec!["/bin/echo".to_string(), "ok".to_string()]);
+        plan.cwd = PathBuf::from("/tmp/workspace");
+        plan.profile.fs_read = vec![
+            PathBuf::from("relative-read"),
+            PathBuf::from("~/.cargo/bin"),
+        ];
+        plan.profile.fs_write = vec![PathBuf::from("relative-write"), PathBuf::from("~/tmp")];
+
+        let prepared = sandbox.prepare_with_env(
+            &plan,
+            vec![
+                ("HOME".to_string(), "/tmp/home-user".to_string()),
+                ("PATH".to_string(), "/usr/bin".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            prepared.fs_read,
+            vec![
+                PathBuf::from("/tmp/workspace/relative-read"),
+                PathBuf::from("/tmp/home-user/.cargo/bin")
+            ]
+        );
+        assert_eq!(
+            prepared.fs_write,
+            vec![
+                PathBuf::from("/tmp/workspace/relative-write"),
+                PathBuf::from("/tmp/home-user/tmp")
+            ]
+        );
     }
 
     #[test]

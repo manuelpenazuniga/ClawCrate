@@ -89,9 +89,9 @@ impl DarwinSandbox {
             execution_id: plan.id.clone(),
             command: plan.command.clone(),
             cwd: plan.cwd.clone(),
-            fs_read: plan.profile.fs_read.clone(),
-            fs_write: plan.profile.fs_write.clone(),
-            fs_deny: plan.profile.fs_deny.clone(),
+            fs_read: normalize_prepared_paths(&plan.cwd, &plan.profile.fs_read, home.as_deref()),
+            fs_write: normalize_prepared_paths(&plan.cwd, &plan.profile.fs_write, home.as_deref()),
+            fs_deny: normalize_deny_patterns(&plan.cwd, &plan.profile.fs_deny, home.as_deref()),
             net: plan.profile.net.clone(),
             scrubbed_env: scrubbed.kept,
             scrubbed_keys: scrubbed.removed,
@@ -243,6 +243,53 @@ fn home_from_env(env: &[(String, String)]) -> Option<PathBuf> {
         .find_map(|(key, value)| (key == "HOME" && !value.is_empty()).then(|| PathBuf::from(value)))
 }
 
+fn expand_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if path_str == "~" {
+        if let Some(home_path) = home {
+            return home_path.to_path_buf();
+        }
+    }
+    if let Some(rest) = path_str.strip_prefix("~/") {
+        if let Some(home_path) = home {
+            return home_path.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn resolve_prepared_path(cwd: &Path, path: &Path, home: Option<&Path>) -> PathBuf {
+    let expanded = expand_home_path(path, home);
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    }
+}
+
+fn normalize_prepared_paths(cwd: &Path, paths: &[PathBuf], home: Option<&Path>) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .map(|path| resolve_prepared_path(cwd, path, home))
+        .collect()
+}
+
+fn normalize_deny_pattern(cwd: &Path, pattern: &str, home: Option<&Path>) -> String {
+    let expanded = expand_home_path(Path::new(pattern), home);
+    if expanded.is_absolute() {
+        expanded.to_string_lossy().to_string()
+    } else {
+        cwd.join(expanded).to_string_lossy().to_string()
+    }
+}
+
+fn normalize_deny_patterns(cwd: &Path, patterns: &[String], home: Option<&Path>) -> Vec<String> {
+    patterns
+        .iter()
+        .map(|pattern| normalize_deny_pattern(cwd, pattern, home))
+        .collect()
+}
+
 fn generate_sbpl_profile(prepared: &PreparedDarwinSandbox, home: Option<&Path>) -> String {
     let mut lines = vec![
         "(version 1)".to_string(),
@@ -279,8 +326,7 @@ fn generate_sbpl_profile(prepared: &PreparedDarwinSandbox, home: Option<&Path>) 
     }));
 
     for pattern in &prepared.fs_deny {
-        let expanded = expand_tilde_pattern(pattern, home);
-        let regex = escape_sbpl_regex(&glob_to_regex(&expanded));
+        let regex = escape_sbpl_regex(&glob_to_regex(pattern));
         lines.push(format!("(deny file-read* (regex #\"{regex}\"))"));
         lines.push(format!("(deny file-write* (regex #\"{regex}\"))"));
     }
@@ -292,16 +338,6 @@ fn generate_sbpl_profile(prepared: &PreparedDarwinSandbox, home: Option<&Path>) 
     }
 
     lines.join("\n")
-}
-
-fn expand_tilde_pattern(pattern: &str, home: Option<&Path>) -> String {
-    if let Some(relative) = pattern.strip_prefix("~/") {
-        if let Some(home_path) = home {
-            return home_path.join(relative).to_string_lossy().to_string();
-        }
-    }
-
-    pattern.to_string()
 }
 
 fn sensitive_deny_paths(home: Option<&Path>) -> Vec<PathBuf> {
@@ -463,6 +499,63 @@ mod tests {
         assert!(prepared
             .scrubbed_keys
             .contains(&"MY_SECRET_TOKEN".to_string()));
+    }
+
+    #[test]
+    fn prepare_normalizes_profile_paths_for_backend_enforcement() {
+        let sandbox = DarwinSandbox::new();
+        let mut plan = test_plan(
+            vec!["/bin/echo".to_string(), "ok".to_string()],
+            NetLevel::None,
+        );
+        plan.cwd = PathBuf::from("/tmp/workspace");
+        plan.profile.fs_read = vec![
+            PathBuf::from("relative-read"),
+            PathBuf::from("~/.cargo/bin"),
+        ];
+        plan.profile.fs_write = vec![PathBuf::from("relative-write"), PathBuf::from("~/tmp")];
+        plan.profile.fs_deny = vec![
+            ".env*".to_string(),
+            "secrets/*.pem".to_string(),
+            "~/.aws/*".to_string(),
+        ];
+
+        let prepared = sandbox.prepare_with_env(
+            &plan,
+            vec![
+                ("HOME".to_string(), "/tmp/home-user".to_string()),
+                ("PATH".to_string(), "/usr/bin".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            prepared.fs_read,
+            vec![
+                PathBuf::from("/tmp/workspace/relative-read"),
+                PathBuf::from("/tmp/home-user/.cargo/bin")
+            ]
+        );
+        assert_eq!(
+            prepared.fs_write,
+            vec![
+                PathBuf::from("/tmp/workspace/relative-write"),
+                PathBuf::from("/tmp/home-user/tmp")
+            ]
+        );
+        assert_eq!(
+            prepared.fs_deny,
+            vec![
+                "/tmp/workspace/.env*".to_string(),
+                "/tmp/workspace/secrets/*.pem".to_string(),
+                "/tmp/home-user/.aws/*".to_string(),
+            ]
+        );
+        assert!(prepared
+            .sbpl_profile
+            .contains("(allow file-read* (subpath \"/tmp/workspace/relative-read\"))"));
+        assert!(prepared
+            .sbpl_profile
+            .contains("(allow file-write* (subpath \"/tmp/workspace/relative-write\"))"));
     }
 
     #[test]
