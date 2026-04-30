@@ -40,6 +40,7 @@ pub(crate) fn normalize_paths(cwd: &Path, paths: &[PathBuf], home: Option<&Path>
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn normalize_path_patterns(
     cwd: &Path,
     patterns: &[String],
