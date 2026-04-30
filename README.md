@@ -303,7 +303,7 @@ Run `clawcrate doctor` to check your system's capabilities.
 - [ ] **v1.0** — Production hardening. Windows (WSL2). Plugin system.
 
 Transition note:
-Alpha release `v0.1.0-alpha.0` is published. P1/P2 capabilities are present in `main`; remaining open issues are hardening and consistency follow-ups.
+The latest alpha release is published on GitHub Releases. Quickstart installs from the latest published release assets; see `CHANGELOG.md` for version-specific details.
 
 ## Contributing
 

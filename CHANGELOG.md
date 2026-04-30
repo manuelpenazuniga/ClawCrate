@@ -8,12 +8,18 @@ with alpha pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.1] - 2026-04-30
+
 ### Added
 - Release automation workflow for multi-target binary artifacts and checksum publication.
 - Install script with platform/architecture detection and SHA256 verification.
 
 ### Changed
 - Reconciled alpha scope contract: documented command surface now explicitly includes `api` and `bridge pennyprompt` alongside `run`, `plan`, and `doctor`.
+
+### Fixed
+- Built-in profile names (`safe`, `build`, `install`, `open`) now resolve correctly in installed release binaries without requiring a local repository checkout.
+- macOS Seatbelt SBPL generation now imports the system baseline profile to prevent trivial sandboxed commands from terminating as `Killed`.
 
 ## [0.1.0-alpha.0] - 2026-04-18
 
