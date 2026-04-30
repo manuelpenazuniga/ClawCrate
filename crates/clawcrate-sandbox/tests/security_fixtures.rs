@@ -117,10 +117,47 @@ fn unique_tmp_path(prefix: &str) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct TempPathGuard {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl TempPathGuard {
+    fn new(prefix: &str) -> Self {
+        Self {
+            path: unique_tmp_path(prefix),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        if self.path.is_dir() {
+            let _ = fs::remove_dir_all(&self.path);
+        } else {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn python3_path_for_linux_fixtures() -> Option<&'static str> {
     ["/usr/bin/python3", "/bin/python3"]
         .into_iter()
         .find(|candidate| Path::new(candidate).exists())
+}
+
+#[cfg(target_os = "linux")]
+fn require_python3_for_linux_fixtures() -> &'static str {
+    python3_path_for_linux_fixtures().unwrap_or_else(|| {
+        panic!("python3 is required for Linux seccomp security fixture tests on this runner")
+    })
 }
 
 #[test]
@@ -252,9 +289,9 @@ fn fixture_network_policy_is_materialized_in_linux_prepare() {
 #[test]
 fn fixture_linux_landlock_denies_write_outside_allowed_workspace() {
     let fixtures = fixture_paths();
-    let workspace = unique_tmp_path("clawcrate_fixture_landlock_workspace");
-    fs::create_dir_all(&workspace).expect("create temporary workspace");
-    let denied_path = unique_tmp_path("clawcrate_fixture_landlock_denied");
+    let workspace = TempPathGuard::new("clawcrate_fixture_landlock_workspace");
+    fs::create_dir_all(workspace.path()).expect("create temporary workspace");
+    let denied_path = TempPathGuard::new("clawcrate_fixture_landlock_denied");
 
     let mut plan = fixture_plan(
         &fixtures,
@@ -263,14 +300,14 @@ fn fixture_linux_landlock_denies_write_outside_allowed_workspace() {
             "-c".to_string(),
             format!(
                 "printf 'ok' > allowed.txt && printf 'denied' > {}",
-                denied_path.display()
+                denied_path.path().display()
             ),
         ],
         NetLevel::None,
     );
-    plan.cwd = workspace.clone();
-    plan.profile.fs_read = vec![workspace.clone()];
-    plan.profile.fs_write = vec![workspace.clone()];
+    plan.cwd = workspace.path().to_path_buf();
+    plan.profile.fs_read = vec![workspace.path().to_path_buf()];
+    plan.profile.fs_write = vec![workspace.path().to_path_buf()];
 
     let sandbox = LinuxSandbox::new();
     let prepared = sandbox.prepare_with_env(
@@ -294,21 +331,23 @@ fn fixture_linux_landlock_denies_write_outside_allowed_workspace() {
         !output.status.success(),
         "writing outside allowed workspace should be denied"
     );
-    let allowed = fs::read_to_string(workspace.join("allowed.txt")).expect("read allowed output");
+    let allowed =
+        fs::read_to_string(workspace.path().join("allowed.txt")).expect("read allowed output");
     assert_eq!(allowed, "ok");
-    assert!(!denied_path.exists(), "denied path should not be created");
+    assert!(
+        !denied_path.path().exists(),
+        "denied path should not be created"
+    );
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn fixture_linux_seccomp_denies_socket_when_network_is_none() {
-    let Some(python3) = python3_path_for_linux_fixtures() else {
-        return;
-    };
+    let python3 = require_python3_for_linux_fixtures();
 
     let fixtures = fixture_paths();
-    let workspace = unique_tmp_path("clawcrate_fixture_seccomp_workspace");
-    fs::create_dir_all(&workspace).expect("create temporary workspace");
+    let workspace = TempPathGuard::new("clawcrate_fixture_seccomp_workspace");
+    fs::create_dir_all(workspace.path()).expect("create temporary workspace");
 
     let mut plan = fixture_plan(
         &fixtures,
@@ -319,9 +358,9 @@ fn fixture_linux_seccomp_denies_socket_when_network_is_none() {
         ],
         NetLevel::None,
     );
-    plan.cwd = workspace.clone();
-    plan.profile.fs_read = vec![workspace.clone()];
-    plan.profile.fs_write = vec![workspace.clone()];
+    plan.cwd = workspace.path().to_path_buf();
+    plan.profile.fs_read = vec![workspace.path().to_path_buf()];
+    plan.profile.fs_write = vec![workspace.path().to_path_buf()];
 
     let sandbox = LinuxSandbox::new();
     let prepared = sandbox.prepare_with_env(
@@ -356,8 +395,8 @@ fn fixture_linux_seccomp_denies_socket_when_network_is_none() {
 #[test]
 fn fixture_linux_rlimit_file_size_denies_large_file_writes() {
     let fixtures = fixture_paths();
-    let workspace = unique_tmp_path("clawcrate_fixture_rlimit_workspace");
-    fs::create_dir_all(&workspace).expect("create temporary workspace");
+    let workspace = TempPathGuard::new("clawcrate_fixture_rlimit_workspace");
+    fs::create_dir_all(workspace.path()).expect("create temporary workspace");
 
     let mut plan = fixture_plan(
         &fixtures,
@@ -368,9 +407,9 @@ fn fixture_linux_rlimit_file_size_denies_large_file_writes() {
         ],
         NetLevel::None,
     );
-    plan.cwd = workspace.clone();
-    plan.profile.fs_read = vec![workspace.clone()];
-    plan.profile.fs_write = vec![workspace.clone()];
+    plan.cwd = workspace.path().to_path_buf();
+    plan.profile.fs_read = vec![workspace.path().to_path_buf()];
+    plan.profile.fs_write = vec![workspace.path().to_path_buf()];
     plan.profile.resources.max_output_bytes = 1024;
 
     let sandbox = LinuxSandbox::new();
@@ -395,7 +434,7 @@ fn fixture_linux_rlimit_file_size_denies_large_file_writes() {
         !output.status.success(),
         "large writes should be denied by RLIMIT_FSIZE"
     );
-    let written_size = fs::metadata(workspace.join("too-big.bin"))
+    let written_size = fs::metadata(workspace.path().join("too-big.bin"))
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     assert!(
