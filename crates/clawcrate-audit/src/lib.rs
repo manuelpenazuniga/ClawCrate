@@ -451,13 +451,16 @@ fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Sqli
 }
 
 fn read_ndjson_audit_events(path: &Path) -> Result<Vec<AuditEvent>, SqliteAuditIndexError> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = File::open(path).map_err(|source| SqliteAuditIndexError::ReadArtifact {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(SqliteAuditIndexError::ReadArtifact {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
     let reader = BufReader::new(file);
 
     let mut events = Vec::new();
@@ -508,6 +511,7 @@ fn audit_event_kind_label(event: &clawcrate_types::AuditEventKind) -> &'static s
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -521,7 +525,8 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::{
-        ArtifactWriter, SqliteAuditIndex, AUDIT_NDJSON, FS_DIFF_JSON, PLAN_JSON, RESULT_JSON,
+        ArtifactWriter, SqliteAuditIndex, SqliteAuditIndexError, AUDIT_NDJSON, FS_DIFF_JSON,
+        PLAN_JSON, RESULT_JSON,
     };
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
@@ -731,6 +736,35 @@ mod tests {
             .expect("index artifacts");
         assert!(!indexed.has_result);
         assert_eq!(indexed.event_count, 0);
+    }
+
+    #[test]
+    fn sqlite_indexer_preserves_non_not_found_ndjson_read_errors() {
+        let root = unique_tmp_dir("clawcrate_audit_sqlite_ndjson_read_error");
+        let writer = ArtifactWriter::new(&root, "exec-ndjson-error").expect("create writer");
+        writer.write_plan(&test_plan()).expect("write plan");
+
+        // Force non-NotFound open failure by making audit.ndjson a directory.
+        fs::create_dir_all(writer.audit_ndjson_path()).expect("create ndjson directory path");
+
+        let db_path = root.join("audit-index.sqlite3");
+        let mut index = SqliteAuditIndex::open(&db_path).expect("open sqlite index");
+        let error = index
+            .index_artifacts_dir(writer.artifacts_dir())
+            .expect_err("indexing must fail on non-file ndjson path");
+
+        match error {
+            SqliteAuditIndexError::ReadArtifact { path, source }
+            | SqliteAuditIndexError::ReadNdjsonLine {
+                path,
+                source,
+                line: _,
+            } => {
+                assert_eq!(path, writer.audit_ndjson_path());
+                assert_ne!(source.kind(), io::ErrorKind::NotFound);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     #[test]
