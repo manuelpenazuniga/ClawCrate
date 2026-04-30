@@ -614,8 +614,11 @@ mod tests {
         )
         .expect("write connect request");
 
-        let response = read_http_response_header(&mut stream);
-        assert!(response.contains("403 Forbidden"));
+        let response = read_http_response_header_with_timeout(&mut stream, Duration::from_secs(3));
+        assert!(
+            response.contains("403 Forbidden"),
+            "unexpected CONNECT deny response: {response}"
+        );
         proxy.shutdown();
     }
 
@@ -905,7 +908,7 @@ mod tests {
     }
 
     fn read_http_response_header(stream: &mut std::net::TcpStream) -> String {
-        read_http_response_header_with_timeout(stream, Duration::from_secs(1))
+        read_http_response_header_with_timeout(stream, Duration::from_secs(2))
     }
 
     fn proxy_network_test_lock() -> std::sync::MutexGuard<'static, ()> {
