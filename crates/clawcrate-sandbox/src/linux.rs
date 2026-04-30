@@ -761,13 +761,16 @@ fn apply_linux_seccomp_filter(context: &LinuxSeccompContext) -> io::Result<()> {
 fn seccomp_apply_error_as_io_error(source: SeccompApplyError) -> io::Error {
     // Keep pre_exec failure conversion allocator-free: emit deterministic raw errno values instead
     // of formatted strings so the child post-fork path remains async-signal-safe.
-    let errno = match source {
+    let errno = match &source {
         SeccompApplyError::Prctl(error) => error.raw_os_error().unwrap_or(libc::EINVAL),
         SeccompApplyError::Seccomp(error) => error.raw_os_error().unwrap_or(libc::EINVAL),
         SeccompApplyError::ThreadSync(_) => libc::EBUSY,
         SeccompApplyError::EmptyFilter => libc::EINVAL,
         SeccompApplyError::Backend(_) => libc::EINVAL,
     };
+    // Intentionally leak this value post-fork to avoid running Drop glue in the child pre-exec
+    // failure path, where touching allocator state is not async-signal-safe.
+    std::mem::forget(source);
     io::Error::from_raw_os_error(errno)
 }
 
@@ -1172,6 +1175,11 @@ mod tests {
 
         let empty_filter_error = seccomp_apply_error_as_io_error(seccompiler::Error::EmptyFilter);
         assert_eq!(empty_filter_error.raw_os_error(), Some(nix::libc::EINVAL));
+
+        let backend_error = seccomp_apply_error_as_io_error(seccompiler::Error::Backend(
+            seccompiler::BackendError::InvalidArgumentNumber,
+        ));
+        assert_eq!(backend_error.raw_os_error(), Some(nix::libc::EINVAL));
     }
 
     #[cfg(target_os = "linux")]
