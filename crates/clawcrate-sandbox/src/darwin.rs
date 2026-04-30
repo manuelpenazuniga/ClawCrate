@@ -9,6 +9,7 @@ use clawcrate_types::{ExecutionPlan, NetLevel};
 use thiserror::Error;
 
 use crate::env_scrub::scrub_environment;
+use crate::path_normalize::{home_from_env_pairs, normalize_path_patterns, normalize_paths};
 
 #[derive(Debug, Clone)]
 pub struct DarwinSandboxPaths {
@@ -83,15 +84,15 @@ impl DarwinSandbox {
             &plan.profile.env_scrub,
             &plan.profile.env_passthrough,
         );
-        let home = home_from_env(&scrubbed.kept);
+        let home = home_from_env_pairs(&scrubbed.kept);
 
         let mut prepared = PreparedDarwinSandbox {
             execution_id: plan.id.clone(),
             command: plan.command.clone(),
             cwd: plan.cwd.clone(),
-            fs_read: normalize_prepared_paths(&plan.cwd, &plan.profile.fs_read, home.as_deref()),
-            fs_write: normalize_prepared_paths(&plan.cwd, &plan.profile.fs_write, home.as_deref()),
-            fs_deny: normalize_deny_patterns(&plan.cwd, &plan.profile.fs_deny, home.as_deref()),
+            fs_read: normalize_paths(&plan.cwd, &plan.profile.fs_read, home.as_deref()),
+            fs_write: normalize_paths(&plan.cwd, &plan.profile.fs_write, home.as_deref()),
+            fs_deny: normalize_path_patterns(&plan.cwd, &plan.profile.fs_deny, home.as_deref()),
             net: plan.profile.net.clone(),
             scrubbed_env: scrubbed.kept,
             scrubbed_keys: scrubbed.removed,
@@ -236,58 +237,6 @@ fn sanitize_identifier_component(value: &str, max_len: usize, fallback: &str) ->
     } else {
         sanitized
     }
-}
-
-fn home_from_env(env: &[(String, String)]) -> Option<PathBuf> {
-    env.iter()
-        .find_map(|(key, value)| (key == "HOME" && !value.is_empty()).then(|| PathBuf::from(value)))
-}
-
-fn expand_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
-    let path_str = path.to_string_lossy();
-    if path_str == "~" {
-        if let Some(home_path) = home {
-            return home_path.to_path_buf();
-        }
-    }
-    if let Some(rest) = path_str.strip_prefix("~/") {
-        if let Some(home_path) = home {
-            return home_path.join(rest);
-        }
-    }
-    path.to_path_buf()
-}
-
-fn resolve_prepared_path(cwd: &Path, path: &Path, home: Option<&Path>) -> PathBuf {
-    let expanded = expand_home_path(path, home);
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        cwd.join(expanded)
-    }
-}
-
-fn normalize_prepared_paths(cwd: &Path, paths: &[PathBuf], home: Option<&Path>) -> Vec<PathBuf> {
-    paths
-        .iter()
-        .map(|path| resolve_prepared_path(cwd, path, home))
-        .collect()
-}
-
-fn normalize_deny_pattern(cwd: &Path, pattern: &str, home: Option<&Path>) -> String {
-    let expanded = expand_home_path(Path::new(pattern), home);
-    if expanded.is_absolute() {
-        expanded.to_string_lossy().to_string()
-    } else {
-        cwd.join(expanded).to_string_lossy().to_string()
-    }
-}
-
-fn normalize_deny_patterns(cwd: &Path, patterns: &[String], home: Option<&Path>) -> Vec<String> {
-    patterns
-        .iter()
-        .map(|pattern| normalize_deny_pattern(cwd, pattern, home))
-        .collect()
 }
 
 fn generate_sbpl_profile(prepared: &PreparedDarwinSandbox, home: Option<&Path>) -> String {
