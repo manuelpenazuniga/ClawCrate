@@ -1753,11 +1753,7 @@ where
 
 #[cfg(unix)]
 fn send_termination_signal(child: &Child, process_group_id: Option<i32>) -> Result<()> {
-    send_unix_signal_to_pid(child.id() as i32, Signal::SIGTERM)?;
-    if let Some(group_id) = eligible_process_group_id(process_group_id) {
-        send_unix_signal_to_process_group(group_id, Signal::SIGTERM)?;
-    }
-    Ok(())
+    send_unix_signal_with_group_fallback(child.id() as i32, process_group_id, Signal::SIGTERM)
 }
 
 #[cfg(not(unix))]
@@ -1769,11 +1765,7 @@ fn send_termination_signal(child: &mut Child, _process_group_id: Option<i32>) ->
 
 #[cfg(unix)]
 fn send_kill_signal(child: &Child, process_group_id: Option<i32>) -> Result<()> {
-    send_unix_signal_to_pid(child.id() as i32, Signal::SIGKILL)?;
-    if let Some(group_id) = eligible_process_group_id(process_group_id) {
-        send_unix_signal_to_process_group(group_id, Signal::SIGKILL)?;
-    }
-    Ok(())
+    send_unix_signal_with_group_fallback(child.id() as i32, process_group_id, Signal::SIGKILL)
 }
 
 #[cfg(not(unix))]
@@ -1808,6 +1800,51 @@ fn send_unix_signal_to_process_group(process_group_id: i32, signal: Signal) -> R
 #[cfg(unix)]
 fn eligible_process_group_id(process_group_id: Option<i32>) -> Option<i32> {
     process_group_id.filter(|group_id| *group_id > 1)
+}
+
+#[cfg(unix)]
+fn send_unix_signal_with_group_fallback(
+    pid_raw: i32,
+    process_group_id: Option<i32>,
+    signal: Signal,
+) -> Result<()> {
+    send_unix_signal_with_group_fallback_impl(
+        pid_raw,
+        process_group_id,
+        signal,
+        send_unix_signal_to_pid,
+        send_unix_signal_to_process_group,
+    )
+}
+
+#[cfg(unix)]
+fn send_unix_signal_with_group_fallback_impl<F, G>(
+    pid_raw: i32,
+    process_group_id: Option<i32>,
+    signal: Signal,
+    send_pid: F,
+    send_process_group: G,
+) -> Result<()>
+where
+    F: Fn(i32, Signal) -> Result<()>,
+    G: Fn(i32, Signal) -> Result<()>,
+{
+    let pid_result = send_pid(pid_raw, signal);
+    let process_group_result = if let Some(group_id) = eligible_process_group_id(process_group_id) {
+        send_process_group(group_id, signal).map(Some)
+    } else {
+        Ok(None)
+    };
+
+    match (pid_result, process_group_result) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Ok(()), Err(group_error)) => Err(group_error),
+        (Err(_), Ok(Some(()))) => Ok(()),
+        (Err(pid_error), Err(group_error)) => Err(anyhow!(
+            "failed to send {signal:?} to pid {pid_raw} and process group fallback failed: pid_error={pid_error}; group_error={group_error}"
+        )),
+        (Err(pid_error), Ok(None)) => Err(pid_error),
+    }
 }
 
 fn execution_status(status: &ExitStatus, termination: RunTermination) -> Status {
@@ -2743,6 +2780,7 @@ fn print_human_plan(plan: &ExecutionPlan, _output: &OutputOptions) {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
     use std::fs;
     use std::io;
     #[cfg(unix)]
@@ -2754,8 +2792,6 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    #[cfg(unix)]
-    use super::eligible_process_group_id;
     use super::{
         api_route_uses_delegated_worker, apply_replica_sync_back, build_api_cli_args,
         build_execution_plan, build_pennyprompt_bridge_response_from_input_result,
@@ -2771,6 +2807,8 @@ mod tests {
         CommandArgs, Commands, PennyPromptBridgeRequest, QueueEnqueueError, ReplicaSyncChange,
         RunTermination,
     };
+    #[cfg(unix)]
+    use super::{eligible_process_group_id, send_unix_signal_with_group_fallback_impl};
     use chrono::Utc;
     use clap::Parser;
     use clawcrate_audit::ArtifactWriter;
@@ -2780,6 +2818,8 @@ mod tests {
         Actor, AuditEvent, AuditEventKind, DefaultMode, ExecutionPlan, NetLevel, Platform,
         ResolvedProfile, ResourceLimits, Status, SystemCapabilities, WorkspaceMode,
     };
+    #[cfg(unix)]
+    use nix::sys::signal::Signal;
     use tiny_http::{Header, Method};
 
     fn unique_tmp_dir(prefix: &str) -> PathBuf {
@@ -4019,6 +4059,54 @@ mod tests {
         assert_eq!(eligible_process_group_id(Some(1)), None);
         assert_eq!(eligible_process_group_id(Some(2)), Some(2));
         assert_eq!(eligible_process_group_id(Some(99)), Some(99));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_fallback_attempts_process_group_when_pid_signal_fails() {
+        let result = send_unix_signal_with_group_fallback_impl(
+            1234,
+            Some(44),
+            Signal::SIGTERM,
+            |_pid, _signal| Err(anyhow!("pid failed")),
+            |_pgid, _signal| Ok(()),
+        );
+
+        assert!(result.is_ok(), "process-group fallback should recover");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_fallback_returns_pid_error_when_no_safe_group_exists() {
+        let result = send_unix_signal_with_group_fallback_impl(
+            1234,
+            Some(1),
+            Signal::SIGTERM,
+            |_pid, _signal| Err(anyhow!("pid failed")),
+            |_pgid, _signal| Ok(()),
+        );
+
+        assert!(
+            result.is_err(),
+            "pid error should surface without safe fallback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_fallback_surfaces_combined_error_when_both_paths_fail() {
+        let result = send_unix_signal_with_group_fallback_impl(
+            1234,
+            Some(44),
+            Signal::SIGKILL,
+            |_pid, _signal| Err(anyhow!("pid failed")),
+            |_pgid, _signal| Err(anyhow!("group failed")),
+        );
+
+        let error = result.expect_err("both failures should return error");
+        let message = error.to_string();
+        assert!(message.contains("pid_error=pid failed"));
+        assert!(message.contains("group_error=group failed"));
     }
 
     #[cfg(unix)]
