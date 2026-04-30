@@ -2387,10 +2387,9 @@ fn handle_bridge(args: BridgeArgs, _output: &OutputOptions) -> Result<()> {
 
 fn handle_pennyprompt_bridge(config: PennyPromptBridgeArgs) -> Result<()> {
     let mut input = String::new();
-    io::stdin().read_to_string(&mut input).map_err(|source| {
-        anyhow!("failed to read PennyPrompt bridge payload from stdin: {source}")
-    })?;
-    let response = build_pennyprompt_bridge_response_with_executor(&input, execute_cli_json);
+    let read_result = io::stdin().read_to_string(&mut input).map(|_| input);
+    let response =
+        build_pennyprompt_bridge_response_from_input_result(read_result, execute_cli_json);
 
     if config.pretty {
         println!("{}", serde_json::to_string_pretty(&response)?);
@@ -2455,6 +2454,22 @@ where
                 stderr: error.stderr,
             }),
         },
+    }
+}
+
+fn build_pennyprompt_bridge_response_from_input_result<F>(
+    input_result: io::Result<String>,
+    executor: F,
+) -> PennyPromptBridgeResponse
+where
+    F: Fn(&[String]) -> std::result::Result<serde_json::Value, ApiCommandError>,
+{
+    match input_result {
+        Ok(input) => build_pennyprompt_bridge_response_with_executor(&input, executor),
+        Err(source) => pennyprompt_validation_error_response(
+            "unknown".to_string(),
+            format!("failed to read PennyPrompt bridge payload from stdin: {source}"),
+        ),
     }
 }
 
@@ -2729,6 +2744,7 @@ fn print_human_plan(plan: &ExecutionPlan, _output: &OutputOptions) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io;
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -2742,12 +2758,12 @@ mod tests {
     use super::eligible_process_group_id;
     use super::{
         api_route_uses_delegated_worker, apply_replica_sync_back, build_api_cli_args,
-        build_execution_plan, build_pennyprompt_bridge_response_with_executor,
-        build_pennyprompt_cli_args, collect_syncable_replica_changes,
-        command_appears_to_need_network, constant_time_eq, copy_workspace_with_default_exclusions,
-        detect_out_of_profile_requests, doctor_rows, execution_status,
-        execution_status_from_exit_status, extract_bearer_token, extract_host_from_reference,
-        is_replica_sync_back_interactive, load_replica_ignore_config,
+        build_execution_plan, build_pennyprompt_bridge_response_from_input_result,
+        build_pennyprompt_bridge_response_with_executor, build_pennyprompt_cli_args,
+        collect_syncable_replica_changes, command_appears_to_need_network, constant_time_eq,
+        copy_workspace_with_default_exclusions, detect_out_of_profile_requests, doctor_rows,
+        execution_status, execution_status_from_exit_status, extract_bearer_token,
+        extract_host_from_reference, is_replica_sync_back_interactive, load_replica_ignore_config,
         materialize_workspace_for_execution, request_authorized, resolve_api_route,
         resolve_execution_path, run_monitored_child, run_monitored_child_with_signal_poller,
         select_default_mode, serialize_api_payload, should_exclude_default_replica_path,
@@ -3202,6 +3218,24 @@ mod tests {
             value.get("action").and_then(serde_json::Value::as_str),
             Some("unknown")
         );
+    }
+
+    #[test]
+    fn pennyprompt_bridge_stdin_read_failure_returns_structured_error_response() {
+        let response = build_pennyprompt_bridge_response_from_input_result(
+            Err(io::Error::other("simulated stdin failure")),
+            |_args| panic!("executor should not run on stdin read failure"),
+        );
+        assert!(!response.ok);
+        assert_eq!(response.action, "unknown");
+        let error = response.error.expect("structured error");
+        assert!(error
+            .message
+            .contains("failed to read PennyPrompt bridge payload from stdin"));
+        assert!(error.message.contains("simulated stdin failure"));
+        assert!(error.stdout.is_empty());
+        assert!(error.stderr.is_empty());
+        assert_eq!(error.exit_code, None);
     }
 
     #[test]
