@@ -10,14 +10,18 @@ Track technical triage for Gemini Code Assist findings across merged PRs
 
 ## Scope Reviewed
 
+Review wave scope: PRs `#82`-`#100` (inclusive), 19 PRs total.
+
 PRs reviewed:
 
 - `#82`
 - `#83`
 - `#84`
 - `#85`
+- `#86`
 - `#87`
 - `#88`
+- `#89`
 - `#90`
 - `#91`
 - `#92`
@@ -57,8 +61,8 @@ All follow-up issues created from this triage wave are now closed:
 
 Deferred recommendations are tracked in:
 
-- issue `#113`
-- `docs/technical-note-gemini-deferred-pr82-pr100.md`
+- [Issue #113](https://github.com/manuelpenazuniga/ClawCrate/issues/113)
+- [Deferred Gemini Recommendations for PRs #82-#100](technical-note-gemini-deferred-pr82-pr100.md)
 
 This keeps security-correctness and behavioral hardening work prioritized while
 preserving a clear cleanup backlog.
@@ -69,4 +73,5 @@ Done criteria from issue `#112`:
 
 - Issues `#101`-`#111` triaged and resolved in the tracker: complete.
 - Deferred/non-critical recommendations split into dedicated note: complete via
-  `#113` and `docs/technical-note-gemini-deferred-pr82-pr100.md`.
+  [#113](https://github.com/manuelpenazuniga/ClawCrate/issues/113) and
+  [docs/technical-note-gemini-deferred-pr82-pr100.md](technical-note-gemini-deferred-pr82-pr100.md).

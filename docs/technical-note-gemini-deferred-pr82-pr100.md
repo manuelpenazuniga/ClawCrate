@@ -9,21 +9,22 @@ deferred because they are non-critical for the current execution order.
 
 ## Scope Source
 
-- Review wave tracked in `#112`.
-- Deferred bucket tracked in `#113` (this note).
+- Review wave tracked in
+  [Issue #112](https://github.com/manuelpenazuniga/ClawCrate/issues/112).
+- Deferred bucket tracked in
+  [Issue #113](https://github.com/manuelpenazuniga/ClawCrate/issues/113)
+  (this note).
 
 ## Deferred Recommendations (Non-Blocking)
 
-1. Replica copy micro-optimizations and idiomatic cleanup.
-- Examples: `target_path` allocation timing, helper signature polish.
-
-2. Test utility refactors and cleanup.
-- Examples: `unique_tmp_dir` deduplication, selective `tempfile` migration,
-  golden-map ordering cleanup where behavior is unchanged.
-
-3. Documentation polish-only cleanups.
-- Examples: markdown heading hierarchy adjustments and structure-only edits that
-  do not change security/behavioral guidance.
+1. Replica copy micro-optimizations and idiomatic cleanup (for example:
+   `target_path` allocation timing, helper signature polish).
+2. Test utility refactors and cleanup (for example: `unique_tmp_dir`
+   deduplication, selective `tempfile` migration, golden-map ordering cleanup
+   where behavior is unchanged).
+3. Documentation polish-only cleanups (for example: markdown heading hierarchy
+   adjustments and structure-only edits that do not change security/behavioral
+   guidance).
 
 ## Why Deferred
 
@@ -52,6 +53,11 @@ Deferred items should be resumed when all of the following are true:
 
 ## Related
 
-- Primary triage note: `docs/technical-note-gemini-triage-pr82-pr100.md`
-- Tracking issues: `#112`, `#113`
-- Existing hardening context: `#69`, `#75`
+- Primary triage note:
+  [docs/technical-note-gemini-triage-pr82-pr100.md](technical-note-gemini-triage-pr82-pr100.md)
+- Tracking issues:
+  [#112](https://github.com/manuelpenazuniga/ClawCrate/issues/112),
+  [#113](https://github.com/manuelpenazuniga/ClawCrate/issues/113)
+- Existing hardening context:
+  [#69](https://github.com/manuelpenazuniga/ClawCrate/issues/69),
+  [#75](https://github.com/manuelpenazuniga/ClawCrate/issues/75)
