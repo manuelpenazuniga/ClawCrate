@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1939,6 +1939,82 @@ struct ApiDelegatedRequest {
     route: ApiRoute,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum QueueEnqueueError<T> {
+    Full(T),
+    Closed(T),
+}
+
+#[derive(Debug)]
+struct BoundedWorkQueue<T> {
+    capacity: usize,
+    state: Mutex<BoundedWorkQueueState<T>>,
+    available: Condvar,
+}
+
+#[derive(Debug)]
+struct BoundedWorkQueueState<T> {
+    queue: VecDeque<T>,
+    closed: bool,
+}
+
+impl<T> BoundedWorkQueue<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: Mutex::new(BoundedWorkQueueState {
+                queue: VecDeque::new(),
+                closed: false,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn try_enqueue(&self, item: T) -> Result<(), QueueEnqueueError<T>> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Err(QueueEnqueueError::Closed(item)),
+        };
+        if state.closed {
+            return Err(QueueEnqueueError::Closed(item));
+        }
+        if state.queue.len() >= self.capacity {
+            return Err(QueueEnqueueError::Full(item));
+        }
+        state.queue.push_back(item);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn dequeue_blocking(&self) -> Option<T> {
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if let Some(item) = state.queue.pop_front() {
+                return Some(item);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.available.wait(state).ok()?;
+        }
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            self.available.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.queue.len())
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ApiCommandError {
     error: String,
@@ -1954,25 +2030,17 @@ fn handle_api(args: ApiArgs, output: &OutputOptions) -> Result<()> {
     let token = resolve_api_token(&args)?;
     let server = Server::http(&args.bind)
         .map_err(|source| anyhow!("failed to bind local API on {}: {source}", args.bind))?;
-    let (delegated_tx, delegated_rx) =
-        mpsc::sync_channel::<ApiDelegatedRequest>(API_MAX_QUEUE_DEPTH);
-    let delegated_rx = Arc::new(Mutex::new(delegated_rx));
+    let delegated_queue = Arc::new(BoundedWorkQueue::<ApiDelegatedRequest>::new(
+        API_MAX_QUEUE_DEPTH,
+    ));
 
     for _ in 0..API_MAX_WORKERS {
-        let delegated_rx = Arc::clone(&delegated_rx);
+        let delegated_queue = Arc::clone(&delegated_queue);
         let output = *output;
-        thread::spawn(move || loop {
-            let delegated = {
-                let receiver = match delegated_rx.lock() {
-                    Ok(receiver) => receiver,
-                    Err(_) => return,
-                };
-                match receiver.recv() {
-                    Ok(request) => request,
-                    Err(_) => return,
-                }
-            };
-            handle_api_delegated_route(delegated.request, delegated.route, &output);
+        thread::spawn(move || {
+            while let Some(delegated) = delegated_queue.dequeue_blocking() {
+                handle_api_delegated_route(delegated.request, delegated.route, &output);
+            }
         });
     }
 
@@ -1980,8 +2048,9 @@ fn handle_api(args: ApiArgs, output: &OutputOptions) -> Result<()> {
     println!("clawcrate api listening on http://{}", args.bind);
 
     for request in server.incoming_requests() {
-        dispatch_api_request(request, &token, output, &delegated_tx);
+        dispatch_api_request(request, &token, output, &delegated_queue);
     }
+    delegated_queue.close();
 
     Ok(())
 }
@@ -2005,7 +2074,7 @@ fn dispatch_api_request(
     request: Request,
     token: &str,
     output: &OutputOptions,
-    delegated_tx: &mpsc::SyncSender<ApiDelegatedRequest>,
+    delegated_queue: &BoundedWorkQueue<ApiDelegatedRequest>,
 ) {
     if !request_authorized(request.headers(), token) {
         respond_api_json(
@@ -2033,9 +2102,9 @@ fn dispatch_api_request(
         return;
     }
 
-    match delegated_tx.try_send(ApiDelegatedRequest { request, route }) {
+    match delegated_queue.try_enqueue(ApiDelegatedRequest { request, route }) {
         Ok(()) => {}
-        Err(mpsc::TrySendError::Full(ApiDelegatedRequest { request, .. })) => {
+        Err(QueueEnqueueError::Full(ApiDelegatedRequest { request, .. })) => {
             verbose_log(
                 output,
                 1,
@@ -2047,7 +2116,7 @@ fn dispatch_api_request(
                 &serde_json::json!({ "error": "server busy", "detail": "too many in-flight API requests" }),
             );
         }
-        Err(mpsc::TrySendError::Disconnected(ApiDelegatedRequest { request, .. })) => {
+        Err(QueueEnqueueError::Closed(ApiDelegatedRequest { request, .. })) => {
             respond_api_json(
                 request,
                 503,
@@ -2664,6 +2733,9 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
@@ -2679,8 +2751,9 @@ mod tests {
         materialize_workspace_for_execution, request_authorized, resolve_api_route,
         resolve_execution_path, run_monitored_child, run_monitored_child_with_signal_poller,
         select_default_mode, serialize_api_payload, should_exclude_default_replica_path,
-        should_use_color, ApiCommandRequest, ApiRoute, BridgeTarget, Cli, CommandArgs, Commands,
-        PennyPromptBridgeRequest, ReplicaSyncChange, RunTermination,
+        should_use_color, ApiCommandRequest, ApiRoute, BoundedWorkQueue, BridgeTarget, Cli,
+        CommandArgs, Commands, PennyPromptBridgeRequest, QueueEnqueueError, ReplicaSyncChange,
+        RunTermination,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -2876,6 +2949,82 @@ mod tests {
         assert!(api_route_uses_delegated_worker(ApiRoute::Doctor));
         assert!(api_route_uses_delegated_worker(ApiRoute::Plan));
         assert!(api_route_uses_delegated_worker(ApiRoute::Run));
+    }
+
+    #[test]
+    fn bounded_work_queue_enforces_capacity_and_closed_state() {
+        let queue = BoundedWorkQueue::new(1);
+
+        assert!(queue.try_enqueue(10usize).is_ok());
+        assert_eq!(queue.len(), 1);
+        assert!(matches!(
+            queue.try_enqueue(20usize),
+            Err(QueueEnqueueError::Full(20))
+        ));
+
+        assert_eq!(queue.dequeue_blocking(), Some(10usize));
+        queue.close();
+        assert!(matches!(
+            queue.try_enqueue(30usize),
+            Err(QueueEnqueueError::Closed(30))
+        ));
+        assert_eq!(queue.dequeue_blocking(), None);
+    }
+
+    #[test]
+    fn bounded_work_queue_allows_parallel_worker_processing() {
+        let queue = Arc::new(BoundedWorkQueue::new(64));
+        let active_workers = Arc::new(AtomicUsize::new(0));
+        let max_active_workers = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let worker_count = 4usize;
+        let job_count = 16usize;
+
+        let mut handles = Vec::new();
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&queue);
+            let active_workers = Arc::clone(&active_workers);
+            let max_active_workers = Arc::clone(&max_active_workers);
+            let completed = Arc::clone(&completed);
+
+            handles.push(thread::spawn(move || {
+                while queue.dequeue_blocking().is_some() {
+                    let active_now = active_workers.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active_workers.fetch_max(active_now, Ordering::SeqCst);
+
+                    thread::sleep(Duration::from_millis(20));
+
+                    active_workers.fetch_sub(1, Ordering::SeqCst);
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+
+        for job in 0..job_count {
+            queue
+                .try_enqueue(job)
+                .expect("queue should accept work while below capacity");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while completed.load(Ordering::SeqCst) < job_count && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        queue.close();
+        for handle in handles {
+            handle.join().expect("worker must join cleanly");
+        }
+
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            job_count,
+            "all queued jobs must complete"
+        );
+        assert!(
+            max_active_workers.load(Ordering::SeqCst) > 1,
+            "expected parallel servicing across multiple workers"
+        );
     }
 
     #[test]
