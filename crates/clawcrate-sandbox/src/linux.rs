@@ -649,33 +649,53 @@ fn apply_linux_landlock_restrictions(context: &LinuxLandlockContext) -> io::Resu
             )
         };
         if add_result < 0 {
+            let add_errno = Errno::last_raw();
             // SAFETY: closing best-effort descriptor obtained from create_ruleset.
             let _ = unsafe { libc::close(ruleset_fd) };
-            return Err(io::Error::from_raw_os_error(Errno::last_raw()));
+            return Err(io::Error::from_raw_os_error(add_errno));
         }
     }
 
     // SAFETY: prctl contract is satisfied for PR_SET_NO_NEW_PRIVS.
     let prctl_result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if prctl_result != 0 {
+        let prctl_errno = Errno::last_raw();
         // SAFETY: closing best-effort descriptor obtained from create_ruleset.
         let _ = unsafe { libc::close(ruleset_fd) };
-        return Err(io::Error::from_raw_os_error(Errno::last_raw()));
+        return Err(io::Error::from_raw_os_error(prctl_errno));
     }
 
     // SAFETY: syscall args follow landlock_restrict_self ABI.
     let restrict_result =
         unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd, 0u32) };
+    let restrict_errno = if restrict_result < 0 {
+        Some(Errno::last_raw())
+    } else {
+        None
+    };
     // SAFETY: closing best-effort descriptor obtained from create_ruleset.
     let close_result = unsafe { libc::close(ruleset_fd) };
-    if restrict_result < 0 {
-        return Err(io::Error::from_raw_os_error(Errno::last_raw()));
-    }
-    if close_result != 0 {
-        return Err(io::Error::from_raw_os_error(Errno::last_raw()));
+    let close_errno = if close_result != 0 {
+        Some(Errno::last_raw())
+    } else {
+        None
+    };
+    if let Some(error) = landlock_errno_to_io_error(restrict_errno, close_errno) {
+        return Err(error);
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_errno_to_io_error(
+    primary_errno: Option<i32>,
+    cleanup_errno: Option<i32>,
+) -> Option<io::Error> {
+    if let Some(errno) = primary_errno {
+        return Some(io::Error::from_raw_os_error(errno));
+    }
+    cleanup_errno.map(io::Error::from_raw_os_error)
 }
 
 #[cfg(target_os = "linux")]
@@ -733,11 +753,11 @@ mod tests {
         Actor, DefaultMode, ExecutionPlan, NetLevel, ResolvedProfile, ResourceLimits, WorkspaceMode,
     };
 
-    #[cfg(target_os = "linux")]
-    use super::seccomp_apply_error_as_io_error;
     use super::{
         apply_enforcement_steps, EnforcementStep, LinuxEnforcer, LinuxSandbox, PreparedLinuxSandbox,
     };
+    #[cfg(target_os = "linux")]
+    use super::{landlock_errno_to_io_error, seccomp_apply_error_as_io_error};
 
     #[derive(Default)]
     struct MockEnforcer {
@@ -1082,5 +1102,21 @@ mod tests {
 
         let empty_filter_error = seccomp_apply_error_as_io_error(seccompiler::Error::EmptyFilter);
         assert_eq!(empty_filter_error.raw_os_error(), Some(nix::libc::EINVAL));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_error_mapping_preserves_primary_errno_over_cleanup_errno() {
+        let error = landlock_errno_to_io_error(Some(nix::libc::EPERM), Some(nix::libc::EBADF))
+            .expect("primary errno must produce io error");
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EPERM));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_error_mapping_falls_back_to_cleanup_errno_when_primary_missing() {
+        let error = landlock_errno_to_io_error(None, Some(nix::libc::EBADF))
+            .expect("cleanup errno must produce io error");
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EBADF));
     }
 }
