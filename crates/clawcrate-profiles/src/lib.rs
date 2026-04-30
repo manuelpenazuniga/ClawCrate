@@ -8,6 +8,10 @@ use clawcrate_types::{DefaultMode, NetLevel, ResolvedProfile, ResourceLimits};
 use serde::Deserialize;
 
 pub const BUILTIN_PROFILE_NAMES: [&str; 4] = ["safe", "build", "install", "open"];
+const BUILTIN_SAFE_PROFILE: &str = include_str!("../../../profiles/safe.yaml");
+const BUILTIN_BUILD_PROFILE: &str = include_str!("../../../profiles/build.yaml");
+const BUILTIN_INSTALL_PROFILE: &str = include_str!("../../../profiles/install.yaml");
+const BUILTIN_OPEN_PROFILE: &str = include_str!("../../../profiles/open.yaml");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectedStack {
@@ -241,7 +245,10 @@ impl ProfileResolver {
         }
 
         let file_path = entry.file_path(relative_to, &self.profiles_dir);
-        let profile = load_raw_profile(&file_path)?;
+        let profile = match entry {
+            ProfileEntry::Builtin(name) => load_builtin_profile(name, &file_path)?,
+            ProfileEntry::Path(_) => load_raw_profile(&file_path)?,
+        };
 
         let resolved = if let Some(base) = profile.extends.clone() {
             let base_entry = ProfileEntry::from_reference(&base);
@@ -584,6 +591,25 @@ fn looks_like_path(reference: &str) -> bool {
         || reference.contains(std::path::MAIN_SEPARATOR)
 }
 
+fn load_builtin_profile(name: &str, source_path: &Path) -> Result<RawProfile, ProfileError> {
+    let content = builtin_profile_content(name)
+        .ok_or_else(|| ProfileError::ProfileNotFound(name.to_string()))?;
+    serde_yaml::from_str(content).map_err(|source| ProfileError::ParseFile {
+        path: source_path.to_path_buf(),
+        source,
+    })
+}
+
+fn builtin_profile_content(name: &str) -> Option<&'static str> {
+    match name {
+        "safe" => Some(BUILTIN_SAFE_PROFILE),
+        "build" => Some(BUILTIN_BUILD_PROFILE),
+        "install" => Some(BUILTIN_INSTALL_PROFILE),
+        "open" => Some(BUILTIN_OPEN_PROFILE),
+        _ => None,
+    }
+}
+
 fn load_raw_profile(path: &Path) -> Result<RawProfile, ProfileError> {
     if !path.exists() {
         return Err(ProfileError::ProfileNotFound(
@@ -683,6 +709,18 @@ mod tests {
             let resolved = resolver
                 .resolve_builtin(profile)
                 .expect("load built-in profile");
+            assert_eq!(resolved.name, profile);
+        }
+    }
+
+    #[test]
+    fn loads_builtin_profiles_without_repository_profiles_dir() {
+        let missing_profiles_dir = unique_tmp_dir("clawcrate_profiles_missing_dir").join("missing");
+        let resolver = ProfileResolver::new(&missing_profiles_dir);
+        for profile in ["safe", "build", "install", "open"] {
+            let resolved = resolver
+                .resolve_builtin(profile)
+                .expect("load embedded built-in profile");
             assert_eq!(resolved.name, profile);
         }
     }
