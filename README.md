@@ -1,9 +1,15 @@
 <p align="center">
-  <h1 align="center">ClawCrate</h1>
-  <p align="center"><strong>Secure execution for AI agents.</strong></p>
-  <p align="center">
-    Your agent runs free. Your secrets stay locked.
-  </p>
+  <img src="./img/ClawCrate_logo.jpg" alt="ClawCrate logo" width="320" />
+</p>
+
+<h1 align="center">ClawCrate</h1>
+
+<p align="center">
+  <strong>Secure execution for AI agents.</strong>
+</p>
+
+<p align="center">
+  Your agent runs free. Your secrets stay locked.
 </p>
 
 <p align="center">
