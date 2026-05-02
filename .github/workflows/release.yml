@@ -129,31 +129,24 @@ jobs:
             echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download install script from release
-        run: |
-          curl -fsSL \
-            "https://github.com/${{ github.repository }}/releases/download/${{ steps.release_meta.outputs.tag }}/install.sh" \
-            -o /tmp/clawcrate-install.sh
-          chmod +x /tmp/clawcrate-install.sh
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release_meta.outputs.tag }}
 
-      - name: Install from published release
+      - name: Run release smoke validation
         env:
-          CLAWCRATE_INSTALL_DIR: ${{ runner.temp }}/clawcrate-bin
+          CLAWCRATE_VALIDATE_REPORT_DIR: ${{ runner.temp }}/release-smoke-${{ matrix.os }}
         run: |
-          /tmp/clawcrate-install.sh \
+          bash scripts/validate_release_smoke.sh \
             --repo "${{ github.repository }}" \
             --version "${{ steps.release_meta.outputs.tag }}" \
-            --install-dir "${CLAWCRATE_INSTALL_DIR}"
+            --report-dir "${CLAWCRATE_VALIDATE_REPORT_DIR}"
 
-      - name: Verify version and doctor
-        env:
-          CLAWCRATE_INSTALL_DIR: ${{ runner.temp }}/clawcrate-bin
-        run: |
-          "${CLAWCRATE_INSTALL_DIR}/clawcrate" --version
-          "${CLAWCRATE_INSTALL_DIR}/clawcrate" doctor --json > "${RUNNER_TEMP}/doctor-${{ matrix.os }}.json"
-
-      - name: Upload doctor artifact
+      - name: Upload release smoke report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: installer-smoke-doctor-${{ matrix.os }}
-          path: ${{ runner.temp }}/doctor-${{ matrix.os }}.json
+          name: release-smoke-${{ matrix.os }}
+          path: ${{ runner.temp }}/release-smoke-${{ matrix.os }}
+          if-no-files-found: warn
