@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./img/ClawCrate_logo.jpg" alt="ClawCrate logo" width="320" />
+  <img src="./img/ClawCrate_logo.png" alt="ClawCrate logo" width="320" />
 </p>
 
 <h1 align="center">ClawCrate</h1>
