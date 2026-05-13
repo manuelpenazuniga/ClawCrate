@@ -8,6 +8,18 @@ with alpha pre-release tags.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-04-30
+
+### Fixed
+- Process-group signal fallback for deterministic SIGINT handling under nested child trees.
+- seccomp pre-exec errors now propagate correctly instead of being silently swallowed.
+- Symlink-safe temp fixture cleanup in sandbox integration tests.
+- Darwin-only path pattern normalization gated correctly so cross-platform clippy stays clean.
+
+### Changed
+- Centralized backend path normalization helpers (refactor, no behaviour change).
+- Workspace crate versions aligned to `0.1.0-alpha.2` before tag cut.
+
 ## [0.1.0-alpha.1] - 2026-04-30
 
 ### Added

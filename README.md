@@ -316,7 +316,7 @@ The latest alpha release is published on GitHub Releases. Quickstart installs fr
 ClawCrate is MIT licensed. Contributions welcome.
 
 ```bash
-git clone https://github.com/anthropic-ai/clawcrate.git
+git clone https://github.com/manuelpenazuniga/ClawCrate.git
 cd clawcrate
 cargo build --workspace
 cargo test --workspace
