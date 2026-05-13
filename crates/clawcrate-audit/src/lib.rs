@@ -56,14 +56,26 @@ fn read_previous_hash(path: &Path) -> String {
         .unwrap_or_else(|| GENESIS_HASH.to_string())
 }
 
-/// Computes `sha256(canonical_json(event) || previous_hash)`.
+/// Serializes `event` to RFC 8785 (JSON Canonicalization Scheme) canonical form.
 ///
-/// # Note on canonicalization
-/// This uses `serde_json::to_string` as a temporary canonical form.
-/// Issue #229 will replace this with RFC 8785 (JCS) for full spec
-/// compliance with IETF draft-sharif-agent-audit-trail-00.
+/// RFC 8785 requirements applied:
+/// - **No insignificant whitespace** — `serde_json` compact output.
+/// - **Lexicographic key ordering** — `serde_json::Map` is backed by `BTreeMap` when
+///   the crate is compiled without the `preserve_order` feature (our configuration),
+///   so `to_value()` produces sorted keys at every nesting level automatically.
+/// - **Float formatting (§3.2.2)** — not applicable: `AuditEvent` has no `f32`/`f64` fields.
+///
+/// Any change to this function's output is a breaking change to existing audit trails.
+pub fn canonical_json(event: &AuditEvent) -> String {
+    // to_value produces Value::Object backed by BTreeMap — lexicographically sorted keys
+    // at every nesting level, with no whitespace in the subsequent to_string call.
+    let value = serde_json::to_value(event).expect("AuditEvent serialization is infallible");
+    serde_json::to_string(&value).expect("Value serialization is infallible")
+}
+
+/// Computes `sha256(canonical_json(event) || previous_hash)`.
 pub(crate) fn compute_event_hash(event: &AuditEvent, previous_hash: &str) -> String {
-    let canonical = serde_json::to_string(event).expect("AuditEvent serialization is infallible");
+    let canonical = canonical_json(event);
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     hasher.update(previous_hash.as_bytes());
@@ -870,6 +882,97 @@ mod tests {
         assert_eq!(index.db_path(), Path::new("audit-index.sqlite3"));
         assert!(root.join("audit-index.sqlite3").exists());
     }
+
+    // ── canonical_json tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn canonical_json_is_deterministic() {
+        let event = AuditEvent {
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            event: AuditEventKind::ProcessStarted {
+                pid: 42,
+                command: vec!["echo".to_string(), "hello".to_string()],
+            },
+        };
+        let first = super::canonical_json(&event);
+        let second = super::canonical_json(&event);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn canonical_json_keys_are_lexicographically_sorted() {
+        let event = AuditEvent {
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            event: AuditEventKind::ProcessStarted {
+                pid: 1,
+                command: vec!["ls".to_string()],
+            },
+        };
+        let canonical = super::canonical_json(&event);
+        let parsed: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+        let obj = parsed.as_object().unwrap();
+
+        // Top-level: "event" (e) must come before "timestamp" (t).
+        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        let event_pos = keys.iter().position(|k| *k == "event").unwrap();
+        let ts_pos = keys.iter().position(|k| *k == "timestamp").unwrap();
+        assert!(
+            event_pos < ts_pos,
+            "\"event\" must precede \"timestamp\" (RFC 8785 lexicographic order)"
+        );
+
+        // Inner object: "command" (c) must come before "pid" (p).
+        let inner = obj["event"]["ProcessStarted"].as_object().unwrap();
+        let inner_keys: Vec<&str> = inner.keys().map(String::as_str).collect();
+        let cmd_pos = inner_keys.iter().position(|k| *k == "command").unwrap();
+        let pid_pos = inner_keys.iter().position(|k| *k == "pid").unwrap();
+        assert!(
+            cmd_pos < pid_pos,
+            "\"command\" must precede \"pid\" (RFC 8785 lexicographic order)"
+        );
+    }
+
+    #[test]
+    fn canonical_json_has_no_whitespace() {
+        let event = AuditEvent {
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            event: AuditEventKind::EnvScrubbed {
+                removed: vec!["SECRET".to_string()],
+            },
+        };
+        let canonical = super::canonical_json(&event);
+        assert!(
+            !canonical.contains("  ") && !canonical.contains(": ") && !canonical.contains(",\n"),
+            "canonical JSON must have no insignificant whitespace; got: {canonical}"
+        );
+    }
+
+    #[test]
+    fn canonical_json_matches_expected_form() {
+        // Pinned timestamp for a stable expected string.
+        let event = AuditEvent {
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-05-13T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            event: AuditEventKind::ProcessExited {
+                exit_code: 0,
+                duration_ms: 42,
+            },
+        };
+        let canonical = super::canonical_json(&event);
+        // "duration_ms" (d) < "exit_code" (e) < "ProcessExited" top key.
+        // Top level: "event" < "timestamp".
+        let expected = r#"{"event":{"ProcessExited":{"duration_ms":42,"exit_code":0}},"timestamp":"2026-05-13T12:00:00Z"}"#;
+        assert_eq!(canonical, expected);
+    }
+
+    // ── hash chain tests ─────────────────────────────────────────────────────
 
     #[test]
     fn hash_chain_disabled_produces_standard_ndjson() {
