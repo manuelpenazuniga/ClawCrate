@@ -1,0 +1,37 @@
+name: agent-inference-allowlist
+extends: build
+description: >
+  Network allowlist for AI agents that call inference APIs.
+  Blocks all egress except the major AI provider endpoints.
+  Use this when your agent needs to call an LLM API but should
+  be blocked from reaching any other host.
+
+filesystem:
+  read:
+    - "."
+  write:
+    - "."
+
+network:
+  mode: filtered
+  allowed_domains:
+    - api.anthropic.com
+    - api.openai.com
+    - generativelanguage.googleapis.com
+    - api.cohere.com
+    - api.mistral.ai
+    - openrouter.ai
+
+environment:
+  scrub:
+    - "ANTHROPIC_API_KEY"
+    - "OPENAI_API_KEY"
+    - "COHERE_API_KEY"
+    - "MISTRAL_API_KEY"
+    - "*_SECRET*"
+    - "*_TOKEN*"
+  passthrough:
+    - HOME
+    - PATH
+    - LANG
+    - TMPDIR
