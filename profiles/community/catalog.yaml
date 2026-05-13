@@ -16,3 +16,13 @@ profiles:
       - python
       - install
       - filtered-network
+  - id: agent-inference-allowlist
+    title: AI agent inference API allowlist (Anthropic, OpenAI, Gemini, Cohere, Mistral, OpenRouter)
+    path: agent-inference-allowlist.yaml
+    owner: "@clawcrate-community"
+    tags:
+      - agent
+      - inference
+      - filtered-network
+      - anthropic
+      - openai
