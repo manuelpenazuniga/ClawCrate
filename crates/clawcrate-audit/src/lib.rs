@@ -7,13 +7,70 @@ use std::path::{Path, PathBuf};
 use clawcrate_types::{AuditEvent, ExecutionPlan, ExecutionResult};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 pub const CRATE_NAME: &str = "clawcrate-audit";
+
+/// All-zeros SHA-256 used as the previous_hash of the first chained event.
+pub const GENESIS_HASH: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 pub const PLAN_JSON: &str = "plan.json";
 pub const RESULT_JSON: &str = "result.json";
 pub const AUDIT_NDJSON: &str = "audit.ndjson";
 pub const FS_DIFF_JSON: &str = "fs-diff.json";
 pub const DEFAULT_AUDIT_DB: &str = "audit-index.sqlite3";
+
+/// Serialized ndjson line written when `CLAWCRATE_AUDIT_HASHCHAIN=1`.
+/// Flattens `AuditEvent` fields (`timestamp`, `event`) then appends the two
+/// hash fields so readers that only understand `AuditEvent` can still
+/// deserialize the line (unknown fields are ignored by serde default).
+#[derive(Serialize)]
+struct ChainedLine<'a> {
+    #[serde(flatten)]
+    event: &'a AuditEvent,
+    previous_hash: &'a str,
+    current_hash: String,
+}
+
+fn hash_chain_enabled() -> bool {
+    std::env::var("CLAWCRATE_AUDIT_HASHCHAIN").as_deref() == Ok("1")
+}
+
+/// Returns the `current_hash` from the last chained line in `path`, or
+/// `GENESIS_HASH` when the file is absent, empty, or unchained.
+fn read_previous_hash(path: &Path) -> String {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return GENESIS_HASH.to_string();
+    };
+    content
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .and_then(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("current_hash")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| GENESIS_HASH.to_string())
+}
+
+/// Computes `sha256(canonical_json(event) || previous_hash)`.
+///
+/// # Note on canonicalization
+/// This uses `serde_json::to_string` as a temporary canonical form.
+/// Issue #229 will replace this with RFC 8785 (JCS) for full spec
+/// compliance with IETF draft-sharif-agent-audit-trail-00.
+pub(crate) fn compute_event_hash(event: &AuditEvent, previous_hash: &str) -> String {
+    let canonical = serde_json::to_string(event).expect("AuditEvent serialization is infallible");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    hasher.update(previous_hash.as_bytes());
+    let bytes = hasher.finalize();
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}")
+}
 
 #[derive(Debug, Clone)]
 pub struct ArtifactWriter {
@@ -81,12 +138,30 @@ impl ArtifactWriter {
                 path: path.clone(),
                 source,
             })?;
-        serde_json::to_writer(&mut file, event).map_err(|source| {
-            ArtifactWriterError::WriteJson {
-                path: path.clone(),
-                source,
-            }
-        })?;
+
+        if hash_chain_enabled() {
+            let previous_hash = read_previous_hash(&path);
+            let current_hash = compute_event_hash(event, &previous_hash);
+            let line = ChainedLine {
+                event,
+                previous_hash: &previous_hash,
+                current_hash,
+            };
+            serde_json::to_writer(&mut file, &line).map_err(|source| {
+                ArtifactWriterError::WriteJson {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+        } else {
+            serde_json::to_writer(&mut file, event).map_err(|source| {
+                ArtifactWriterError::WriteJson {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+        }
+
         file.write_all(b"\n")
             .map_err(|source| ArtifactWriterError::WriteIo {
                 path: path.clone(),
@@ -530,6 +605,20 @@ mod tests {
     };
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct HashChainGuard;
+    impl HashChainGuard {
+        fn enable() -> Self {
+            std::env::set_var("CLAWCRATE_AUDIT_HASHCHAIN", "1");
+            Self
+        }
+    }
+    impl Drop for HashChainGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("CLAWCRATE_AUDIT_HASHCHAIN");
+        }
+    }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct FsDiffFixture {
@@ -780,6 +869,178 @@ mod tests {
         let index = open_result.expect("open sqlite index with bare filename path");
         assert_eq!(index.db_path(), Path::new("audit-index.sqlite3"));
         assert!(root.join("audit-index.sqlite3").exists());
+    }
+
+    #[test]
+    fn hash_chain_disabled_produces_standard_ndjson() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("CLAWCRATE_AUDIT_HASHCHAIN");
+
+        let root = unique_tmp_dir("clawcrate_audit_hashchain_off");
+        let writer = ArtifactWriter::new(&root, "exec-hc-off").expect("create writer");
+        let event = AuditEvent {
+            timestamp: Utc::now(),
+            event: AuditEventKind::ProcessStarted {
+                pid: 1,
+                command: vec!["echo".to_string()],
+            },
+        };
+        writer.append_audit_event(&event).expect("append event");
+
+        let line = fs::read_to_string(writer.audit_ndjson_path()).expect("read ndjson");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).expect("parse line");
+        assert!(
+            parsed.get("previous_hash").is_none(),
+            "hash fields must be absent when chain is disabled"
+        );
+        assert!(parsed.get("current_hash").is_none());
+    }
+
+    #[test]
+    fn hash_chain_genesis_event_has_all_zero_previous_hash() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = HashChainGuard::enable();
+
+        let root = unique_tmp_dir("clawcrate_audit_hashchain_genesis");
+        let writer = ArtifactWriter::new(&root, "exec-hc-genesis").expect("create writer");
+        let event = AuditEvent {
+            timestamp: Utc::now(),
+            event: AuditEventKind::EnvScrubbed {
+                removed: vec!["SECRET".to_string()],
+            },
+        };
+        writer.append_audit_event(&event).expect("append event");
+
+        let line = fs::read_to_string(writer.audit_ndjson_path()).expect("read ndjson");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).expect("parse line");
+        assert_eq!(
+            parsed["previous_hash"].as_str().expect("previous_hash"),
+            super::GENESIS_HASH
+        );
+        let current = parsed["current_hash"].as_str().expect("current_hash");
+        assert!(
+            current.starts_with("sha256:"),
+            "current_hash must have sha256: prefix"
+        );
+        assert_eq!(
+            current.len(),
+            "sha256:".len() + 64,
+            "current_hash must be sha256: + 64 hex chars"
+        );
+    }
+
+    #[test]
+    fn hash_chain_links_events_correctly() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = HashChainGuard::enable();
+
+        let root = unique_tmp_dir("clawcrate_audit_hashchain_chain");
+        let writer = ArtifactWriter::new(&root, "exec-hc-chain").expect("create writer");
+
+        let events = [
+            AuditEvent {
+                timestamp: Utc::now(),
+                event: AuditEventKind::SandboxApplied {
+                    backend: "test".to_string(),
+                    capabilities: vec![],
+                },
+            },
+            AuditEvent {
+                timestamp: Utc::now(),
+                event: AuditEventKind::ProcessStarted {
+                    pid: 42,
+                    command: vec!["ls".to_string()],
+                },
+            },
+            AuditEvent {
+                timestamp: Utc::now(),
+                event: AuditEventKind::ProcessExited {
+                    exit_code: 0,
+                    duration_ms: 10,
+                },
+            },
+        ];
+        for e in &events {
+            writer.append_audit_event(e).expect("append event");
+        }
+
+        let ndjson = fs::read_to_string(writer.audit_ndjson_path()).expect("read ndjson");
+        let lines: Vec<serde_json::Value> = ndjson
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("parse line"))
+            .collect();
+
+        assert_eq!(lines.len(), 3);
+        // Chain: line[n].previous_hash == line[n-1].current_hash
+        assert_eq!(
+            lines[0]["previous_hash"].as_str().unwrap(),
+            super::GENESIS_HASH
+        );
+        assert_eq!(
+            lines[1]["previous_hash"].as_str().unwrap(),
+            lines[0]["current_hash"].as_str().unwrap()
+        );
+        assert_eq!(
+            lines[2]["previous_hash"].as_str().unwrap(),
+            lines[1]["current_hash"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn hash_chain_tamper_breaks_chain() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = HashChainGuard::enable();
+
+        let root = unique_tmp_dir("clawcrate_audit_hashchain_tamper");
+        let writer = ArtifactWriter::new(&root, "exec-hc-tamper").expect("create writer");
+
+        // Write three events with a stable timestamp so hashes are deterministic.
+        let ts = Utc::now();
+        let make_event = |pid: u32| AuditEvent {
+            timestamp: ts,
+            event: AuditEventKind::ProcessStarted {
+                pid,
+                command: vec!["cmd".to_string()],
+            },
+        };
+        for pid in [1u32, 2, 3] {
+            writer
+                .append_audit_event(&make_event(pid))
+                .expect("append event");
+        }
+
+        let ndjson = fs::read_to_string(writer.audit_ndjson_path()).expect("read ndjson");
+        let lines: Vec<serde_json::Value> = ndjson
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("parse line"))
+            .collect();
+        assert_eq!(lines.len(), 3);
+
+        // Stored current_hash for line[1] was computed over make_event(2).
+        let stored_hash = lines[1]["current_hash"].as_str().unwrap();
+        let stored_prev = lines[1]["previous_hash"].as_str().unwrap();
+
+        // An attacker changes the payload to pid=9999. Recompute what the hash
+        // of the modified event would be, using the same previous_hash.
+        let tampered_event = make_event(9999);
+        let recomputed = super::compute_event_hash(&tampered_event, stored_prev);
+
+        // The recomputed hash must differ — the stored hash proves the original content.
+        assert_ne!(
+            recomputed, stored_hash,
+            "tampered payload must produce a different hash than the stored one"
+        );
+
+        // Additionally, line[2].previous_hash was set from the original line[1].current_hash.
+        // A verifier would recompute line[1]'s hash from its payload and find a mismatch.
+        let original_event = make_event(2);
+        let original_recomputed = super::compute_event_hash(&original_event, stored_prev);
+        assert_eq!(
+            original_recomputed, stored_hash,
+            "original event must reproduce the stored hash"
+        );
     }
 
     #[test]
