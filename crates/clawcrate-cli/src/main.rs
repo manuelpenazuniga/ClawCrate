@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use clap::{ArgAction, Args, Parser, Subcommand};
-use clawcrate_audit::{ArtifactWriter, SqliteAuditIndex, DEFAULT_AUDIT_DB};
+use clawcrate_audit::{
+    verify_audit_chain, ArtifactWriter, SqliteAuditIndex, VerifyChainError, AUDIT_NDJSON,
+    DEFAULT_AUDIT_DB,
+};
 use clawcrate_capture::{
     capture_streams, diff_snapshots, snapshot_paths, CaptureConfig, CaptureError, CaptureSummary,
     FsChange, FsChangeKind,
@@ -92,6 +95,8 @@ enum Commands {
     Api(ApiArgs),
     /// Integration bridges for external agent tooling
     Bridge(BridgeArgs),
+    /// Verify the SHA-256 hash chain of a run's audit log
+    Verify(VerifyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -123,6 +128,16 @@ struct CommandArgs {
 
 #[derive(Debug, Args)]
 struct DoctorArgs {
+    /// Machine-readable JSON output
+    #[arg(long, action = ArgAction::SetTrue)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct VerifyArgs {
+    /// Run ID (directory name under ~/.clawcrate/runs/)
+    run_id: String,
+
     /// Machine-readable JSON output
     #[arg(long, action = ArgAction::SetTrue)]
     json: bool,
@@ -176,6 +191,7 @@ fn run(cli: Cli, output: OutputOptions) -> Result<()> {
         Commands::Doctor(args) => handle_doctor(args, &output),
         Commands::Api(args) => handle_api(args, &output),
         Commands::Bridge(args) => handle_bridge(args, &output),
+        Commands::Verify(args) => handle_verify(args, &output),
     }
 }
 
@@ -2059,6 +2075,107 @@ struct ApiCommandError {
     stdout: String,
     stderr: String,
 }
+
+// ── verify ───────────────────────────────────────────────────────────────────
+
+fn handle_verify(args: VerifyArgs, output: &OutputOptions) -> Result<()> {
+    let run_dir = runs_root()?.join(&args.run_id);
+    let audit_path = run_dir.join(AUDIT_NDJSON);
+
+    let result = match verify_audit_chain(&audit_path) {
+        Ok(r) => r,
+        Err(VerifyChainError::NotFound { .. }) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "valid": false,
+                        "events_checked": 0,
+                        "tampered_at": null,
+                        "run_id": args.run_id,
+                        "error": format!("run '{}' not found", args.run_id)
+                    })
+                );
+            } else {
+                eprintln!("error: run '{}' not found", args.run_id);
+                eprintln!("hint: list available runs with `ls ~/.clawcrate/runs/`");
+            }
+            std::process::exit(2);
+        }
+        Err(VerifyChainError::NoHashChain) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "valid": false,
+                        "events_checked": 0,
+                        "tampered_at": null,
+                        "run_id": args.run_id,
+                        "error": "audit.ndjson has no hash chain (re-run with CLAWCRATE_AUDIT_HASHCHAIN=1)"
+                    })
+                );
+            } else {
+                eprintln!(
+                    "error: audit.ndjson for '{}' has no hash chain fields.",
+                    args.run_id
+                );
+                eprintln!(
+                    "hint: set CLAWCRATE_AUDIT_HASHCHAIN=1 before running to enable chaining."
+                );
+            }
+            std::process::exit(3);
+        }
+        Err(VerifyChainError::Io(e)) => {
+            return Err(anyhow!("failed to read audit.ndjson: {e}"));
+        }
+    };
+
+    if args.json {
+        let mut obj = serde_json::json!({
+            "valid": result.valid,
+            "events_checked": result.events_checked,
+            "tampered_at": result.tampered_at,
+            "run_id": args.run_id,
+        });
+        if let Some(e) = &result.error {
+            obj["error"] = serde_json::Value::String(e.clone());
+        }
+        println!("{obj}");
+    } else {
+        let green = output.color;
+        let (check, cross) = if green {
+            ("✅", "❌")
+        } else {
+            ("OK", "FAIL")
+        };
+
+        if result.valid {
+            println!(
+                "{check} Hash chain valid ({} events)",
+                result.events_checked
+            );
+            println!("{check} No tampering detected");
+            println!("   Run ID:      {}", args.run_id);
+            if let Some(ts) = &result.first_event_ts {
+                println!("   First event: {ts}");
+            }
+            if let Some(ts) = &result.last_event_ts {
+                println!("   Last event:  {ts}");
+            }
+        } else {
+            let at = result.tampered_at.unwrap_or(0);
+            println!("{cross} Tampering detected at event #{at}");
+            if let Some(e) = &result.error {
+                println!("   {e}");
+            }
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+// ── api ───────────────────────────────────────────────────────────────────────
 
 const API_MAX_WORKERS: usize = 4;
 const API_MAX_QUEUE_DEPTH: usize = 16;
