@@ -4,9 +4,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use clawcrate_types::{AuditEvent, ExecutionPlan, ExecutionResult};
+use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePublicKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CRATE_NAME: &str = "clawcrate-audit";
@@ -19,6 +23,7 @@ pub const RESULT_JSON: &str = "result.json";
 pub const AUDIT_NDJSON: &str = "audit.ndjson";
 pub const FS_DIFF_JSON: &str = "fs-diff.json";
 pub const DEFAULT_AUDIT_DB: &str = "audit-index.sqlite3";
+pub const DEFAULT_SIGNATURE_BLOCK_SIZE: usize = 100;
 
 /// Serialized ndjson line written when `CLAWCRATE_AUDIT_HASHCHAIN=1`.
 /// Flattens `AuditEvent` fields (`timestamp`, `event`) then appends the two
@@ -32,8 +37,32 @@ struct ChainedLine<'a> {
     current_hash: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockSignature {
+    pub kind: String,
+    pub block_start: usize,
+    pub block_end: usize,
+    pub block_hash: String,
+    pub signature: String,
+    pub public_key_fingerprint: String,
+}
+
 fn hash_chain_enabled() -> bool {
     std::env::var("CLAWCRATE_AUDIT_HASHCHAIN").as_deref() == Ok("1")
+}
+
+fn audit_signing_key_path() -> Option<PathBuf> {
+    std::env::var_os("CLAWCRATE_AUDIT_SIGN")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn audit_signature_block_size() -> usize {
+    std::env::var("CLAWCRATE_AUDIT_SIGN_BLOCK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SIGNATURE_BLOCK_SIZE)
 }
 
 /// Returns the `current_hash` from the last chained line in `path`, or
@@ -54,6 +83,66 @@ fn read_previous_hash(path: &Path) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| GENESIS_HASH.to_string())
+}
+
+#[derive(Debug, Clone)]
+struct ChainEventLine {
+    current_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct AuditSignatureState {
+    events: Vec<ChainEventLine>,
+    signatures: Vec<BlockSignature>,
+}
+
+fn read_signature_state(path: &Path) -> Result<AuditSignatureState, ArtifactWriterError> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Ok(AuditSignatureState {
+            events: Vec::new(),
+            signatures: Vec::new(),
+        });
+    };
+
+    let mut events = Vec::new();
+    let mut signatures = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|source| {
+            ArtifactWriterError::ReadSignatureState {
+                path: path.to_path_buf(),
+                line: index + 1,
+                source,
+            }
+        })?;
+        if is_block_signature_value(&value) {
+            let signature: BlockSignature = serde_json::from_value(value).map_err(|source| {
+                ArtifactWriterError::ReadSignatureState {
+                    path: path.to_path_buf(),
+                    line: index + 1,
+                    source,
+                }
+            })?;
+            signatures.push(signature);
+            continue;
+        }
+
+        let parsed: ChainedLineRead = serde_json::from_value(value).map_err(|source| {
+            ArtifactWriterError::ReadSignatureState {
+                path: path.to_path_buf(),
+                line: index + 1,
+                source,
+            }
+        })?;
+        if let Some(current_hash) = parsed.current_hash {
+            events.push(ChainEventLine { current_hash });
+        }
+    }
+
+    Ok(AuditSignatureState { events, signatures })
 }
 
 /// Serializes `event` to RFC 8785 (JSON Canonicalization Scheme) canonical form.
@@ -84,6 +173,118 @@ pub fn compute_event_hash(event: &AuditEvent, previous_hash: &str) -> String {
     format!("sha256:{hex}")
 }
 
+pub fn compute_block_hash(event_hashes: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for event_hash in event_hashes {
+        hasher.update(event_hash.as_bytes());
+    }
+    let bytes = hasher.finalize();
+    format!("sha256:{}", hex_encode(&bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn is_block_signature_value(value: &serde_json::Value) -> bool {
+    value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind == "BlockSignature")
+}
+
+fn public_key_fingerprint(verifying_key: &VerifyingKey) -> Result<String, ArtifactWriterError> {
+    let der =
+        verifying_key
+            .to_public_key_der()
+            .map_err(|source| ArtifactWriterError::SigningKey {
+                path: PathBuf::from("<derived-public-key>"),
+                detail: source.to_string(),
+            })?;
+    let digest = Sha256::digest(der.as_bytes());
+    Ok(format!("SHA256:{}", BASE64_STANDARD.encode(digest)))
+}
+
+fn load_signing_key(path: &Path) -> Result<SigningKey, ArtifactWriterError> {
+    let pem = fs::read_to_string(path).map_err(|source| ArtifactWriterError::ReadSigningKey {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    SigningKey::from_pkcs8_pem(&pem).map_err(|source| ArtifactWriterError::SigningKey {
+        path: path.to_path_buf(),
+        detail: source.to_string(),
+    })
+}
+
+fn load_verifying_key(path: &Path) -> Result<VerifyingKey, VerifyChainError> {
+    let pem = fs::read_to_string(path).map_err(|source| VerifyChainError::ReadPublicKey {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    VerifyingKey::from_public_key_pem(&pem).map_err(|source| VerifyChainError::PublicKey {
+        path: path.to_path_buf(),
+        detail: source.to_string(),
+    })
+}
+
+fn maybe_build_signature(
+    path: &Path,
+    event: &AuditEvent,
+    block_size: usize,
+) -> Result<Option<BlockSignature>, ArtifactWriterError> {
+    let Some(key_path) = audit_signing_key_path() else {
+        return Ok(None);
+    };
+
+    let state = read_signature_state(path)?;
+    if state.events.is_empty() {
+        return Ok(None);
+    }
+
+    let next_start = state
+        .signatures
+        .iter()
+        .map(|signature| signature.block_end + 1)
+        .max()
+        .unwrap_or(0);
+    if next_start >= state.events.len() {
+        return Ok(None);
+    }
+
+    let pending_len = state.events.len() - next_start;
+    let should_close_block = pending_len >= block_size || is_terminal_event(event);
+    if !should_close_block {
+        return Ok(None);
+    }
+
+    let block_end = state.events.len() - 1;
+    let block_hash = compute_block_hash(
+        &state.events[next_start..=block_end]
+            .iter()
+            .map(|event| event.current_hash.clone())
+            .collect::<Vec<_>>(),
+    );
+    let signing_key = load_signing_key(&key_path)?;
+    let verifying_key = signing_key.verifying_key();
+    let signature = signing_key.sign(block_hash.as_bytes());
+    Ok(Some(BlockSignature {
+        kind: "BlockSignature".to_string(),
+        block_start: next_start,
+        block_end,
+        block_hash,
+        signature: format!("ed25519:{}", BASE64_STANDARD.encode(signature.to_bytes())),
+        public_key_fingerprint: public_key_fingerprint(&verifying_key)?,
+    }))
+}
+
+fn is_terminal_event(event: &AuditEvent) -> bool {
+    matches!(
+        event.event,
+        clawcrate_types::AuditEventKind::ProcessExited { .. }
+            | clawcrate_types::AuditEventKind::PermissionBlocked { .. }
+    )
+}
+
 // ── Hash-chain verification ───────────────────────────────────────────────────
 
 /// Line shape we deserialize when verifying a chained `audit.ndjson`.
@@ -101,6 +302,7 @@ struct ChainedLineRead {
 pub struct ChainVerifyResult {
     pub valid: bool,
     pub events_checked: usize,
+    pub signatures_checked: usize,
     /// 1-based index of the first tampered event, `None` when valid.
     pub tampered_at: Option<usize>,
     pub first_event_ts: Option<String>,
@@ -118,6 +320,10 @@ pub enum VerifyChainError {
     NoHashChain,
     #[error("I/O error reading audit.ndjson: {0}")]
     Io(#[from] io::Error),
+    #[error("failed to read Ed25519 public key at {path}: {source}")]
+    ReadPublicKey { path: PathBuf, source: io::Error },
+    #[error("failed to parse Ed25519 public key at {path}: {detail}")]
+    PublicKey { path: PathBuf, detail: String },
 }
 
 /// Reads `audit_path` and verifies the SHA-256 hash chain.
@@ -125,20 +331,30 @@ pub enum VerifyChainError {
 /// Returns `Ok(ChainVerifyResult)` for both valid and tampered chains;
 /// errors only for structural problems (file missing, no chain fields).
 pub fn verify_audit_chain(audit_path: &Path) -> Result<ChainVerifyResult, VerifyChainError> {
+    verify_audit_chain_with_pubkey(audit_path, None)
+}
+
+pub fn verify_audit_chain_with_pubkey(
+    audit_path: &Path,
+    pubkey_path: Option<&Path>,
+) -> Result<ChainVerifyResult, VerifyChainError> {
     if !audit_path.exists() {
         return Err(VerifyChainError::NotFound {
             path: audit_path.to_owned(),
         });
     }
 
+    let verifying_key = pubkey_path.map(load_verifying_key).transpose()?;
     let file = fs::File::open(audit_path).map_err(VerifyChainError::Io)?;
     let reader = BufReader::new(file);
 
     let mut events_checked: usize = 0;
+    let mut signatures_checked: usize = 0;
     let mut previous_hash = GENESIS_HASH.to_string();
     let mut first_ts: Option<String> = None;
     let mut last_ts: Option<String> = None;
     let mut has_chain_fields = false;
+    let mut event_hashes: Vec<String> = Vec::new();
 
     for (idx, line_result) in reader.lines().enumerate() {
         let line = line_result.map_err(VerifyChainError::Io)?;
@@ -147,7 +363,68 @@ pub fn verify_audit_chain(audit_path: &Path) -> Result<ChainVerifyResult, Verify
             continue;
         }
 
-        let parsed: ChainedLineRead = serde_json::from_str(line).map_err(|e| {
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+            VerifyChainError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("line {}: {e}", idx + 1),
+            ))
+        })?;
+        if is_block_signature_value(&value) {
+            let signature: BlockSignature = serde_json::from_value(value).map_err(|e| {
+                VerifyChainError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("line {}: {e}", idx + 1),
+                ))
+            })?;
+            if let Some(verifying_key) = &verifying_key {
+                signatures_checked += 1;
+                if signature.block_start > signature.block_end
+                    || signature.block_end >= event_hashes.len()
+                {
+                    return Ok(ChainVerifyResult {
+                        valid: false,
+                        events_checked,
+                        signatures_checked,
+                        tampered_at: None,
+                        first_event_ts: first_ts,
+                        last_event_ts: last_ts,
+                        error: Some(format!(
+                            "invalid signature block range {}..={} at line {}",
+                            signature.block_start,
+                            signature.block_end,
+                            idx + 1
+                        )),
+                    });
+                }
+                let expected_block_hash =
+                    compute_block_hash(&event_hashes[signature.block_start..=signature.block_end]);
+                if expected_block_hash != signature.block_hash {
+                    return Ok(ChainVerifyResult {
+                        valid: false,
+                        events_checked,
+                        signatures_checked,
+                        tampered_at: None,
+                        first_event_ts: first_ts,
+                        last_event_ts: last_ts,
+                        error: Some(format!(
+                            "signature block hash mismatch at line {}: expected {}, found {}",
+                            idx + 1,
+                            expected_block_hash,
+                            signature.block_hash
+                        )),
+                    });
+                }
+                verify_block_signature(verifying_key, &signature).map_err(|e| {
+                    VerifyChainError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("line {}: {e}", idx + 1),
+                    ))
+                })?;
+            }
+            continue;
+        }
+
+        let parsed: ChainedLineRead = serde_json::from_value(value).map_err(|e| {
             VerifyChainError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("line {}: {e}", idx + 1),
@@ -172,12 +449,26 @@ pub fn verify_audit_chain(audit_path: &Path) -> Result<ChainVerifyResult, Verify
             None => continue, // unchained line — skip hash check
         };
         let stored_previous = parsed.previous_hash.as_deref().unwrap_or(GENESIS_HASH);
+        if stored_previous != previous_hash {
+            return Ok(ChainVerifyResult {
+                valid: false,
+                events_checked,
+                signatures_checked,
+                tampered_at: Some(event_no),
+                first_event_ts: first_ts,
+                last_event_ts: last_ts,
+                error: Some(format!(
+                    "previous_hash mismatch at event {event_no}: expected {previous_hash}, found {stored_previous}"
+                )),
+            });
+        }
 
         let expected = compute_event_hash(&parsed.event, stored_previous);
         if expected != stored_current {
             return Ok(ChainVerifyResult {
                 valid: false,
                 events_checked,
+                signatures_checked,
                 tampered_at: Some(event_no),
                 first_event_ts: first_ts,
                 last_event_ts: last_ts,
@@ -186,7 +477,8 @@ pub fn verify_audit_chain(audit_path: &Path) -> Result<ChainVerifyResult, Verify
                 )),
             });
         }
-        previous_hash = stored_current;
+        previous_hash = stored_current.clone();
+        event_hashes.push(stored_current);
     }
     let _ = previous_hash; // consumed for chain walk
 
@@ -197,11 +489,32 @@ pub fn verify_audit_chain(audit_path: &Path) -> Result<ChainVerifyResult, Verify
     Ok(ChainVerifyResult {
         valid: true,
         events_checked,
+        signatures_checked,
         tampered_at: None,
         first_event_ts: first_ts,
         last_event_ts: last_ts,
         error: None,
     })
+}
+
+fn verify_block_signature(
+    verifying_key: &VerifyingKey,
+    block_signature: &BlockSignature,
+) -> Result<(), String> {
+    let signature_bytes = block_signature
+        .signature
+        .strip_prefix("ed25519:")
+        .ok_or_else(|| "signature is missing ed25519: prefix".to_string())
+        .and_then(|encoded| {
+            BASE64_STANDARD
+                .decode(encoded)
+                .map_err(|source| format!("signature base64 decode failed: {source}"))
+        })?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|source| format!("signature parse failed: {source}"))?;
+    verifying_key
+        .verify(block_signature.block_hash.as_bytes(), &signature)
+        .map_err(|source| format!("signature verification failed: {source}"))
 }
 
 // ── ArtifactWriter ───────────────────────────────────────────────────────────
@@ -273,7 +586,7 @@ impl ArtifactWriter {
                 source,
             })?;
 
-        if hash_chain_enabled() {
+        if hash_chain_enabled() || audit_signing_key_path().is_some() {
             let previous_hash = read_previous_hash(&path);
             let current_hash = compute_event_hash(event, &previous_hash);
             let line = ChainedLine {
@@ -287,6 +600,29 @@ impl ArtifactWriter {
                     source,
                 }
             })?;
+            file.write_all(b"\n")
+                .map_err(|source| ArtifactWriterError::WriteIo {
+                    path: path.clone(),
+                    source,
+                })?;
+            file.flush()
+                .map_err(|source| ArtifactWriterError::WriteIo {
+                    path: path.clone(),
+                    source,
+                })?;
+
+            if let Some(signature) =
+                maybe_build_signature(&path, event, audit_signature_block_size())?
+            {
+                serde_json::to_writer(&mut file, &signature).map_err(|source| {
+                    ArtifactWriterError::WriteJson {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+            } else {
+                return Ok(());
+            }
         } else {
             serde_json::to_writer(&mut file, event).map_err(|source| {
                 ArtifactWriterError::WriteJson {
@@ -332,6 +668,21 @@ pub enum ArtifactWriterError {
         path: PathBuf,
         #[source]
         source: io::Error,
+    },
+    #[error("failed to read Ed25519 signing key at {path}: {source}")]
+    ReadSigningKey {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to use Ed25519 signing key at {path}: {detail}")]
+    SigningKey { path: PathBuf, detail: String },
+    #[error("failed to read signature state at {path}, line {line}: {source}")]
+    ReadSignatureState {
+        path: PathBuf,
+        line: usize,
+        #[source]
+        source: serde_json::Error,
     },
 }
 
@@ -682,7 +1033,17 @@ fn read_ndjson_audit_events(path: &Path) -> Result<Vec<AuditEvent>, SqliteAuditI
         if line.trim().is_empty() {
             continue;
         }
-        let event = serde_json::from_str::<AuditEvent>(&line).map_err(|source| {
+        let value = serde_json::from_str::<serde_json::Value>(&line).map_err(|source| {
+            SqliteAuditIndexError::ParseNdjsonLine {
+                path: path.to_path_buf(),
+                line: index + 1,
+                source,
+            }
+        })?;
+        if is_block_signature_value(&value) {
+            continue;
+        }
+        let event = serde_json::from_value::<AuditEvent>(value).map_err(|source| {
             SqliteAuditIndexError::ParseNdjsonLine {
                 path: path.to_path_buf(),
                 line: index + 1,
@@ -730,6 +1091,8 @@ mod tests {
         Actor, AuditEvent, AuditEventKind, DefaultMode, ExecutionPlan, ExecutionResult, NetLevel,
         ResolvedProfile, ResourceLimits, Status, WorkspaceMode,
     };
+    use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
+    use ed25519_dalek::SigningKey;
     use rusqlite::Connection;
     use serde::{Deserialize, Serialize};
 
@@ -751,6 +1114,21 @@ mod tests {
     impl Drop for HashChainGuard {
         fn drop(&mut self) {
             std::env::remove_var("CLAWCRATE_AUDIT_HASHCHAIN");
+        }
+    }
+
+    struct SigningEnvGuard;
+    impl SigningEnvGuard {
+        fn enable(key_path: &Path, block_size: usize) -> Self {
+            std::env::set_var("CLAWCRATE_AUDIT_SIGN", key_path);
+            std::env::set_var("CLAWCRATE_AUDIT_SIGN_BLOCK_SIZE", block_size.to_string());
+            Self
+        }
+    }
+    impl Drop for SigningEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("CLAWCRATE_AUDIT_SIGN");
+            std::env::remove_var("CLAWCRATE_AUDIT_SIGN_BLOCK_SIZE");
         }
     }
 
@@ -1313,6 +1691,18 @@ mod tests {
         }
     }
 
+    fn sample_started_event(pid: u32) -> AuditEvent {
+        AuditEvent {
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-05-14T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            event: AuditEventKind::ProcessStarted {
+                pid,
+                command: vec!["echo".to_string(), "hello".to_string()],
+            },
+        }
+    }
+
     fn write_chained_ndjson(dir: &Path, events: &[AuditEvent]) -> PathBuf {
         use super::{compute_event_hash, AUDIT_NDJSON, GENESIS_HASH};
         use std::io::Write as _;
@@ -1335,6 +1725,22 @@ mod tests {
             prev = current;
         }
         path
+    }
+
+    fn write_test_ed25519_keypair(dir: &Path) -> (PathBuf, PathBuf) {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let private_pem = signing_key
+            .to_pkcs8_pem(Default::default())
+            .expect("encode private key");
+        let public_pem = signing_key
+            .verifying_key()
+            .to_public_key_pem(Default::default())
+            .expect("encode public key");
+        let private_path = dir.join("audit-signing.key");
+        let public_path = dir.join("audit-signing.pub");
+        fs::write(&private_path, private_pem.as_bytes()).expect("write private key");
+        fs::write(&public_path, public_pem.as_bytes()).expect("write public key");
+        (private_path, public_path)
     }
 
     #[test]
@@ -1388,5 +1794,99 @@ mod tests {
         let result = super::verify_audit_chain(&path).unwrap();
         assert!(!result.valid);
         assert_eq!(result.tampered_at, Some(2));
+    }
+
+    #[test]
+    fn signing_appends_block_signature_and_verify_accepts_pubkey() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let root = unique_tmp_dir("audit_signing_roundtrip");
+        let (private_key, public_key) = write_test_ed25519_keypair(&root);
+        let _guard = SigningEnvGuard::enable(&private_key, 2);
+        let writer = ArtifactWriter::new(&root, "exec-signed").expect("create writer");
+
+        writer.append_audit_event(&sample_started_event(1)).unwrap();
+        writer.append_audit_event(&sample_started_event(2)).unwrap();
+
+        let ndjson = fs::read_to_string(writer.audit_ndjson_path()).expect("read audit");
+        let lines: Vec<serde_json::Value> = ndjson
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse audit line"))
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2]["kind"], "BlockSignature");
+        assert_eq!(lines[2]["block_start"], 0);
+        assert_eq!(lines[2]["block_end"], 1);
+        assert!(lines[2]["signature"]
+            .as_str()
+            .expect("signature")
+            .starts_with("ed25519:"));
+
+        let result =
+            super::verify_audit_chain_with_pubkey(&writer.audit_ndjson_path(), Some(&public_key))
+                .expect("verify signed audit");
+        assert!(result.valid);
+        assert_eq!(result.events_checked, 2);
+        assert_eq!(result.signatures_checked, 1);
+    }
+
+    #[test]
+    fn signing_flushes_partial_block_on_terminal_event() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let root = unique_tmp_dir("audit_signing_terminal");
+        let (private_key, public_key) = write_test_ed25519_keypair(&root);
+        let _guard = SigningEnvGuard::enable(&private_key, 100);
+        let writer = ArtifactWriter::new(&root, "exec-signed-terminal").expect("create writer");
+
+        writer.append_audit_event(&sample_event()).unwrap();
+
+        let ndjson = fs::read_to_string(writer.audit_ndjson_path()).expect("read audit");
+        let lines: Vec<serde_json::Value> = ndjson
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse audit line"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["kind"], "BlockSignature");
+
+        let result =
+            super::verify_audit_chain_with_pubkey(&writer.audit_ndjson_path(), Some(&public_key))
+                .expect("verify signed audit");
+        assert!(result.valid);
+        assert_eq!(result.signatures_checked, 1);
+    }
+
+    #[test]
+    fn verify_fails_when_signed_block_is_modified() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let root = unique_tmp_dir("audit_signing_tamper");
+        let (private_key, public_key) = write_test_ed25519_keypair(&root);
+        let _guard = SigningEnvGuard::enable(&private_key, 2);
+        let writer = ArtifactWriter::new(&root, "exec-signed-tamper").expect("create writer");
+
+        writer.append_audit_event(&sample_started_event(1)).unwrap();
+        writer.append_audit_event(&sample_started_event(2)).unwrap();
+
+        let content = fs::read_to_string(writer.audit_ndjson_path()).expect("read audit");
+        let mut lines: Vec<String> = content.lines().map(ToString::to_string).collect();
+        assert_eq!(lines.len(), 3);
+        let mut signature_line: serde_json::Value =
+            serde_json::from_str(&lines[2]).expect("parse signature line");
+        signature_line["block_hash"] = serde_json::Value::String(super::GENESIS_HASH.to_string());
+        lines[2] = signature_line.to_string();
+        fs::write(
+            writer.audit_ndjson_path(),
+            format!("{}\n", lines.join("\n")),
+        )
+        .expect("write tampered audit");
+
+        let result =
+            super::verify_audit_chain_with_pubkey(&writer.audit_ndjson_path(), Some(&public_key))
+                .expect("verify tampered signed audit");
+        assert!(!result.valid);
+        assert_eq!(result.signatures_checked, 1);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("signature block hash mismatch"));
     }
 }
