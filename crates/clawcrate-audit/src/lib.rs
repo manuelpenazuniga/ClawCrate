@@ -74,7 +74,7 @@ pub fn canonical_json(event: &AuditEvent) -> String {
 }
 
 /// Computes `sha256(canonical_json(event) || previous_hash)`.
-pub(crate) fn compute_event_hash(event: &AuditEvent, previous_hash: &str) -> String {
+pub fn compute_event_hash(event: &AuditEvent, previous_hash: &str) -> String {
     let canonical = canonical_json(event);
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
@@ -83,6 +83,128 @@ pub(crate) fn compute_event_hash(event: &AuditEvent, previous_hash: &str) -> Str
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     format!("sha256:{hex}")
 }
+
+// ── Hash-chain verification ───────────────────────────────────────────────────
+
+/// Line shape we deserialize when verifying a chained `audit.ndjson`.
+/// Fields beyond `AuditEvent` (previous_hash, current_hash) are read directly.
+#[derive(serde::Deserialize)]
+struct ChainedLineRead {
+    #[serde(flatten)]
+    event: AuditEvent,
+    previous_hash: Option<String>,
+    current_hash: Option<String>,
+}
+
+/// Outcome returned by [`verify_audit_chain`].
+#[derive(Debug, Serialize)]
+pub struct ChainVerifyResult {
+    pub valid: bool,
+    pub events_checked: usize,
+    /// 1-based index of the first tampered event, `None` when valid.
+    pub tampered_at: Option<usize>,
+    pub first_event_ts: Option<String>,
+    pub last_event_ts: Option<String>,
+    /// Human-readable error detail when `!valid`.
+    pub error: Option<String>,
+}
+
+/// Errors returned by [`verify_audit_chain`] before the chain walk begins.
+#[derive(Debug, thiserror::Error)]
+pub enum VerifyChainError {
+    #[error("audit.ndjson not found at {path}")]
+    NotFound { path: PathBuf },
+    #[error("audit.ndjson contains no hash chain fields (run with CLAWCRATE_AUDIT_HASHCHAIN=1)")]
+    NoHashChain,
+    #[error("I/O error reading audit.ndjson: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// Reads `audit_path` and verifies the SHA-256 hash chain.
+///
+/// Returns `Ok(ChainVerifyResult)` for both valid and tampered chains;
+/// errors only for structural problems (file missing, no chain fields).
+pub fn verify_audit_chain(audit_path: &Path) -> Result<ChainVerifyResult, VerifyChainError> {
+    if !audit_path.exists() {
+        return Err(VerifyChainError::NotFound {
+            path: audit_path.to_owned(),
+        });
+    }
+
+    let file = fs::File::open(audit_path).map_err(VerifyChainError::Io)?;
+    let reader = BufReader::new(file);
+
+    let mut events_checked: usize = 0;
+    let mut previous_hash = GENESIS_HASH.to_string();
+    let mut first_ts: Option<String> = None;
+    let mut last_ts: Option<String> = None;
+    let mut has_chain_fields = false;
+
+    for (idx, line_result) in reader.lines().enumerate() {
+        let line = line_result.map_err(VerifyChainError::Io)?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let parsed: ChainedLineRead = serde_json::from_str(line).map_err(|e| {
+            VerifyChainError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("line {}: {e}", idx + 1),
+            ))
+        })?;
+
+        // Detect whether any chained fields are present (first line is enough).
+        if !has_chain_fields {
+            has_chain_fields = parsed.current_hash.is_some();
+        }
+
+        let event_no = idx + 1;
+        let ts = parsed.event.timestamp.to_rfc3339();
+        if first_ts.is_none() {
+            first_ts = Some(ts.clone());
+        }
+        last_ts = Some(ts);
+        events_checked += 1;
+
+        let stored_current = match &parsed.current_hash {
+            Some(h) => h.clone(),
+            None => continue, // unchained line — skip hash check
+        };
+        let stored_previous = parsed.previous_hash.as_deref().unwrap_or(GENESIS_HASH);
+
+        let expected = compute_event_hash(&parsed.event, stored_previous);
+        if expected != stored_current {
+            return Ok(ChainVerifyResult {
+                valid: false,
+                events_checked,
+                tampered_at: Some(event_no),
+                first_event_ts: first_ts,
+                last_event_ts: last_ts,
+                error: Some(format!(
+                    "hash mismatch at event {event_no}: expected {expected}, found {stored_current}"
+                )),
+            });
+        }
+        previous_hash = stored_current;
+    }
+    let _ = previous_hash; // consumed for chain walk
+
+    if !has_chain_fields {
+        return Err(VerifyChainError::NoHashChain);
+    }
+
+    Ok(ChainVerifyResult {
+        valid: true,
+        events_checked,
+        tampered_at: None,
+        first_event_ts: first_ts,
+        last_event_ts: last_ts,
+        error: None,
+    })
+}
+
+// ── ArtifactWriter ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct ArtifactWriter {
@@ -1175,5 +1297,96 @@ mod tests {
 
         assert_eq!(indexed.execution_id, "exec-large");
         assert_eq!(indexed.event_count, 1_500);
+    }
+
+    // ── verify_audit_chain tests ──────────────────────────────────────────────
+
+    fn sample_event() -> AuditEvent {
+        AuditEvent {
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-05-14T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            event: AuditEventKind::ProcessExited {
+                exit_code: 0,
+                duration_ms: 100,
+            },
+        }
+    }
+
+    fn write_chained_ndjson(dir: &Path, events: &[AuditEvent]) -> PathBuf {
+        use super::{compute_event_hash, AUDIT_NDJSON, GENESIS_HASH};
+        use std::io::Write as _;
+        let path = dir.join(AUDIT_NDJSON);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut prev = GENESIS_HASH.to_string();
+        for event in events {
+            let current = compute_event_hash(event, &prev);
+            let line = serde_json::json!({
+                "timestamp": event.timestamp,
+                "event": event.event,
+                "previous_hash": prev,
+                "current_hash": current,
+            });
+            writeln!(file, "{line}").unwrap();
+            prev = current;
+        }
+        path
+    }
+
+    #[test]
+    fn verify_returns_error_when_file_missing() {
+        let root = unique_tmp_dir("verify_missing");
+        let path = root.join(super::AUDIT_NDJSON);
+        let err = super::verify_audit_chain(&path).unwrap_err();
+        assert!(matches!(err, super::VerifyChainError::NotFound { .. }));
+    }
+
+    #[test]
+    fn verify_returns_error_for_unchained_ndjson() {
+        let root = unique_tmp_dir("verify_nochain");
+        let writer = ArtifactWriter::from_artifacts_dir(&root).unwrap();
+        // Write a plain (no hash chain) event
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CLAWCRATE_AUDIT_HASHCHAIN");
+        writer.append_audit_event(&sample_event()).unwrap();
+        let path = root.join(super::AUDIT_NDJSON);
+        let err = super::verify_audit_chain(&path).unwrap_err();
+        assert!(matches!(err, super::VerifyChainError::NoHashChain));
+    }
+
+    #[test]
+    fn verify_valid_chain_returns_ok() {
+        let root = unique_tmp_dir("verify_valid");
+        let events = vec![sample_event(), sample_event()];
+        let path = write_chained_ndjson(&root, &events);
+        let result = super::verify_audit_chain(&path).unwrap();
+        assert!(result.valid);
+        assert_eq!(result.events_checked, 2);
+        assert!(result.tampered_at.is_none());
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn verify_detects_tampered_event() {
+        let root = unique_tmp_dir("verify_tamper");
+        let events = vec![sample_event(), sample_event(), sample_event()];
+        let path = write_chained_ndjson(&root, &events);
+
+        // Corrupt the second line: replace exit_code value
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // Modify the second event's exit_code to 99
+        let tampered = lines[1].replace("\"exit_code\":0", "\"exit_code\":99");
+        let new_content = format!("{}\n{}\n{}\n", lines[0], tampered, lines[2]);
+        fs::write(&path, new_content).unwrap();
+
+        let result = super::verify_audit_chain(&path).unwrap();
+        assert!(!result.valid);
+        assert_eq!(result.tampered_at, Some(2));
     }
 }
