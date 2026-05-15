@@ -305,8 +305,8 @@ issues:
 
   - id: "GH-219-03"
     epic: "GH-219"
-    github_issue: null
-    state: "planned"
+    github_issue: 253
+    state: "open"
     milestone: "v0.2.0"
     title: "feat(cli): clawcrate mcp wrap subcommand"
     labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "crate:cli"]
@@ -314,8 +314,8 @@ issues:
 
   - id: "GH-219-04"
     epic: "GH-219"
-    github_issue: null
-    state: "planned"
+    github_issue: 254
+    state: "open"
     milestone: "v0.2.0"
     title: "feat(mcp): transparent stdin/stdout relay preserving JSON-RPC framing"
     labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "crate:cli"]
@@ -323,8 +323,8 @@ issues:
 
   - id: "GH-219-05"
     epic: "GH-219"
-    github_issue: null
-    state: "planned"
+    github_issue: 255
+    state: "open"
     milestone: "v0.2.0"
     title: "feat(mcp): auto-detect MCP server shape"
     labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "crate:cli"]
@@ -332,8 +332,8 @@ issues:
 
   - id: "GH-219-06"
     epic: "GH-219"
-    github_issue: null
-    state: "planned"
+    github_issue: 256
+    state: "open"
     milestone: "v0.2.0"
     title: "docs(integrations): Claude Desktop MCP wrap recipe"
     labels: ["type:docs", "priority:p0", "tier:T1", "area:mcp", "area:docs"]
@@ -341,8 +341,8 @@ issues:
 
   - id: "GH-219-07"
     epic: "GH-219"
-    github_issue: null
-    state: "planned"
+    github_issue: 257
+    state: "open"
     milestone: "v0.2.0"
     title: "docs(integrations): Cursor MCP wrap recipe"
     labels: ["type:docs", "priority:p0", "tier:T1", "area:mcp", "area:docs"]
@@ -350,8 +350,8 @@ issues:
 
   - id: "GH-219-08"
     epic: "GH-219"
-    github_issue: null
-    state: "planned"
+    github_issue: 258
+    state: "open"
     milestone: "v0.2.0"
     title: "docs(integrations): Continue.dev MCP wrap recipe"
     labels: ["type:docs", "priority:p0", "tier:T1", "area:mcp", "area:docs"]
@@ -359,8 +359,8 @@ issues:
 
   - id: "GH-219-09"
     epic: "GH-219"
-    github_issue: null
-    state: "planned"
+    github_issue: 259
+    state: "open"
     milestone: "v0.2.0"
     title: "examples(mcp): demo wrap of @modelcontextprotocol/server-filesystem"
     labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "area:examples"]
