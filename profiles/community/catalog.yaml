@@ -26,3 +26,12 @@ profiles:
       - filtered-network
       - anthropic
       - openai
+  - id: mcp-server
+    title: MCP server workspace profile (read/write workspace, no secrets, no network)
+    path: mcp-server.yaml
+    owner: "@clawcrate-community"
+    tags:
+      - mcp
+      - agent
+      - replica
+      - no-network
