@@ -9,6 +9,8 @@ Community profiles live under `profiles/community/`:
 ```text
 profiles/community/
 ├── catalog.yaml
+├── agent-inference-allowlist.yaml
+├── mcp-server.yaml
 ├── npm-install-allowlist.yaml
 └── pip-install-pypi-only.yaml
 ```
@@ -70,3 +72,14 @@ Maintainers should verify:
 - replica/direct default is aligned with risk level
 - env scrub/pass-through values avoid secret leakage
 - profile naming and metadata in catalog remain clear and searchable
+
+## MCP Server Profile
+
+`mcp-server` is a community profile for stdio MCP servers that need read/write
+access to the project workspace but should not read local secrets or reach the
+network.
+
+The profile defaults to Replica mode because Linux Landlock cannot reliably deny
+specific secret files inside an otherwise allowed workspace path. Replica mode
+keeps that promise by filtering the materialized workspace before launch, while
+macOS also applies Seatbelt deny rules for the same sensitive path patterns.
