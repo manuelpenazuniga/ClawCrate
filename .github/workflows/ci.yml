@@ -42,6 +42,10 @@ jobs:
       - name: Cargo check
         run: cargo check --workspace
 
+      - name: Audit benchmark compile (informational)
+        run: cargo bench -p clawcrate-audit --no-run
+        continue-on-error: true
+
   integration-and-fixtures:
     name: Integration + Fixtures (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
