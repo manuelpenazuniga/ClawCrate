@@ -10,6 +10,7 @@ Community profiles live under `profiles/community/`:
 profiles/community/
 ├── catalog.yaml
 ├── agent-inference-allowlist.yaml
+├── mcp-readonly.yaml
 ├── mcp-server.yaml
 ├── npm-install-allowlist.yaml
 └── pip-install-pypi-only.yaml
@@ -83,3 +84,8 @@ The profile defaults to Replica mode because Linux Landlock cannot reliably deny
 specific secret files inside an otherwise allowed workspace path. Replica mode
 keeps that promise by filtering the materialized workspace before launch, while
 macOS also applies Seatbelt deny rules for the same sensitive path patterns.
+
+`mcp-readonly` is the stricter companion profile for MCP servers that only need
+to inspect project files. It grants workspace reads, grants no write paths,
+blocks network access, and uses the same Replica-mode secret filtering rationale
+as `mcp-server`.

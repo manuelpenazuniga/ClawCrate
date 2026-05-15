@@ -968,6 +968,30 @@ network:
     }
 
     #[test]
+    fn resolves_mcp_readonly_community_profile_without_write_access() {
+        let resolver = ProfileResolver::default();
+        let profile_path = resolver
+            .profiles_dir()
+            .join("community")
+            .join("mcp-readonly.yaml");
+
+        let profile = resolver
+            .resolve_from_path(&profile_path)
+            .expect("resolve mcp-readonly community profile");
+
+        assert_eq!(profile.name, "mcp-readonly");
+        assert_eq!(profile.default_mode, DefaultMode::Replica);
+        assert_eq!(profile.net, NetLevel::None);
+        assert!(profile.fs_read.iter().any(|it| it == Path::new(".")));
+        assert!(profile.fs_write.is_empty());
+        assert!(profile.fs_deny.iter().any(|it| it == ".env"));
+        assert!(profile.fs_deny.iter().any(|it| it == "**/.env.*"));
+        assert!(profile.fs_deny.iter().any(|it| it == ".git/config"));
+        assert!(profile.env_scrub.iter().any(|it| it == "SSH_AUTH_SOCK"));
+        assert!(profile.env_scrub.iter().any(|it| it == "*_TOKEN*"));
+    }
+
+    #[test]
     fn rejects_catalog_entry_with_parent_directory_escape() {
         let resolver = ProfileResolver::default();
         let tmp = unique_tmp_dir("clawcrate_profiles_catalog_path_escape");
