@@ -70,6 +70,36 @@ labels:
   - name: "area:release"
     color: "f9d0c4"
     description: "Versioning and release assets"
+  - name: "tier:T0"
+    color: "e11d48"
+    description: "Reactivation sprint, hackathon, and hygiene"
+  - name: "tier:T1"
+    color: "ea580c"
+    description: "v0.2.0 critical pre-AI Act scope"
+  - name: "tier:T2"
+    color: "ca8a04"
+    description: "v0.3.0 distribution and adoption scope"
+  - name: "tier:T3"
+    color: "15803d"
+    description: "v0.4.0 and v1.0 leap features"
+  - name: "area:mcp"
+    color: "7c3aed"
+    description: "MCP server sandboxing and firewall"
+  - name: "area:profiles"
+    color: "059669"
+    description: "Profile and community catalog work"
+  - name: "area:integration"
+    color: "8b5cf6"
+    description: "Agent integrations, GitHub Action, and VS Code"
+  - name: "area:examples"
+    color: "059669"
+    description: "Examples and runnable demos"
+  - name: "area:compliance"
+    color: "1d4ed8"
+    description: "EU AI Act, audit trail standards, and signing"
+  - name: "area:bench"
+    color: "0ea5e9"
+    description: "Performance benchmarks and overhead"
 
 milestones:
   - key: "M0"
@@ -99,6 +129,15 @@ milestones:
   - key: "P3"
     title: "P3 - WSL2"
     description: "Windows support via WSL2."
+  - key: "V0.2"
+    title: "v0.2.0"
+    description: "Compliance Kit, MCP Server Firewall, and Tier 1 polish before the 2026-08-02 EU AI Act window."
+  - key: "V0.3"
+    title: "v0.3.0"
+    description: "GitHub Action, agent integrations, VS Code extension, and profiles.dev MVP."
+  - key: "V0.4"
+    title: "v0.4.0"
+    description: "clawcrate learn, profiles.dev signing, and leap features."
 
 epics:
   - id: "M0-EPIC"
@@ -191,7 +230,403 @@ epics:
       - "CI validates baseline WSL2 support."
       - "Known limitations are explicit in docs."
 
+  - id: "GH-219"
+    github_issue: 219
+    state: "open"
+    milestone: "v0.2.0"
+    title: "Epic 4: MCP Server Firewall - sandbox every MCP invocation"
+    labels: ["type:epic", "priority:p0", "tier:T1", "area:mcp", "area:profiles"]
+    objective: "Make ClawCrate the first practical sandbox layer for MCP servers by wrapping any stdio MCP server transparently."
+    source: "docs/roadmap-2026-05-09.md"
+    done_when:
+      - "`clawcrate mcp wrap` can launch a stdio MCP server through ClawCrate."
+      - "JSON-RPC stdio framing remains transparent to clients such as Claude Desktop, Cursor, and Continue.dev."
+      - "MCP server attempts to read local secrets are blocked and audited."
+      - "Integration recipes and a demo are available."
+
+  - id: "GH-220"
+    github_issue: 220
+    state: "open"
+    milestone: "v0.3.0"
+    title: "Epic 5: Distribution - GitHub Action + agent integrations + VS Code extension"
+    labels: ["type:epic", "priority:p1", "tier:T2", "area:integration", "area:examples"]
+    objective: "Move ClawCrate from individual local usage to team adoption through CI, reference integrations, and editor entry points."
+    source: "docs/roadmap-2026-05-09.md"
+    done_when:
+      - "`clawcrate/action@v1` exists and can upload audit artifacts."
+      - "Reference integration examples exist for major agent tools."
+      - "A VS Code extension MVP can run commands under ClawCrate and surface audit state."
+
+  - id: "GH-221"
+    github_issue: 221
+    state: "open"
+    milestone: "v0.3.0"
+    title: "Epic 3: profiles.dev - community-signed profile marketplace"
+    labels: ["type:epic", "priority:p1", "tier:T2", "area:profiles"]
+    objective: "Turn the local community profile catalog into a discoverable, cacheable, and eventually signed profile ecosystem."
+    source: "docs/roadmap-2026-05-09.md"
+    done_when:
+      - "`clawcrate profiles fetch/search/install` can work against the MVP catalog."
+      - "Downloaded profiles are verified by SHA256 before use."
+      - "The external profile repository is bootstrapped with contribution guidance and seed profiles."
+      - "Sigstore signing is defined for the v0.4.0 phase."
+
+  - id: "GH-222"
+    github_issue: 222
+    state: "open"
+    milestone: "v0.4.0"
+    title: "Epic 1: clawcrate learn - auto-generate tightest-fit profiles by tracing"
+    labels: ["type:epic", "priority:p1", "tier:T3", "platform:cross-platform", "crate:sandbox", "area:profiles"]
+    objective: "Remove YAML authoring friction by tracing command behavior and synthesizing the smallest useful ClawCrate profile."
+    source: "docs/roadmap-2026-05-09.md"
+    done_when:
+      - "`clawcrate learn` traces filesystem, network, environment, and process behavior."
+      - "Trace output can be reduced into a profile YAML."
+      - "Learned profiles can be used locally and published into the profile ecosystem."
+
 issues:
+  - id: "GH-219-01"
+    epic: "GH-219"
+    github_issue: 249
+    state: "closed"
+    milestone: "v0.2.0"
+    title: "feat(profiles): add mcp-server community profile"
+    labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "area:profiles"]
+    scope: "Add a read/write workspace MCP community profile with Replica mode, secret guardrails, no network access, catalog entry, docs, and resolver coverage."
+
+  - id: "GH-219-02"
+    epic: "GH-219"
+    github_issue: 251
+    state: "closed"
+    milestone: "v0.2.0"
+    title: "feat(profiles): add mcp-readonly community profile"
+    labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "area:profiles"]
+    scope: "Add a strict read-only MCP community profile with Replica mode, no write paths, no network access, catalog entry, docs, and resolver coverage."
+
+  - id: "GH-219-03"
+    epic: "GH-219"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.2.0"
+    title: "feat(cli): clawcrate mcp wrap subcommand"
+    labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "crate:cli"]
+    scope: "Add the CLI surface for `clawcrate mcp wrap --profile <profile> -- COMMAND...` without changing JSON-RPC relay behavior yet."
+
+  - id: "GH-219-04"
+    epic: "GH-219"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.2.0"
+    title: "feat(mcp): transparent stdin/stdout relay preserving JSON-RPC framing"
+    labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "crate:cli"]
+    scope: "Relay stdin/stdout between the MCP client and wrapped server while preserving stdio JSON-RPC framing and avoiding protocol-visible output."
+
+  - id: "GH-219-05"
+    epic: "GH-219"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.2.0"
+    title: "feat(mcp): auto-detect MCP server shape"
+    labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "crate:cli"]
+    scope: "Detect stdio JSON-RPC MCP server shape heuristically so ClawCrate can recommend or apply MCP-aware profiles safely."
+
+  - id: "GH-219-06"
+    epic: "GH-219"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.2.0"
+    title: "docs(integrations): Claude Desktop MCP wrap recipe"
+    labels: ["type:docs", "priority:p0", "tier:T1", "area:mcp", "area:docs"]
+    scope: "Document how to configure Claude Desktop to launch an MCP server through `clawcrate mcp wrap`."
+
+  - id: "GH-219-07"
+    epic: "GH-219"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.2.0"
+    title: "docs(integrations): Cursor MCP wrap recipe"
+    labels: ["type:docs", "priority:p0", "tier:T1", "area:mcp", "area:docs"]
+    scope: "Document how to configure Cursor MCP settings to launch an MCP server through `clawcrate mcp wrap`."
+
+  - id: "GH-219-08"
+    epic: "GH-219"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.2.0"
+    title: "docs(integrations): Continue.dev MCP wrap recipe"
+    labels: ["type:docs", "priority:p0", "tier:T1", "area:mcp", "area:docs"]
+    scope: "Document how to configure Continue.dev to launch an MCP server through `clawcrate mcp wrap`."
+
+  - id: "GH-219-09"
+    epic: "GH-219"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.2.0"
+    title: "examples(mcp): demo wrap of @modelcontextprotocol/server-filesystem"
+    labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "area:examples"]
+    scope: "Add a runnable example showing `@modelcontextprotocol/server-filesystem` launched through ClawCrate with an MCP profile."
+
+  - id: "GH-220-01"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(action): clawcrate/action@v1 GitHub Action"
+    labels: ["type:feature", "priority:p1", "tier:T2", "area:integration"]
+    scope: "Create the official GitHub Action entry point for running commands under ClawCrate in CI."
+
+  - id: "GH-220-02"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(action): upload-audit workflow artifact"
+    labels: ["type:feature", "priority:p1", "tier:T2", "area:integration"]
+    scope: "Add Action support for uploading `audit.ndjson` and related run artifacts as GitHub workflow artifacts."
+
+  - id: "GH-220-03"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(action): fail-on-tampering with clawcrate verify"
+    labels: ["type:feature", "priority:p1", "tier:T2", "area:integration", "area:compliance"]
+    scope: "Integrate `clawcrate verify` into the Action so CI can fail when audit integrity checks fail."
+
+  - id: "GH-220-04"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "examples(integrations): Claude Code wrap recipe"
+    labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
+    scope: "Add a reference recipe showing how Claude Code tool calls can be routed through ClawCrate."
+
+  - id: "GH-220-05"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "examples(integrations): Codex CLI wrap recipe"
+    labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
+    scope: "Add a reference recipe for using ClawCrate around Codex CLI commands or CI workflows."
+
+  - id: "GH-220-06"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "examples(integrations): Cursor terminal wrap recipe"
+    labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
+    scope: "Add a reference recipe for Cursor terminal command execution through ClawCrate."
+
+  - id: "GH-220-07"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "examples(integrations): Aider wrap recipe"
+    labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
+    scope: "Add a reference recipe for invoking Aider with commands routed through ClawCrate."
+
+  - id: "GH-220-08"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "examples(integrations): OpenClaw wrap recipe"
+    labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
+    scope: "Add a reference recipe for wrapping OpenClaw shell tool execution with ClawCrate."
+
+  - id: "GH-220-09"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "examples(integrations): Continue.dev wrap recipe"
+    labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
+    scope: "Add a reference recipe for Continue.dev command or MCP runner integration with ClawCrate."
+
+  - id: "GH-220-10"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(vscode): ClawCrate VS Code extension MVP"
+    labels: ["type:feature", "priority:p1", "tier:T2", "area:integration"]
+    scope: "Create a minimal VS Code extension entry point that can run a selected command under ClawCrate."
+
+  - id: "GH-220-11"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(vscode): audit panel viewer"
+    labels: ["type:feature", "priority:p1", "tier:T2", "area:integration"]
+    scope: "Add a VS Code panel that displays the latest audit events and highlights blocked operations."
+
+  - id: "GH-220-12"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(vscode): status bar indicator"
+    labels: ["type:feature", "priority:p1", "tier:T2", "area:integration"]
+    scope: "Show a VS Code status bar indicator when commands are being executed under ClawCrate."
+
+  - id: "GH-220-13"
+    epic: "GH-220"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "docs(adoption): ClawCrate Inside badge"
+    labels: ["type:docs", "priority:p2", "tier:T2", "area:docs", "area:integration"]
+    scope: "Document a badge and adoption guidance for projects that run CI or agent workflows through ClawCrate."
+
+  - id: "GH-221-01"
+    epic: "GH-221"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(profiles): clawcrate profiles fetch"
+    labels: ["type:feature", "priority:p1", "tier:T2", "area:profiles", "crate:profiles"]
+    scope: "Fetch profile YAML from the MVP GitHub raw catalog and cache it locally."
+
+  - id: "GH-221-02"
+    epic: "GH-221"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(profiles): clawcrate profiles search"
+    labels: ["type:feature", "priority:p1", "tier:T2", "area:profiles", "crate:profiles"]
+    scope: "Search the remote or cached profile catalog by name, tool, and tags."
+
+  - id: "GH-221-03"
+    epic: "GH-221"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(profiles): clawcrate profiles install"
+    labels: ["type:feature", "priority:p1", "tier:T2", "area:profiles", "crate:profiles"]
+    scope: "Install a selected profile into the local ClawCrate profile cache."
+
+  - id: "GH-221-04"
+    epic: "GH-221"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "chore(profiles): bootstrap clawcrate/profiles repository"
+    labels: ["type:infra", "priority:p1", "tier:T2", "area:profiles"]
+    scope: "Create the external community profile repository structure, README, contribution guide, and catalog schema."
+
+  - id: "GH-221-05"
+    epic: "GH-221"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(profiles): seed top-50 community profiles"
+    labels: ["type:feature", "priority:p1", "tier:T2", "area:profiles"]
+    scope: "Seed common profiles for cargo, pytest, npm test, npm install, go build, and other high-frequency commands."
+
+  - id: "GH-221-06"
+    epic: "GH-221"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(profiles): SHA256 verification for downloaded profiles"
+    labels: ["type:feature", "priority:p1", "tier:T2", "area:profiles", "crate:profiles"]
+    scope: "Verify downloaded profile YAML against expected SHA256 digests before installation or execution."
+
+  - id: "GH-221-07"
+    epic: "GH-221"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.3.0"
+    title: "feat(profiles): profile templating"
+    labels: ["type:feature", "priority:p2", "tier:T2", "area:profiles", "crate:profiles"]
+    scope: "Define and implement variables and includes for reusable community profile definitions."
+
+  - id: "GH-221-08"
+    epic: "GH-221"
+    github_issue: null
+    state: "planned"
+    milestone: "v0.4.0"
+    title: "feat(profiles): sigstore signing and transparency verification"
+    labels: ["type:feature", "priority:p1", "tier:T3", "area:profiles", "crate:profiles"]
+    scope: "Add Sigstore signing and transparency log verification for community profiles in the v0.4.0 phase."
+
+  - id: "GH-222-01"
+    epic: "GH-222"
+    github_issue: null
+    state: "deferred"
+    milestone: "v0.4.0"
+    title: "feat(learn): Linux trace harness with strace and lsof"
+    labels: ["type:feature", "priority:p1", "tier:T3", "platform:linux", "crate:sandbox"]
+    scope: "Trace filesystem, process, and command behavior on Linux using strace and lsof as the first learn harness."
+
+  - id: "GH-222-02"
+    epic: "GH-222"
+    github_issue: null
+    state: "deferred"
+    milestone: "v0.4.0"
+    title: "feat(learn): network access detection via procfs"
+    labels: ["type:feature", "priority:p1", "tier:T3", "platform:linux", "crate:sandbox"]
+    scope: "Detect network access during learning by observing `/proc/<pid>/net/tcp` and related process state."
+
+  - id: "GH-222-03"
+    epic: "GH-222"
+    github_issue: null
+    state: "deferred"
+    milestone: "v0.4.0"
+    title: "feat(learn): profile synthesizer"
+    labels: ["type:feature", "priority:p1", "tier:T3", "area:profiles", "crate:profiles"]
+    scope: "Convert trace observations into a ClawCrate-compatible profile YAML."
+
+  - id: "GH-222-04"
+    epic: "GH-222"
+    github_issue: null
+    state: "deferred"
+    milestone: "v0.4.0"
+    title: "feat(learn): tightest-fit reduction"
+    labels: ["type:feature", "priority:p1", "tier:T3", "area:profiles", "crate:profiles"]
+    scope: "Reduce raw trace observations into minimal read/write/network/env policy sets."
+
+  - id: "GH-222-05"
+    epic: "GH-222"
+    github_issue: null
+    state: "deferred"
+    milestone: "v0.4.0"
+    title: "feat(cli): clawcrate learn subcommand"
+    labels: ["type:feature", "priority:p1", "tier:T3", "crate:cli", "area:profiles"]
+    scope: "Expose the learning workflow through a `clawcrate learn -- COMMAND...` CLI subcommand."
+
+  - id: "GH-222-06"
+    epic: "GH-222"
+    github_issue: null
+    state: "deferred"
+    milestone: "v0.4.0"
+    title: "feat(learn): clawcrate profiles publish integration"
+    labels: ["type:feature", "priority:p1", "tier:T3", "area:profiles", "crate:cli"]
+    scope: "Allow learned profiles to be submitted or prepared for publication into the community profile ecosystem."
+
+  - id: "GH-222-07"
+    epic: "GH-222"
+    github_issue: null
+    state: "deferred"
+    milestone: "v0.4.0"
+    title: "docs(learn): tutorial and macOS caveats"
+    labels: ["type:docs", "priority:p1", "tier:T3", "area:docs", "area:profiles"]
+    scope: "Document the learn workflow and platform caveats, including macOS SIP limitations."
+
+  - id: "GH-222-08"
+    epic: "GH-222"
+    github_issue: null
+    state: "deferred"
+    milestone: "v0.4.0"
+    title: "feat(learn): macOS DTrace harness"
+    labels: ["type:feature", "priority:p2", "tier:T3", "platform:macos", "crate:sandbox"]
+    scope: "Add a best-effort macOS DTrace learning harness for environments where SIP constraints permit it."
+
   - id: "M0-01"
     epic: "M0-EPIC"
     milestone: "M0 - Workspace Bootstrap"
