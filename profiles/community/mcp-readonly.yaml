@@ -1,0 +1,56 @@
+name: mcp-readonly
+default_mode: Replica
+
+filesystem:
+  read:
+    - "."
+  write: []
+  deny:
+    - ".env"
+    - ".env.*"
+    - "**/.env"
+    - "**/.env.*"
+    - ".git/config"
+    - "**/.git/config"
+    - ".npmrc"
+    - "**/.npmrc"
+    - ".pypirc"
+    - "**/.pypirc"
+    - ".netrc"
+    - "**/.netrc"
+
+network: none
+
+environment:
+  scrub:
+    - "AWS_*"
+    - "AZURE_*"
+    - "GCP_*"
+    - "GOOGLE_APPLICATION_CREDENTIALS"
+    - "ANTHROPIC_API_KEY"
+    - "OPENAI_API_KEY"
+    - "GITHUB_TOKEN"
+    - "NPM_TOKEN"
+    - "DATABASE_URL"
+    - "SSH_AUTH_SOCK"
+    - "*_SECRET*"
+    - "*_PASSWORD*"
+    - "*_TOKEN*"
+    - "*_KEY"
+  passthrough:
+    - "HOME"
+    - "PATH"
+    - "USER"
+    - "SHELL"
+    - "TERM"
+    - "LANG"
+    - "LC_*"
+    - "TMPDIR"
+    - "XDG_*"
+
+resources:
+  max_cpu_seconds: 600
+  max_memory_mb: 2048
+  max_open_files: 1024
+  max_processes: 128
+  max_output_bytes: 8388608

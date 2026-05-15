@@ -35,3 +35,13 @@ profiles:
       - agent
       - replica
       - no-network
+  - id: mcp-readonly
+    title: MCP server read-only workspace profile (no writes, no secrets, no network)
+    path: mcp-readonly.yaml
+    owner: "@clawcrate-community"
+    tags:
+      - mcp
+      - agent
+      - read-only
+      - replica
+      - no-network
