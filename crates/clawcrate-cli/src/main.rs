@@ -2,9 +2,10 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use clawcrate_audit::{
 };
 use clawcrate_capture::{
     capture_streams, diff_snapshots, snapshot_paths, CaptureConfig, CaptureError, CaptureSummary,
-    FsChange, FsChangeKind,
+    FsChange, FsChangeKind, StreamCaptureStats,
 };
 use clawcrate_profiles::ProfileResolver;
 #[cfg(target_os = "macos")]
@@ -368,22 +369,98 @@ fn handle_mcp_wrap(
     let cwd =
         std::env::current_dir().map_err(|source| anyhow!("failed to get current dir: {source}"))?;
     let plan = build_mcp_wrap_plan(resolver, &cwd, &args)?;
+    let mut sqlite_index = configure_optional_sqlite_index(output);
     verbose_log(
         output,
         1,
         format!(
-            "mcp wrap parsed: profile={}, mode={:?}, command={}",
+            "mcp wrap start: id={}, profile={}, mode={:?}, command={}",
+            plan.id,
             plan.profile.name,
             plan.mode,
             plan.command.join(" ")
         ),
     );
 
-    Err(anyhow!(
-        "`clawcrate mcp wrap` parsed successfully and resolved profile `{}` for `{}`, but transparent MCP stdio relay is not implemented yet; continue with GitHub issue #254",
-        plan.profile.name,
-        plan.command.join(" ")
-    ))
+    let writer = ArtifactWriter::new(&runs_root()?, &plan.id)
+        .map_err(|source| anyhow!("failed to initialize artifact writer: {source}"))?;
+    verbose_log(
+        output,
+        2,
+        format!(
+            "mcp artifacts dir initialized at {}",
+            writer.artifacts_dir().display()
+        ),
+    );
+
+    writer
+        .write_plan(&plan)
+        .map_err(|source| anyhow!("failed to write plan artifact: {source}"))?;
+
+    let started_at = Instant::now();
+    let pipeline = match execute_mcp_wrap_pipeline(&plan, &writer) {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            persist_sandbox_error_result(
+                &writer,
+                &plan.id,
+                started_at.elapsed().as_millis() as u64,
+                &error,
+            )?;
+            maybe_index_artifacts_in_sqlite(&mut sqlite_index, &writer, output);
+            return Err(error);
+        }
+    };
+
+    writer
+        .write_fs_diff(&pipeline.fs_diff)
+        .map_err(|source| anyhow!("failed to write fs-diff artifact: {source}"))?;
+
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+    append_audit_event(
+        &writer,
+        AuditEventKind::ProcessExited {
+            exit_code: pipeline.execution.exit_status.code().unwrap_or(-1),
+            duration_ms,
+        },
+    )?;
+
+    let result = ExecutionResult {
+        id: plan.id.clone(),
+        exit_code: pipeline.execution.exit_status.code(),
+        status: execution_status(
+            &pipeline.execution.exit_status,
+            pipeline.execution.termination,
+        ),
+        duration_ms,
+        artifacts_dir: writer.artifacts_dir().to_path_buf(),
+    };
+    writer
+        .write_result(&result)
+        .map_err(|source| anyhow!("failed to write result artifact: {source}"))?;
+    maybe_index_artifacts_in_sqlite(&mut sqlite_index, &writer, output);
+
+    verbose_log(
+        output,
+        1,
+        format!(
+            "mcp wrap exit: id={}, backend={}, status={:?}, scrubbed_env_vars={}, output_truncated={}",
+            plan.id,
+            pipeline.execution.backend,
+            result.status,
+            pipeline.execution.scrubbed_keys.len(),
+            pipeline.execution.relay_summary.truncated
+        ),
+    );
+
+    if pipeline.execution.exit_status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "wrapped MCP server exited with status {}",
+            pipeline.execution.exit_status
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -405,6 +482,21 @@ enum RunTermination {
 #[derive(Debug)]
 struct RunPipelineResult {
     execution: RunExecutionOutcome,
+    fs_diff: Vec<FsChange>,
+}
+
+#[derive(Debug)]
+struct McpRelayExecutionOutcome {
+    backend: String,
+    scrubbed_keys: Vec<String>,
+    exit_status: ExitStatus,
+    relay_summary: CaptureSummary,
+    termination: RunTermination,
+}
+
+#[derive(Debug)]
+struct McpRelayPipelineResult {
+    execution: McpRelayExecutionOutcome,
     fs_diff: Vec<FsChange>,
 }
 
@@ -544,6 +636,30 @@ fn execute_run_pipeline(
     let fs_diff = diff_snapshots(&snapshot_before, &snapshot_after);
 
     Ok(RunPipelineResult { execution, fs_diff })
+}
+
+fn execute_mcp_wrap_pipeline(
+    plan: &ExecutionPlan,
+    writer: &ArtifactWriter,
+) -> Result<McpRelayPipelineResult> {
+    materialize_workspace_for_execution(plan, writer)?;
+    let fs_diff_roots = resolve_fs_diff_roots(plan);
+    let snapshot_before = snapshot_paths(&fs_diff_roots).map_err(|source| {
+        anyhow!("failed to snapshot writable paths before MCP execution: {source}")
+    })?;
+
+    let capture_config = CaptureConfig {
+        artifacts_dir: writer.artifacts_dir().to_path_buf(),
+        max_output_bytes: plan.profile.resources.max_output_bytes,
+    };
+    let execution = launch_and_relay_mcp(plan, writer, &capture_config)?;
+
+    let snapshot_after = snapshot_paths(&fs_diff_roots).map_err(|source| {
+        anyhow!("failed to snapshot writable paths after MCP execution: {source}")
+    })?;
+    let fs_diff = diff_snapshots(&snapshot_before, &snapshot_after);
+
+    Ok(McpRelayPipelineResult { execution, fs_diff })
 }
 
 #[derive(Clone, Copy)]
@@ -1718,11 +1834,455 @@ fn launch_and_capture(
     Err(anyhow!("unsupported platform for `run` command"))
 }
 
+#[cfg(target_os = "linux")]
+fn launch_and_relay_mcp(
+    plan: &ExecutionPlan,
+    writer: &ArtifactWriter,
+    capture_config: &CaptureConfig,
+) -> Result<McpRelayExecutionOutcome> {
+    let sandbox = LinuxSandbox::new();
+    let mut prepared = sandbox.prepare(plan);
+    let egress_proxy =
+        maybe_start_filtered_egress_proxy(&plan.profile.net, &mut prepared.scrubbed_env)?;
+    let scrubbed_keys = prepared.scrubbed_keys.clone();
+
+    let mut capabilities = vec![
+        "rlimits".to_string(),
+        "landlock".to_string(),
+        "seccomp".to_string(),
+        "stdio-relay".to_string(),
+    ];
+    if egress_proxy.is_some() {
+        capabilities.push("egress-proxy".to_string());
+    }
+    append_audit_event(
+        writer,
+        AuditEventKind::SandboxApplied {
+            backend: "linux".to_string(),
+            capabilities,
+        },
+    )?;
+    if !scrubbed_keys.is_empty() {
+        append_audit_event(
+            writer,
+            AuditEventKind::EnvScrubbed {
+                removed: scrubbed_keys.clone(),
+            },
+        )?;
+    }
+
+    let mut child = sandbox
+        .launch_with_stdio(&prepared, Stdio::inherit(), Stdio::piped(), Stdio::piped())
+        .map_err(|source| anyhow!("failed to launch linux MCP sandbox: {source}"))?;
+    let pid = child.pid();
+    append_audit_event(
+        writer,
+        AuditEventKind::ProcessStarted {
+            pid,
+            command: plan.command.clone(),
+        },
+    )?;
+
+    let stdout = child
+        .child_mut()
+        .stdout
+        .take()
+        .ok_or(CaptureError::MissingStdoutPipe)
+        .map_err(|source| anyhow!("failed to relay MCP stdout pipe: {source}"))?;
+    let stderr = child
+        .child_mut()
+        .stderr
+        .take()
+        .ok_or(CaptureError::MissingStderrPipe)
+        .map_err(|source| anyhow!("failed to relay MCP stderr pipe: {source}"))?;
+    let monitored = run_mcp_relay_child(
+        child.child_mut(),
+        stdout,
+        stderr,
+        capture_config,
+        plan.profile.resources.max_cpu_seconds,
+        Some(pid as i32),
+    )?;
+    drop(egress_proxy);
+
+    Ok(McpRelayExecutionOutcome {
+        backend: "linux".to_string(),
+        scrubbed_keys,
+        exit_status: monitored.exit_status,
+        relay_summary: monitored.capture_summary,
+        termination: monitored.termination,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn launch_and_relay_mcp(
+    plan: &ExecutionPlan,
+    writer: &ArtifactWriter,
+    capture_config: &CaptureConfig,
+) -> Result<McpRelayExecutionOutcome> {
+    let sandbox = DarwinSandbox::new();
+    let mut prepared = sandbox.prepare(plan);
+    let egress_proxy =
+        maybe_start_filtered_egress_proxy(&plan.profile.net, &mut prepared.scrubbed_env)?;
+    let scrubbed_keys = prepared.scrubbed_keys.clone();
+
+    let mut capabilities = vec!["seatbelt".to_string(), "stdio-relay".to_string()];
+    if egress_proxy.is_some() {
+        capabilities.push("egress-proxy".to_string());
+    }
+    append_audit_event(
+        writer,
+        AuditEventKind::SandboxApplied {
+            backend: "macos-seatbelt".to_string(),
+            capabilities,
+        },
+    )?;
+    if !scrubbed_keys.is_empty() {
+        append_audit_event(
+            writer,
+            AuditEventKind::EnvScrubbed {
+                removed: scrubbed_keys.clone(),
+            },
+        )?;
+    }
+
+    let mut child = sandbox
+        .launch_with_stdio(&prepared, Stdio::inherit(), Stdio::piped(), Stdio::piped())
+        .map_err(|source| anyhow!("failed to launch macOS MCP sandbox: {source}"))?;
+    let pid = child.pid();
+    append_audit_event(
+        writer,
+        AuditEventKind::ProcessStarted {
+            pid,
+            command: plan.command.clone(),
+        },
+    )?;
+
+    let stdout = child
+        .child_mut()
+        .stdout
+        .take()
+        .ok_or(CaptureError::MissingStdoutPipe)
+        .map_err(|source| anyhow!("failed to relay MCP stdout pipe: {source}"))?;
+    let stderr = child
+        .child_mut()
+        .stderr
+        .take()
+        .ok_or(CaptureError::MissingStderrPipe)
+        .map_err(|source| anyhow!("failed to relay MCP stderr pipe: {source}"))?;
+    let monitored = run_mcp_relay_child(
+        child.child_mut(),
+        stdout,
+        stderr,
+        capture_config,
+        plan.profile.resources.max_cpu_seconds,
+        Some(pid as i32),
+    )?;
+    drop(egress_proxy);
+
+    Ok(McpRelayExecutionOutcome {
+        backend: "macos-seatbelt".to_string(),
+        scrubbed_keys,
+        exit_status: monitored.exit_status,
+        relay_summary: monitored.capture_summary,
+        termination: monitored.termination,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn launch_and_relay_mcp(
+    _plan: &ExecutionPlan,
+    _writer: &ArtifactWriter,
+    _capture_config: &CaptureConfig,
+) -> Result<McpRelayExecutionOutcome> {
+    Err(anyhow!("unsupported platform for `mcp wrap` command"))
+}
+
 #[derive(Debug)]
 struct MonitoredChildResult {
     exit_status: ExitStatus,
     capture_summary: CaptureSummary,
     termination: RunTermination,
+}
+
+const MCP_RELAY_CHUNK_SIZE: usize = 8192;
+
+fn run_mcp_relay_child(
+    child: &mut Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    capture_config: &CaptureConfig,
+    timeout_seconds: u64,
+    process_group_id: Option<i32>,
+) -> Result<MonitoredChildResult> {
+    #[cfg(unix)]
+    let mut signals = Signals::new([SIGINT, SIGTERM])
+        .map_err(|source| anyhow!("failed to install signal handlers: {source}"))?;
+
+    #[cfg(unix)]
+    let mut poll_pending_interrupts = || {
+        signals
+            .pending()
+            .filter(|signal| *signal == SIGINT || *signal == SIGTERM)
+            .count()
+    };
+    #[cfg(not(unix))]
+    let mut poll_pending_interrupts = || 0usize;
+
+    run_mcp_relay_child_with_signal_poller(
+        child,
+        stdout,
+        stderr,
+        capture_config,
+        timeout_seconds,
+        process_group_id,
+        &mut poll_pending_interrupts,
+    )
+}
+
+fn run_mcp_relay_child_with_signal_poller<F>(
+    child: &mut Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    capture_config: &CaptureConfig,
+    timeout_seconds: u64,
+    process_group_id: Option<i32>,
+    poll_pending_interrupts: &mut F,
+) -> Result<MonitoredChildResult>
+where
+    F: FnMut() -> usize,
+{
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+    const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(2);
+    const RELAY_DRAIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
+    const RELAY_DRAIN_MAX_WAIT: Duration = Duration::from_secs(2);
+
+    let capture_config = capture_config.clone();
+    let (relay_tx, relay_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = relay_tx.send(relay_mcp_streams(stdout, stderr, &capture_config));
+    });
+
+    let started_at = Instant::now();
+    let mut interrupted = false;
+    let mut timed_out = false;
+    let mut interrupt_sent_at: Option<Instant> = None;
+    let mut interrupt_forced_kill = false;
+
+    let timeout_limit = (timeout_seconds > 0).then(|| Duration::from_secs(timeout_seconds));
+    let exit_status = loop {
+        let pending_interrupts = poll_pending_interrupts();
+        let was_interrupted = interrupted;
+        if pending_interrupts > 0 {
+            if !interrupted {
+                send_termination_signal(child, process_group_id)?;
+                interrupted = true;
+                interrupt_sent_at = Some(Instant::now());
+            }
+
+            let repeated_interrupt = pending_interrupts > 1 || was_interrupted;
+            if repeated_interrupt && !timed_out && !interrupt_forced_kill {
+                send_kill_signal(child, process_group_id)?;
+                interrupt_forced_kill = true;
+            }
+        }
+
+        if !timed_out
+            && timeout_limit
+                .map(|timeout| started_at.elapsed() >= timeout)
+                .unwrap_or(false)
+        {
+            send_kill_signal(child, process_group_id)?;
+            timed_out = true;
+        }
+
+        if interrupted && !timed_out && !interrupt_forced_kill {
+            if let Some(interrupt_at) = interrupt_sent_at {
+                if interrupt_at.elapsed() >= INTERRUPT_GRACE_PERIOD {
+                    send_kill_signal(child, process_group_id)?;
+                    interrupt_forced_kill = true;
+                }
+            }
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| anyhow!("failed while waiting for MCP server exit: {source}"))?
+        {
+            break status;
+        }
+
+        thread::sleep(POLL_INTERVAL);
+    };
+
+    let relay_wait_started = Instant::now();
+    let mut relay_force_kill_sent = false;
+    let capture_summary = loop {
+        match relay_rx.recv_timeout(POLL_INTERVAL) {
+            Ok(Ok(summary)) => break summary,
+            Ok(Err(source)) => return Err(source),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!(
+                    "MCP relay thread disconnected before returning capture summary"
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !relay_force_kill_sent
+                    && relay_wait_started.elapsed() >= RELAY_DRAIN_GRACE_PERIOD
+                {
+                    send_kill_signal(child, process_group_id)?;
+                    relay_force_kill_sent = true;
+                }
+
+                if relay_wait_started.elapsed() >= RELAY_DRAIN_MAX_WAIT {
+                    return Err(anyhow!(
+                        "timed out draining MCP relay output; descendant process may be holding stdout/stderr open"
+                    ));
+                }
+            }
+        }
+    };
+
+    let termination = if timed_out {
+        RunTermination::Timeout
+    } else if interrupted {
+        RunTermination::Interrupted
+    } else {
+        RunTermination::Exited
+    };
+
+    Ok(MonitoredChildResult {
+        exit_status,
+        capture_summary,
+        termination,
+    })
+}
+
+fn relay_mcp_streams(
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    capture_config: &CaptureConfig,
+) -> Result<CaptureSummary> {
+    std::fs::create_dir_all(&capture_config.artifacts_dir).map_err(|source| {
+        anyhow!(
+            "failed to create MCP relay artifact directory {}: {source}",
+            capture_config.artifacts_dir.display()
+        )
+    })?;
+    let remaining_log_bytes = Arc::new(Mutex::new(capture_config.max_output_bytes));
+
+    let stdout_log = capture_config.stdout_log_path();
+    let stdout_budget = Arc::clone(&remaining_log_bytes);
+    let stdout_handle = thread::spawn(move || {
+        relay_stream_to_output_and_log(stdout, io::stdout(), stdout_log, stdout_budget)
+    });
+
+    let stderr_log = capture_config.stderr_log_path();
+    let stderr_budget = Arc::clone(&remaining_log_bytes);
+    let stderr_handle = thread::spawn(move || {
+        relay_stream_to_output_and_log(stderr, io::stderr(), stderr_log, stderr_budget)
+    });
+
+    let stdout = join_relay_thread(stdout_handle)?;
+    let stderr = join_relay_thread(stderr_handle)?;
+    Ok(capture_summary(stdout, stderr))
+}
+
+fn relay_stream_to_output_and_log<R, W>(
+    mut input: R,
+    mut output: W,
+    log_path: PathBuf,
+    remaining_log_bytes: Arc<Mutex<u64>>,
+) -> Result<StreamCaptureStats>
+where
+    R: Read,
+    W: Write,
+{
+    let mut log = File::create(&log_path).map_err(|source| {
+        anyhow!(
+            "failed to create MCP relay log {}: {source}",
+            log_path.display()
+        )
+    })?;
+    let mut written_bytes = 0u64;
+    let mut dropped_bytes = 0u64;
+    let mut buffer = [0u8; MCP_RELAY_CHUNK_SIZE];
+
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|source| anyhow!("failed to read MCP relay stream: {source}"))?;
+        if read == 0 {
+            break;
+        }
+
+        if !write_mcp_relay_output(&mut output, &buffer[..read])? {
+            break;
+        }
+
+        let log_bytes = {
+            let mut remaining = remaining_log_bytes
+                .lock()
+                .map_err(|_| anyhow!("MCP relay output budget lock poisoned"))?;
+            let allowed = (*remaining).min(read as u64) as usize;
+            *remaining -= allowed as u64;
+            allowed
+        };
+
+        if log_bytes > 0 {
+            log.write_all(&buffer[..log_bytes])
+                .map_err(|source| anyhow!("failed to write MCP relay log: {source}"))?;
+            written_bytes += log_bytes as u64;
+        }
+        dropped_bytes += (read - log_bytes) as u64;
+    }
+
+    log.flush()
+        .map_err(|source| anyhow!("failed to flush MCP relay log: {source}"))?;
+
+    Ok(StreamCaptureStats {
+        written_bytes,
+        dropped_bytes,
+    })
+}
+
+fn write_mcp_relay_output<W>(output: &mut W, bytes: &[u8]) -> Result<bool>
+where
+    W: Write,
+{
+    if let Err(source) = output.write_all(bytes) {
+        if source.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(false);
+        }
+        return Err(anyhow!("failed to write MCP relay output: {source}"));
+    }
+    if let Err(source) = output.flush() {
+        if source.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(false);
+        }
+        return Err(anyhow!("failed to flush MCP relay output: {source}"));
+    }
+    Ok(true)
+}
+
+fn join_relay_thread(
+    handle: thread::JoinHandle<Result<StreamCaptureStats>>,
+) -> Result<StreamCaptureStats> {
+    handle
+        .join()
+        .map_err(|_| anyhow!("MCP relay stream thread panicked"))?
+}
+
+fn capture_summary(stdout: StreamCaptureStats, stderr: StreamCaptureStats) -> CaptureSummary {
+    let total_written_bytes = stdout.written_bytes + stderr.written_bytes;
+    let total_dropped_bytes = stdout.dropped_bytes + stderr.dropped_bytes;
+    CaptureSummary {
+        stdout,
+        stderr,
+        total_written_bytes,
+        total_dropped_bytes,
+        truncated: total_dropped_bytes > 0,
+    }
 }
 
 fn run_monitored_child(
@@ -3348,7 +3908,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -3361,12 +3921,13 @@ mod tests {
         copy_workspace_with_default_exclusions, detect_out_of_profile_requests, doctor_rows,
         execution_status, execution_status_from_exit_status, extract_bearer_token,
         extract_host_from_reference, is_replica_sync_back_interactive, load_replica_ignore_config,
-        materialize_workspace_for_execution, request_authorized, resolve_api_route,
-        resolve_execution_path, run_monitored_child, run_monitored_child_with_signal_poller,
-        select_default_mode, serialize_api_payload, should_exclude_default_replica_path,
-        should_use_color, ApiCommandRequest, ApiRoute, AuditCommand, AuditExportFormat,
-        BoundedWorkQueue, BridgeTarget, Cli, CommandArgs, Commands, McpCommand, McpWrapArgs,
-        PennyPromptBridgeRequest, QueueEnqueueError, ReplicaSyncChange, RunTermination,
+        materialize_workspace_for_execution, relay_stream_to_output_and_log, request_authorized,
+        resolve_api_route, resolve_execution_path, run_monitored_child,
+        run_monitored_child_with_signal_poller, select_default_mode, serialize_api_payload,
+        should_exclude_default_replica_path, should_use_color, ApiCommandRequest, ApiRoute,
+        AuditCommand, AuditExportFormat, BoundedWorkQueue, BridgeTarget, Cli, CommandArgs,
+        Commands, McpCommand, McpWrapArgs, PennyPromptBridgeRequest, QueueEnqueueError,
+        ReplicaSyncChange, RunTermination,
     };
     #[cfg(unix)]
     use super::{eligible_process_group_id, send_unix_signal_with_group_fallback_impl};
@@ -3536,6 +4097,78 @@ mod tests {
         assert_eq!(plan.profile.name, "mcp-readonly");
         assert_eq!(plan.command, args.command);
         assert!(matches!(plan.mode, WorkspaceMode::Replica { .. }));
+    }
+
+    #[test]
+    fn mcp_relay_preserves_json_rpc_framing_bytes() {
+        let tmp = unique_tmp_dir("clawcrate_mcp_relay_preserves");
+        let log_path = tmp.join("stdout.log");
+        let input = b"Content-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"ok\"}";
+        let mut output = Vec::new();
+
+        let stats = relay_stream_to_output_and_log(
+            io::Cursor::new(input),
+            &mut output,
+            log_path.clone(),
+            Arc::new(Mutex::new(1024)),
+        )
+        .expect("relay stream");
+
+        assert_eq!(output, input);
+        assert_eq!(fs::read(log_path).expect("read relay log"), input);
+        assert_eq!(stats.written_bytes, input.len() as u64);
+        assert_eq!(stats.dropped_bytes, 0);
+    }
+
+    #[test]
+    fn mcp_relay_truncates_log_without_truncating_client_output() {
+        let tmp = unique_tmp_dir("clawcrate_mcp_relay_truncates_log");
+        let log_path = tmp.join("stdout.log");
+        let input = b"123456789";
+        let mut output = Vec::new();
+
+        let stats = relay_stream_to_output_and_log(
+            io::Cursor::new(input),
+            &mut output,
+            log_path.clone(),
+            Arc::new(Mutex::new(5)),
+        )
+        .expect("relay stream");
+
+        assert_eq!(output, input);
+        assert_eq!(fs::read(log_path).expect("read relay log"), b"12345");
+        assert_eq!(stats.written_bytes, 5);
+        assert_eq!(stats.dropped_bytes, 4);
+    }
+
+    #[test]
+    fn mcp_relay_treats_broken_pipe_as_clean_client_disconnect() {
+        struct BrokenPipeWriter;
+
+        impl io::Write for BrokenPipeWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tmp = unique_tmp_dir("clawcrate_mcp_relay_broken_pipe");
+        let log_path = tmp.join("stdout.log");
+
+        let stats = relay_stream_to_output_and_log(
+            io::Cursor::new(b"server response"),
+            BrokenPipeWriter,
+            log_path.clone(),
+            Arc::new(Mutex::new(1024)),
+        )
+        .expect("broken pipe should be treated as clean disconnect");
+
+        assert_eq!(fs::read(log_path).expect("read relay log"), b"");
+        assert_eq!(stats.written_bytes, 0);
+        assert_eq!(stats.dropped_bytes, 0);
     }
 
     #[test]
