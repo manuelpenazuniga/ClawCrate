@@ -28,6 +28,20 @@ P1 introduces a new level:
 
 - `filtered`: command egress must pass through local policy-aware proxy.
 
+## Current Implementation Status
+
+The current implementation is proxy-mediated filtering. ClawCrate starts a
+loopback CONNECT proxy, injects `HTTP_PROXY`, `HTTPS_PROXY`, and related proxy
+environment variables into the sandboxed child, and enforces the configured
+domain allowlist at the proxy.
+
+Backends currently permit network syscalls for `network: filtered` so that
+proxy-aware tools can connect to the loopback proxy. This means filtered mode
+must be described as best-effort unless the deployment also enforces direct
+egress bypass prevention. Tools that ignore proxy environment variables can
+attempt direct network connections; those attempts are outside the proxy's
+domain decision path.
+
 ## High-Level Architecture
 
 ```text

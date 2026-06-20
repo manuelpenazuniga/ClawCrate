@@ -171,5 +171,8 @@ Parser behavior includes:
   - absolute patterns are kept as-is
   - relative patterns are resolved from execution cwd
   - `~`/`~/...` patterns expand from `HOME`
-- Linux intra-workspace deny behavior depends on Landlock implementation status.
-- For sensitive file filtering in alpha, use Replica mode + default exclusions + `.clawcrateignore`.
+- Linux Direct Mode does not provide reliable sensitive-file read denial inside
+  an allowed workspace. The current Landlock path is focused on write controls.
+- For sensitive file filtering in alpha, use Replica Mode + default exclusions +
+  `.clawcrateignore`. This is the intended cross-platform way to keep readable
+  secrets out of the materialized execution workspace.

@@ -8,6 +8,37 @@ with alpha pre-release tags.
 
 ## [Unreleased]
 
+## [0.2.0-alpha.0] - 2026-06-20
+
+### Added
+- Compliance Kit audit features:
+  SHA-256 hash-chain audit lines, deterministic canonical JSON hashing,
+  offline `clawcrate verify <run-id>`, Ed25519 block signatures, and
+  SIEM-oriented audit export formats (`json`, `cef`, `syslog`, `elastic`).
+- Compliance documentation mapping ClawCrate audit artifacts to EU AI Act
+  Article 12/19/26 evidence boundaries and IETF Agent Audit Trail alignment.
+- Hash-chain benchmark coverage for compute, append, and verification paths.
+- Community profiles:
+  `agent-inference-allowlist`, `mcp-server`, and `mcp-readonly`.
+- `examples/agent-demo/` for a minimal agent flow delegating commands through
+  ClawCrate.
+- Structured roadmap/backlog docs for the `v0.2.0`, `v0.3.0`, and `v0.4.0`
+  milestones.
+
+### Changed
+- Clarified Linux Direct Mode filesystem boundaries: current Linux Landlock
+  enforcement focuses on write controls; Replica Mode is the supported path for
+  excluding sensitive readable files before execution.
+- Clarified `network: filtered` as proxy-mediated domain filtering with
+  documented bypass caveats for tools that ignore proxy environment variables.
+- Updated release planning around the MCP Server Firewall as the next active
+  `v0.2.0` workstream after this Compliance Kit alpha.
+
+### Fixed
+- Internal audit-control environment variables (`CLAWCRATE_AUDIT_*`) are now
+  always removed from the sandboxed child environment, even if a profile would
+  otherwise pass through `CLAWCRATE_*`.
+
 ## [0.1.0-alpha.2] - 2026-04-30
 
 ### Fixed

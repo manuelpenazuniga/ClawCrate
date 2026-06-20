@@ -36,6 +36,13 @@ In the current alpha codebase, Linux launch stages are wired as:
 These stages are implemented and enforced during Linux launch.
 Historical note: issue `#69` ("Implement real Linux enforcement") is closed.
 
+Current Linux Landlock policy is focused on filesystem write controls for
+allowed `filesystem.write` paths. Do not treat Linux Direct Mode as a reliable
+secret-read deny boundary for sensitive files inside or adjacent to an allowed
+workspace. Use Replica Mode when a workflow must exclude readable files such as
+`.env*`, `.git/config`, package registry credentials, or other local secrets
+before execution.
+
 ## macOS
 
 ## Minimum baseline

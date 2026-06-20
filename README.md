@@ -43,7 +43,7 @@ Agent says: "run npm test"
 clawcrate run --profile build -- npm test
     │
     ├── Sandbox applied (kernel-level, irremovible)
-    ├── ~/.ssh, ~/.aws, Keychain → blocked
+    ├── Secrets blocked via env scrub, macOS denies, or Replica filtering
     ├── Env vars scrubbed (AWS_SECRET_ACCESS_KEY → gone)
     ├── Filesystem: read project, write only target/
     ├── Network: blocked
@@ -240,7 +240,7 @@ For regulated AI-agent deployments, see the [EU AI Act compliance mapping](docs/
 | | Linux | macOS |
 |---|-------|-------|
 | **Mechanism** | Landlock LSM + seccomp-bpf | Seatbelt (sandbox-exec) |
-| **Filesystem** | Path-hierarchy deny | Path + regex deny (intra-workspace) |
+| **Filesystem** | Landlock write controls; Replica Mode for secret read filtering | Path + regex deny (intra-workspace) |
 | **Syscalls** | seccomp-bpf per-syscall filtering | Seatbelt operation categories |
 | **Network** | Blocked by default | Blocked by default |
 | **Resources** | rlimits | rlimits |
@@ -297,7 +297,7 @@ ClawCrate integrates at the boundary where the agent delegates shell command exe
 
 | Platform | Minimum | Recommended |
 |----------|---------|-------------|
-| **Linux** | Kernel 5.13+ (Landlock v1) | Kernel 6.7+ (Landlock v4, network control) |
+| **Linux** | Kernel 5.13+ (Landlock v1) | Kernel 6.7+ for newer Landlock capabilities |
 | **macOS** | macOS 12+ (Monterey) | macOS 14+ (Sonoma) |
 
 Run `clawcrate doctor` to check your system's capabilities.
@@ -306,12 +306,15 @@ Run `clawcrate doctor` to check your system's capabilities.
 
 - [x] Project specification (v3.1.1)
 - [x] **Alpha** — `run`, `plan`, `doctor`, `api`, `bridge pennyprompt`. Profiles. Dual-platform sandbox. Replica mode. Artifacts.
-- [x] **P1** — Egress proxy (network filtering by domain). Approval workflow. Community profiles.
+- [x] **P1** — Egress proxy (proxy-mediated domain filtering; see threat-model caveats). Approval workflow. Community profiles.
 - [x] **P2** — SQLite audit storage. API/bridge hardening and expanded integration contracts.
 - [ ] **v1.0** — Production hardening. Windows (WSL2). Plugin system.
 
 Transition note:
 The latest alpha release is published on GitHub Releases. Quickstart installs from the latest published release assets; see `CHANGELOG.md` for version-specific details.
+
+Linux note:
+Direct Mode currently uses Landlock for filesystem write controls and seccomp for syscall/network restrictions. For Linux workflows that must exclude sensitive readable files inside or near an allowed workspace, use Replica Mode so `.env*`, `.git/config`, and `.clawcrateignore` exclusions are applied before launch.
 
 ## Contributing
 

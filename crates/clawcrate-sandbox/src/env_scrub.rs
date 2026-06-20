@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+const INTERNAL_CHILD_ENV_PREFIXES: &[&str] = &["CLAWCRATE_AUDIT_"];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrubbedEnvironment {
     pub kept: Vec<(String, String)>,
@@ -25,6 +27,11 @@ where
     let mut removed = BTreeSet::new();
 
     for (name, value) in vars {
+        if is_internal_child_env(&name) {
+            removed.insert(name);
+            continue;
+        }
+
         let passes_passthrough = matches_any_pattern(&name, passthrough_patterns);
         let should_scrub = matches_any_pattern(&name, scrub_patterns);
         if should_scrub && !passes_passthrough {
@@ -38,6 +45,12 @@ where
         kept,
         removed: removed.into_iter().collect(),
     }
+}
+
+fn is_internal_child_env(candidate: &str) -> bool {
+    INTERNAL_CHILD_ENV_PREFIXES
+        .iter()
+        .any(|prefix| candidate.starts_with(prefix))
 }
 
 fn matches_any_pattern(candidate: &str, patterns: &[String]) -> bool {
@@ -149,5 +162,39 @@ mod tests {
         assert!(wildcard_matches("*_KEY", "DATABASE_KEY"));
         assert!(!wildcard_matches("*_KEY", "DATABASE_KEY_EXTRA"));
         assert!(!wildcard_matches("SSH_AUTH_SOCK", "SSH_AUTH"));
+    }
+
+    #[test]
+    fn removes_internal_audit_variables_even_when_passthrough_would_keep_them() {
+        let vars = vec![
+            ("CLAWCRATE_AUDIT_HASHCHAIN".to_string(), "1".to_string()),
+            (
+                "CLAWCRATE_AUDIT_SIGN".to_string(),
+                "/secure/audit-signing.key".to_string(),
+            ),
+            (
+                "CLAWCRATE_AUDIT_SIGN_BLOCK_SIZE".to_string(),
+                "100".to_string(),
+            ),
+            ("HOME".to_string(), "/Users/test".to_string()),
+        ];
+        let scrub_patterns = Vec::new();
+        let passthrough_patterns = vec!["CLAWCRATE_*".to_string(), "HOME".to_string()];
+
+        let scrubbed = scrub_environment(vars, &scrub_patterns, &passthrough_patterns);
+
+        assert_eq!(
+            scrubbed.removed,
+            vec![
+                "CLAWCRATE_AUDIT_HASHCHAIN".to_string(),
+                "CLAWCRATE_AUDIT_SIGN".to_string(),
+                "CLAWCRATE_AUDIT_SIGN_BLOCK_SIZE".to_string(),
+            ]
+        );
+        assert!(scrubbed.kept.iter().any(|(name, _)| name == "HOME"));
+        assert!(!scrubbed
+            .kept
+            .iter()
+            .any(|(name, _)| name.starts_with("CLAWCRATE_AUDIT_")));
     }
 }
