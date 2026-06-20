@@ -93,6 +93,8 @@ enum Commands {
     Doctor(DoctorArgs),
     /// Serve local authenticated HTTP API for tool integrations
     Api(ApiArgs),
+    /// Wrap stdio MCP servers in a ClawCrate profile
+    Mcp(McpArgs),
     /// Integration bridges for external agent tooling
     Bridge(BridgeArgs),
     /// Verify the SHA-256 hash chain of a run's audit log
@@ -195,6 +197,37 @@ struct ApiArgs {
 }
 
 #[derive(Debug, Args)]
+struct McpArgs {
+    #[command(subcommand)]
+    command: McpCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Wrap a stdio MCP server command
+    Wrap(McpWrapArgs),
+}
+
+#[derive(Debug, Args)]
+struct McpWrapArgs {
+    /// MCP profile name or YAML file path, usually mcp-readonly or mcp-server
+    #[arg(long)]
+    profile: String,
+
+    /// Force replica mode
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "direct")]
+    replica: bool,
+
+    /// Force direct mode
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "replica")]
+    direct: bool,
+
+    /// MCP server command to launch (must be passed after --)
+    #[arg(last = true, num_args = 1.., required = true)]
+    command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 struct BridgeArgs {
     #[command(subcommand)]
     target: BridgeTarget,
@@ -230,6 +263,7 @@ fn run(cli: Cli, output: OutputOptions) -> Result<()> {
         Commands::Run(args) => handle_run(&resolver, args, &output),
         Commands::Doctor(args) => handle_doctor(args, &output),
         Commands::Api(args) => handle_api(args, &output),
+        Commands::Mcp(args) => handle_mcp(&resolver, args, &output),
         Commands::Bridge(args) => handle_bridge(args, &output),
         Commands::Verify(args) => handle_verify(args, &output),
         Commands::Audit(args) => handle_audit(args),
@@ -279,7 +313,9 @@ fn print_cli_error(error: &anyhow::Error, verbose: u8) {
 fn error_hint(error: &anyhow::Error) -> Option<&'static str> {
     let message = error.to_string();
     if message.contains("failed to resolve profile") {
-        return Some("use `--profile <safe|build|install|open>` or a valid profile YAML path.");
+        return Some(
+            "use `--profile <safe|build|install|open|mcp-readonly|mcp-server>` or a valid profile YAML path.",
+        );
     }
     if message.contains("unsupported platform") {
         return Some("`run` and `doctor` are supported on Linux and macOS only.");
@@ -316,6 +352,38 @@ fn handle_plan(
     }
 
     Ok(())
+}
+
+fn handle_mcp(resolver: &ProfileResolver, args: McpArgs, output: &OutputOptions) -> Result<()> {
+    match args.command {
+        McpCommand::Wrap(args) => handle_mcp_wrap(resolver, args, output),
+    }
+}
+
+fn handle_mcp_wrap(
+    resolver: &ProfileResolver,
+    args: McpWrapArgs,
+    output: &OutputOptions,
+) -> Result<()> {
+    let cwd =
+        std::env::current_dir().map_err(|source| anyhow!("failed to get current dir: {source}"))?;
+    let plan = build_mcp_wrap_plan(resolver, &cwd, &args)?;
+    verbose_log(
+        output,
+        1,
+        format!(
+            "mcp wrap parsed: profile={}, mode={:?}, command={}",
+            plan.profile.name,
+            plan.mode,
+            plan.command.join(" ")
+        ),
+    );
+
+    Err(anyhow!(
+        "`clawcrate mcp wrap` parsed successfully and resolved profile `{}` for `{}`, but transparent MCP stdio relay is not implemented yet; continue with GitHub issue #254",
+        plan.profile.name,
+        plan.command.join(" ")
+    ))
 }
 
 #[derive(Debug)]
@@ -1963,6 +2031,23 @@ fn build_execution_plan(
     })
 }
 
+fn build_mcp_wrap_plan(
+    resolver: &ProfileResolver,
+    cwd: &Path,
+    args: &McpWrapArgs,
+) -> Result<ExecutionPlan> {
+    let command_args = CommandArgs {
+        profile: Some(args.profile.clone()),
+        replica: args.replica,
+        direct: args.direct,
+        json: false,
+        approve_out_of_profile: false,
+        command: args.command.clone(),
+    };
+
+    build_execution_plan(resolver, cwd, &command_args)
+}
+
 fn select_default_mode(default_mode: DefaultMode, args: &CommandArgs) -> DefaultMode {
     if args.replica {
         DefaultMode::Replica
@@ -3269,7 +3354,8 @@ mod tests {
 
     use super::{
         api_route_uses_delegated_worker, apply_replica_sync_back, build_api_cli_args,
-        build_execution_plan, build_pennyprompt_bridge_response_from_input_result,
+        build_execution_plan, build_mcp_wrap_plan,
+        build_pennyprompt_bridge_response_from_input_result,
         build_pennyprompt_bridge_response_with_executor, build_pennyprompt_cli_args,
         collect_syncable_replica_changes, command_appears_to_need_network, constant_time_eq,
         copy_workspace_with_default_exclusions, detect_out_of_profile_requests, doctor_rows,
@@ -3279,8 +3365,8 @@ mod tests {
         resolve_execution_path, run_monitored_child, run_monitored_child_with_signal_poller,
         select_default_mode, serialize_api_payload, should_exclude_default_replica_path,
         should_use_color, ApiCommandRequest, ApiRoute, AuditCommand, AuditExportFormat,
-        BoundedWorkQueue, BridgeTarget, Cli, CommandArgs, Commands, PennyPromptBridgeRequest,
-        QueueEnqueueError, ReplicaSyncChange, RunTermination,
+        BoundedWorkQueue, BridgeTarget, Cli, CommandArgs, Commands, McpCommand, McpWrapArgs,
+        PennyPromptBridgeRequest, QueueEnqueueError, ReplicaSyncChange, RunTermination,
     };
     #[cfg(unix)]
     use super::{eligible_process_group_id, send_unix_signal_with_group_fallback_impl};
@@ -3357,6 +3443,99 @@ mod tests {
             }
             _ => panic!("expected plan command"),
         }
+    }
+
+    #[test]
+    fn parses_mcp_wrap_command_with_profile_and_separator() {
+        let cli = Cli::parse_from([
+            "clawcrate",
+            "mcp",
+            "wrap",
+            "--profile",
+            "mcp-readonly",
+            "--",
+            "npx",
+            "-y",
+            "@modelcontextprotocol/server-filesystem",
+            "/tmp",
+        ]);
+
+        match cli.command {
+            Commands::Mcp(args) => match args.command {
+                McpCommand::Wrap(args) => {
+                    assert_eq!(args.profile, "mcp-readonly");
+                    assert_eq!(
+                        args.command,
+                        vec![
+                            "npx".to_string(),
+                            "-y".to_string(),
+                            "@modelcontextprotocol/server-filesystem".to_string(),
+                            "/tmp".to_string(),
+                        ]
+                    );
+                    assert!(!args.replica);
+                    assert!(!args.direct);
+                }
+            },
+            _ => panic!("expected mcp wrap command"),
+        }
+    }
+
+    #[test]
+    fn mcp_wrap_requires_command_separator() {
+        let error = Cli::try_parse_from([
+            "clawcrate",
+            "mcp",
+            "wrap",
+            "--profile",
+            "mcp-readonly",
+            "npx",
+        ])
+        .expect_err("mcp wrap must require -- before the wrapped command");
+        let message = error.to_string();
+
+        assert!(message.contains("unexpected argument"));
+        assert!(message.contains("--"));
+    }
+
+    #[test]
+    fn mcp_wrap_requires_wrapped_command() {
+        let error = Cli::try_parse_from([
+            "clawcrate",
+            "mcp",
+            "wrap",
+            "--profile",
+            "mcp-readonly",
+            "--",
+        ])
+        .expect_err("mcp wrap must require a command after --");
+        let message = error.to_string();
+
+        assert!(message.contains("required"));
+        assert!(message.contains("<COMMAND>"));
+    }
+
+    #[test]
+    fn mcp_wrap_plan_resolves_selected_profile() {
+        let cwd = unique_tmp_dir("clawcrate_mcp_wrap_plan_workspace");
+        let resolver = ProfileResolver::default();
+        let args = McpWrapArgs {
+            profile: "mcp-readonly".to_string(),
+            replica: false,
+            direct: false,
+            command: vec![
+                "npx".to_string(),
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string(),
+                cwd.display().to_string(),
+            ],
+        };
+
+        let plan = build_mcp_wrap_plan(&resolver, &cwd, &args).expect("build mcp wrap plan");
+
+        assert_eq!(plan.profile.name, "mcp-readonly");
+        assert_eq!(plan.command, args.command);
+        assert!(matches!(plan.mode, WorkspaceMode::Replica { .. }));
     }
 
     #[test]
