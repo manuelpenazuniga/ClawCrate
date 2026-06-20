@@ -103,6 +103,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release_meta.outputs.tag }}
+          prerelease: ${{ contains(steps.release_meta.outputs.tag, '-') }}
+          make_latest: ${{ contains(steps.release_meta.outputs.tag, '-') && 'false' || 'true' }}
           generate_release_notes: true
           files: |
             dist/clawcrate-*.tar.gz
