@@ -109,7 +109,67 @@ impl ProfileResolver {
         if looks_like_path(profile) || Path::new(profile).exists() {
             return self.resolve_from_path(profile);
         }
-        self.resolve_builtin(profile)
+        if BUILTIN_PROFILE_NAMES.contains(&profile) {
+            return self.resolve_builtin(profile);
+        }
+        self.resolve_community(profile)
+    }
+
+    pub fn resolve_community(&self, id: &str) -> Result<ResolvedProfile, ProfileError> {
+        let catalog_path = self.community_catalog_path();
+        if !catalog_path.exists() {
+            return Err(ProfileError::ProfileNotFound(id.to_string()));
+        }
+
+        let catalog = self.load_community_catalog(&catalog_path)?;
+        if catalog.version != 1 {
+            return Err(ProfileError::InvalidCatalog {
+                path: catalog_path,
+                reason: format!("unsupported version {}; expected 1", catalog.version),
+            });
+        }
+
+        let entry = catalog
+            .profiles
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| ProfileError::ProfileNotFound(id.to_string()))?;
+        let normalized_id = normalize_string(&entry.id);
+        if entry.id != normalized_id || !is_valid_catalog_id(&entry.id) {
+            return Err(ProfileError::InvalidCatalog {
+                path: catalog_path,
+                reason: format!(
+                    "entry id '{}' must be lowercase kebab-case [a-z0-9-]",
+                    entry.id
+                ),
+            });
+        }
+        if entry.path.is_absolute() {
+            return Err(ProfileError::InvalidCatalog {
+                path: catalog_path,
+                reason: format!("entry '{}' path must be relative", entry.id),
+            });
+        }
+        if entry
+            .path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(ProfileError::InvalidCatalog {
+                path: catalog_path,
+                reason: format!("entry '{}' path cannot escape catalog directory", entry.id),
+            });
+        }
+        if entry.path.extension().and_then(|it| it.to_str()) != Some("yaml") {
+            return Err(ProfileError::InvalidCatalog {
+                path: catalog_path,
+                reason: format!("entry '{}' path must end in .yaml", entry.id),
+            });
+        }
+
+        let catalog_dir = catalog_path.parent().unwrap_or_else(|| Path::new("."));
+        let profile_path = catalog_dir.join(normalize_catalog_relative_path(&entry.path));
+        self.resolve_from_path(profile_path)
     }
 
     pub fn resolve_builtin(&self, name: &str) -> Result<ResolvedProfile, ProfileError> {
@@ -941,6 +1001,18 @@ network:
             .validate_community_catalog(resolver.community_catalog_path())
             .expect("validate bundled community catalog");
         assert!(count >= 1);
+    }
+
+    #[test]
+    fn resolves_community_profile_by_catalog_id() {
+        let resolver = ProfileResolver::default();
+        let profile = resolver
+            .resolve("mcp-readonly")
+            .expect("resolve community profile by catalog id");
+
+        assert_eq!(profile.name, "mcp-readonly");
+        assert_eq!(profile.default_mode, DefaultMode::Replica);
+        assert_eq!(profile.net, NetLevel::None);
     }
 
     #[test]
