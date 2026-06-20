@@ -106,6 +106,16 @@ impl DarwinSandbox {
         &self,
         prepared: &PreparedDarwinSandbox,
     ) -> Result<DarwinSandboxedChild, DarwinSandboxError> {
+        self.launch_with_stdio(prepared, Stdio::null(), Stdio::piped(), Stdio::piped())
+    }
+
+    pub fn launch_with_stdio(
+        &self,
+        prepared: &PreparedDarwinSandbox,
+        stdin: Stdio,
+        stdout: Stdio,
+        stderr: Stdio,
+    ) -> Result<DarwinSandboxedChild, DarwinSandboxError> {
         if prepared.command.is_empty() {
             return Err(DarwinSandboxError::EmptyCommand);
         }
@@ -119,9 +129,9 @@ impl DarwinSandbox {
         command.arg(&prepared.command[0]);
         command.args(&prepared.command[1..]);
         command.current_dir(&prepared.cwd);
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
+        command.stdin(stdin);
+        command.stdout(stdout);
+        command.stderr(stderr);
         command.process_group(0);
         command.env_clear();
         command.envs(prepared.scrubbed_env.iter().cloned());

@@ -472,6 +472,16 @@ impl LinuxSandbox {
         &self,
         prepared: &PreparedLinuxSandbox,
     ) -> Result<LinuxSandboxedChild, LinuxSandboxError> {
+        self.launch_with_stdio(prepared, Stdio::null(), Stdio::piped(), Stdio::piped())
+    }
+
+    pub fn launch_with_stdio(
+        &self,
+        prepared: &PreparedLinuxSandbox,
+        stdin: Stdio,
+        stdout: Stdio,
+        stderr: Stdio,
+    ) -> Result<LinuxSandboxedChild, LinuxSandboxError> {
         if prepared.command.is_empty() {
             return Err(LinuxSandboxError::EmptyCommand);
         }
@@ -479,9 +489,9 @@ impl LinuxSandbox {
         let mut command = Command::new(&prepared.command[0]);
         command.args(&prepared.command[1..]);
         command.current_dir(&prepared.cwd);
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
+        command.stdin(stdin);
+        command.stdout(stdout);
+        command.stderr(stderr);
         #[cfg(unix)]
         command.process_group(0);
         command.env_clear();
