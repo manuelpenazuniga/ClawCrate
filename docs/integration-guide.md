@@ -14,6 +14,10 @@ Do not pass a shell command string unless you explicitly need shell features.
 
 ## Common Patterns
 
+## MCP Client Recipes
+
+- [Claude Desktop MCP wrap recipe](integrations/claude-desktop-mcp-wrap.md)
+
 ## Plan before execution
 
 ```bash
