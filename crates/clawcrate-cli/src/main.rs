@@ -211,9 +211,10 @@ enum McpCommand {
 
 #[derive(Debug, Args)]
 struct McpWrapArgs {
-    /// MCP profile name or YAML file path, usually mcp-readonly or mcp-server
+    /// MCP profile name or YAML file path, usually mcp-readonly or mcp-server.
+    /// If omitted, a conservative MCP command-shape detector selects mcp-readonly.
     #[arg(long)]
-    profile: String,
+    profile: Option<String>,
 
     /// Force replica mode
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "direct")]
@@ -498,6 +499,15 @@ struct McpRelayExecutionOutcome {
 struct McpRelayPipelineResult {
     execution: McpRelayExecutionOutcome,
     fs_diff: Vec<FsChange>,
+}
+
+const AUTO_DETECTED_MCP_PROFILE: &str = "mcp-readonly";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpServerShapeDetection {
+    OfficialPackage,
+    ServerName,
+    MarkerWithStdio,
 }
 
 #[derive(Debug, Serialize)]
@@ -2596,8 +2606,22 @@ fn build_mcp_wrap_plan(
     cwd: &Path,
     args: &McpWrapArgs,
 ) -> Result<ExecutionPlan> {
+    let profile = match args.profile.as_deref() {
+        Some(explicit) => explicit.to_string(),
+        None => {
+            if detect_stdio_mcp_server_shape(&args.command).is_some() {
+                AUTO_DETECTED_MCP_PROFILE.to_string()
+            } else {
+                return Err(anyhow!(
+                    "could not auto-detect a stdio MCP server shape for `{}`; pass `--profile mcp-readonly` for read-only servers or `--profile mcp-server` for workspace-writing servers",
+                    args.command.join(" ")
+                ));
+            }
+        }
+    };
+
     let command_args = CommandArgs {
-        profile: Some(args.profile.clone()),
+        profile: Some(profile),
         replica: args.replica,
         direct: args.direct,
         json: false,
@@ -2606,6 +2630,95 @@ fn build_mcp_wrap_plan(
     };
 
     build_execution_plan(resolver, cwd, &command_args)
+}
+
+fn detect_stdio_mcp_server_shape(command: &[String]) -> Option<McpServerShapeDetection> {
+    if command.is_empty() {
+        return None;
+    }
+
+    let tokens = command
+        .iter()
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    // Conservative command-shape heuristic only. A positive match never grants
+    // broader policy: omitted profiles become mcp-readonly, and unknown shapes
+    // require the user to choose an MCP profile explicitly.
+    if tokens
+        .iter()
+        .any(|token| token.contains("@modelcontextprotocol/"))
+    {
+        return Some(McpServerShapeDetection::OfficialPackage);
+    }
+
+    if tokens
+        .iter()
+        .any(|token| token_has_mcp_server_name_marker(token))
+    {
+        return Some(McpServerShapeDetection::ServerName);
+    }
+
+    if command_has_stdio_transport_hint(&tokens)
+        && tokens
+            .iter()
+            .any(|token| token.contains("modelcontextprotocol") || token_has_mcp_marker(token))
+    {
+        return Some(McpServerShapeDetection::MarkerWithStdio);
+    }
+
+    None
+}
+
+fn command_has_stdio_transport_hint(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(token.as_str(), "stdio" | "--stdio" | "--transport=stdio")
+            || token.ends_with("transport=stdio")
+    }) || tokens
+        .windows(2)
+        .any(|pair| matches!(pair[0].as_str(), "--transport" | "transport") && pair[1] == "stdio")
+}
+
+fn token_has_mcp_marker(token: &str) -> bool {
+    let name = normalized_mcp_token_name(token);
+
+    name == "mcp" || name.ends_with("-mcp") || name.contains("-mcp-")
+}
+
+fn token_has_mcp_server_name_marker(token: &str) -> bool {
+    let name = normalized_mcp_token_name(token);
+
+    name == "mcp-server"
+        || name.starts_with("mcp-server-")
+        || name.ends_with("-mcp-server")
+        || name.contains("-mcp-server-")
+}
+
+fn normalized_mcp_token_name(token: &str) -> String {
+    let value = strip_cli_value_prefix(token);
+    let name = token_basename(value);
+    let name = strip_known_script_suffix(name);
+
+    name.replace('_', "-")
+}
+
+fn strip_cli_value_prefix(token: &str) -> &str {
+    ["--package=", "--from=", "-p="]
+        .iter()
+        .find_map(|prefix| token.strip_prefix(prefix))
+        .unwrap_or(token)
+}
+
+fn token_basename(token: &str) -> &str {
+    token.rsplit(['/', '\\']).next().unwrap_or(token)
+}
+
+fn strip_known_script_suffix(token: &str) -> &str {
+    [".js", ".mjs", ".cjs", ".py", ".sh", ".exe"]
+        .iter()
+        .find_map(|suffix| token.strip_suffix(suffix))
+        .unwrap_or(token)
 }
 
 fn select_default_mode(default_mode: DefaultMode, args: &CommandArgs) -> DefaultMode {
@@ -3918,16 +4031,17 @@ mod tests {
         build_pennyprompt_bridge_response_from_input_result,
         build_pennyprompt_bridge_response_with_executor, build_pennyprompt_cli_args,
         collect_syncable_replica_changes, command_appears_to_need_network, constant_time_eq,
-        copy_workspace_with_default_exclusions, detect_out_of_profile_requests, doctor_rows,
-        execution_status, execution_status_from_exit_status, extract_bearer_token,
-        extract_host_from_reference, is_replica_sync_back_interactive, load_replica_ignore_config,
+        copy_workspace_with_default_exclusions, detect_out_of_profile_requests,
+        detect_stdio_mcp_server_shape, doctor_rows, execution_status,
+        execution_status_from_exit_status, extract_bearer_token, extract_host_from_reference,
+        is_replica_sync_back_interactive, load_replica_ignore_config,
         materialize_workspace_for_execution, relay_stream_to_output_and_log, request_authorized,
         resolve_api_route, resolve_execution_path, run_monitored_child,
         run_monitored_child_with_signal_poller, select_default_mode, serialize_api_payload,
         should_exclude_default_replica_path, should_use_color, ApiCommandRequest, ApiRoute,
         AuditCommand, AuditExportFormat, BoundedWorkQueue, BridgeTarget, Cli, CommandArgs,
-        Commands, McpCommand, McpWrapArgs, PennyPromptBridgeRequest, QueueEnqueueError,
-        ReplicaSyncChange, RunTermination,
+        Commands, McpCommand, McpServerShapeDetection, McpWrapArgs, PennyPromptBridgeRequest,
+        QueueEnqueueError, ReplicaSyncChange, RunTermination, AUTO_DETECTED_MCP_PROFILE,
     };
     #[cfg(unix)]
     use super::{eligible_process_group_id, send_unix_signal_with_group_fallback_impl};
@@ -4024,7 +4138,7 @@ mod tests {
         match cli.command {
             Commands::Mcp(args) => match args.command {
                 McpCommand::Wrap(args) => {
-                    assert_eq!(args.profile, "mcp-readonly");
+                    assert_eq!(args.profile.as_deref(), Some("mcp-readonly"));
                     assert_eq!(
                         args.command,
                         vec![
@@ -4081,7 +4195,7 @@ mod tests {
         let cwd = unique_tmp_dir("clawcrate_mcp_wrap_plan_workspace");
         let resolver = ProfileResolver::default();
         let args = McpWrapArgs {
-            profile: "mcp-readonly".to_string(),
+            profile: Some("mcp-readonly".to_string()),
             replica: false,
             direct: false,
             command: vec![
@@ -4097,6 +4211,182 @@ mod tests {
         assert_eq!(plan.profile.name, "mcp-readonly");
         assert_eq!(plan.command, args.command);
         assert!(matches!(plan.mode, WorkspaceMode::Replica { .. }));
+    }
+
+    #[test]
+    fn parses_mcp_wrap_command_without_profile_for_auto_detection() {
+        let cli = Cli::parse_from([
+            "clawcrate",
+            "mcp",
+            "wrap",
+            "--",
+            "npx",
+            "-y",
+            "@modelcontextprotocol/server-filesystem",
+            "/tmp",
+        ]);
+
+        match cli.command {
+            Commands::Mcp(args) => match args.command {
+                McpCommand::Wrap(args) => {
+                    assert_eq!(args.profile, None);
+                    assert_eq!(
+                        args.command,
+                        vec![
+                            "npx".to_string(),
+                            "-y".to_string(),
+                            "@modelcontextprotocol/server-filesystem".to_string(),
+                            "/tmp".to_string(),
+                        ]
+                    );
+                }
+            },
+            _ => panic!("expected mcp wrap command"),
+        }
+    }
+
+    #[test]
+    fn mcp_shape_detector_accepts_official_stdio_server_package() {
+        let command = vec![
+            "npx".to_string(),
+            "-y".to_string(),
+            "@modelcontextprotocol/server-filesystem".to_string(),
+            "/tmp".to_string(),
+        ];
+
+        assert_eq!(
+            detect_stdio_mcp_server_shape(&command),
+            Some(McpServerShapeDetection::OfficialPackage)
+        );
+    }
+
+    #[test]
+    fn mcp_shape_detector_accepts_mcp_server_binary_with_stdio_hint() {
+        let command = vec![
+            "node".to_string(),
+            "./dist/github-mcp-server.js".to_string(),
+            "--transport".to_string(),
+            "stdio".to_string(),
+        ];
+
+        assert_eq!(
+            detect_stdio_mcp_server_shape(&command),
+            Some(McpServerShapeDetection::ServerName)
+        );
+    }
+
+    #[test]
+    fn mcp_shape_detector_accepts_python_mcp_server_names_with_underscores() {
+        let command = vec![
+            "uvx".to_string(),
+            "mcp_server_postgres".to_string(),
+            "--transport".to_string(),
+            "stdio".to_string(),
+        ];
+
+        assert_eq!(
+            detect_stdio_mcp_server_shape(&command),
+            Some(McpServerShapeDetection::ServerName)
+        );
+    }
+
+    #[test]
+    fn mcp_shape_detector_accepts_python_mcp_marker_with_stdio_hint() {
+        let command = vec![
+            "python".to_string(),
+            "-m".to_string(),
+            "git_mcp".to_string(),
+            "--stdio".to_string(),
+        ];
+
+        assert_eq!(
+            detect_stdio_mcp_server_shape(&command),
+            Some(McpServerShapeDetection::MarkerWithStdio)
+        );
+    }
+
+    #[test]
+    fn mcp_shape_detector_rejects_stdio_without_mcp_marker() {
+        let command = vec![
+            "node".to_string(),
+            "./dist/jsonrpc-stdio-proxy.js".to_string(),
+            "--transport".to_string(),
+            "stdio".to_string(),
+        ];
+
+        assert_eq!(detect_stdio_mcp_server_shape(&command), None);
+    }
+
+    #[test]
+    fn mcp_shape_detector_rejects_near_miss_package_names() {
+        let command = vec![
+            "npx".to_string(),
+            "-y".to_string(),
+            "mcp-serverless-cli".to_string(),
+            "--stdio".to_string(),
+        ];
+
+        assert_eq!(detect_stdio_mcp_server_shape(&command), None);
+    }
+
+    #[test]
+    fn mcp_wrap_plan_auto_selects_readonly_profile_for_detected_server() {
+        let cwd = unique_tmp_dir("clawcrate_mcp_wrap_auto_profile_workspace");
+        let resolver = ProfileResolver::default();
+        let args = McpWrapArgs {
+            profile: None,
+            replica: false,
+            direct: false,
+            command: vec![
+                "npx".to_string(),
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string(),
+                cwd.display().to_string(),
+            ],
+        };
+
+        let plan = build_mcp_wrap_plan(&resolver, &cwd, &args).expect("build mcp wrap plan");
+
+        assert_eq!(plan.profile.name, AUTO_DETECTED_MCP_PROFILE);
+        assert!(matches!(plan.mode, WorkspaceMode::Replica { .. }));
+        assert!(plan.profile.fs_write.is_empty());
+    }
+
+    #[test]
+    fn mcp_wrap_plan_requires_explicit_profile_for_unknown_shape() {
+        let cwd = unique_tmp_dir("clawcrate_mcp_wrap_unknown_profile_workspace");
+        let resolver = ProfileResolver::default();
+        let args = McpWrapArgs {
+            profile: None,
+            replica: false,
+            direct: false,
+            command: vec!["/bin/cat".to_string()],
+        };
+
+        let error = build_mcp_wrap_plan(&resolver, &cwd, &args)
+            .expect_err("unknown shape must require explicit profile");
+        let message = error.to_string();
+
+        assert!(message.contains("could not auto-detect a stdio MCP server shape"));
+        assert!(message.contains("--profile mcp-readonly"));
+        assert!(message.contains("--profile mcp-server"));
+    }
+
+    #[test]
+    fn mcp_wrap_plan_honors_explicit_profile_for_unknown_shape() {
+        let cwd = unique_tmp_dir("clawcrate_mcp_wrap_explicit_profile_workspace");
+        let resolver = ProfileResolver::default();
+        let args = McpWrapArgs {
+            profile: Some("mcp-server".to_string()),
+            replica: false,
+            direct: false,
+            command: vec!["/bin/cat".to_string()],
+        };
+
+        let plan = build_mcp_wrap_plan(&resolver, &cwd, &args).expect("build mcp wrap plan");
+
+        assert_eq!(plan.profile.name, "mcp-server");
+        assert_eq!(plan.command, args.command);
     }
 
     #[test]
