@@ -17,6 +17,7 @@ Do not pass a shell command string unless you explicitly need shell features.
 ## MCP Client Recipes
 
 - [Claude Desktop MCP wrap recipe](integrations/claude-desktop-mcp-wrap.md)
+- [Cursor MCP wrap recipe](integrations/cursor-mcp-wrap.md)
 
 ## Plan before execution
 
