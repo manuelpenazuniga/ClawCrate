@@ -2740,12 +2740,17 @@ fn materialize_workspace_mode(
         DefaultMode::Direct => WorkspaceMode::Direct,
         DefaultMode::Replica => WorkspaceMode::Replica {
             source: source_cwd.to_path_buf(),
-            copy: std::env::temp_dir()
+            copy: replica_temp_root()
                 .join("clawcrate")
                 .join(format!("exec_{execution_id}"))
                 .join("workspace"),
         },
     }
+}
+
+fn replica_temp_root() -> PathBuf {
+    let temp_root = std::env::temp_dir();
+    std::fs::canonicalize(&temp_root).unwrap_or(temp_root)
 }
 
 fn handle_doctor(args: DoctorArgs, output: &OutputOptions) -> Result<()> {
@@ -4035,8 +4040,8 @@ mod tests {
         detect_stdio_mcp_server_shape, doctor_rows, execution_status,
         execution_status_from_exit_status, extract_bearer_token, extract_host_from_reference,
         is_replica_sync_back_interactive, load_replica_ignore_config,
-        materialize_workspace_for_execution, relay_stream_to_output_and_log, request_authorized,
-        resolve_api_route, resolve_execution_path, run_monitored_child,
+        materialize_workspace_for_execution, relay_stream_to_output_and_log, replica_temp_root,
+        request_authorized, resolve_api_route, resolve_execution_path, run_monitored_child,
         run_monitored_child_with_signal_poller, select_default_mode, serialize_api_payload,
         should_exclude_default_replica_path, should_use_color, ApiCommandRequest, ApiRoute,
         AuditCommand, AuditExportFormat, BoundedWorkQueue, BridgeTarget, Cli, CommandArgs,
@@ -5174,7 +5179,7 @@ mod tests {
         match &plan.mode {
             WorkspaceMode::Replica { source, copy } => {
                 assert_eq!(source, &cwd);
-                assert!(copy.starts_with(Path::new(&std::env::temp_dir())));
+                assert!(copy.starts_with(replica_temp_root()));
                 assert_eq!(plan.cwd, *copy);
             }
             WorkspaceMode::Direct => panic!("install profile must default to replica"),
@@ -5228,7 +5233,7 @@ mod tests {
         match &plan.mode {
             WorkspaceMode::Replica { source, copy } => {
                 assert_eq!(source, &cwd);
-                assert!(copy.starts_with(Path::new(&std::env::temp_dir())));
+                assert!(copy.starts_with(replica_temp_root()));
                 assert_eq!(plan.cwd, *copy);
             }
             WorkspaceMode::Direct => {

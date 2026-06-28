@@ -150,3 +150,52 @@ fn install_run_uses_replica_and_excludes_secret_env_files() {
         "replica copy should contain non-secret files"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn readonly_replica_run_can_read_its_canonical_workspace() {
+    let workspace = unique_tmp_dir("clawcrate_cli_it_readonly_replica_workspace");
+    let home = unique_tmp_dir("clawcrate_cli_it_readonly_replica_home");
+    fs::write(workspace.join("public.txt"), "visible").expect("write public file");
+
+    let summary = run_clawcrate_json(
+        &[
+            "run",
+            "--profile",
+            "mcp-readonly",
+            "--json",
+            "--",
+            "/bin/sh",
+            "-c",
+            "test -f public.txt",
+        ],
+        &workspace,
+        &home,
+    );
+
+    let artifacts_dir = PathBuf::from(
+        summary
+            .get("result")
+            .and_then(|result| result.get("artifacts_dir"))
+            .and_then(Value::as_str)
+            .expect("artifacts_dir in run summary"),
+    );
+    let plan: Value = serde_json::from_str(
+        &fs::read_to_string(artifacts_dir.join("plan.json")).expect("read plan artifact json"),
+    )
+    .expect("parse plan artifact json");
+    let copy_path = PathBuf::from(
+        plan.get("mode")
+            .and_then(|mode| mode.get("Replica"))
+            .and_then(|replica| replica.get("copy"))
+            .and_then(Value::as_str)
+            .expect("replica copy path"),
+    );
+
+    assert!(
+        copy_path.starts_with(
+            fs::canonicalize(std::env::temp_dir()).expect("canonicalize system temp directory")
+        ),
+        "Replica copy should use the physical macOS temp path"
+    );
+}
