@@ -93,6 +93,24 @@ ClawCrate exists because:
 - **Not a replacement for VMs.** If you need kernel-level isolation against kernel exploits, use a VM. ClawCrate is defense-in-depth at the process level.
 - **Not magic.** If your agent has legitimate network access and legitimate credentials for an allowed domain, ClawCrate can't prevent misuse of that access.
 
+## What Makes ClawCrate Different
+
+The sandbox is not the product. Every agent vendor (Codex, Cursor, Claude Code) already ships one internally, and the kernel primitives are free. ClawCrate is **the governance layer for agent-executed commands: minimal authority + portable evidence, for _any_ agent** — three layers no single agent vendor can own without ceasing to be agent-agnostic:
+
+- **Least-authority policy** — profiles today; auto-generated policy (`learn`) and a signed community marketplace (`profiles.dev`) next.
+- **Kernel enforcement** — Landlock + seccomp (Linux) / Seatbelt (macOS).
+- **Tamper-evident evidence** — a hash-chained, signable, verifiable audit trail.
+
+Five differentials, defensible today:
+
+1. **Only standalone dual-platform native sandbox** — Landlock+seccomp / Seatbelt, no Docker, no root, one Rust binary. (Alternatives are agent-internal, Docker-based, or macOS-only.)
+2. **Audit-grade by default, MIT** — SHA-256 hash chain + canonical JSON (RFC 8785) + offline `clawcrate verify` + Ed25519 signing + SIEM export. Matches closed-source tools; beats the plain logs of agents' internal sandboxes.
+3. **MCP Server Firewall** — `clawcrate mcp wrap` transparently sandboxes any stdio MCP server; the client never notices. Nobody else does this.
+4. **Agent-agnostic** — the same binary serves OpenClaw, Claude Code, Codex, Cursor, Gemini CLI, and CI.
+5. **Concrete compliance narrative** — EU AI Act Article 12/19/26 mapping + IETF draft-sharif alignment. Turns "security" into regulatory evidence.
+
+> **Honesty guardrails.** Read isolation is enforced on macOS (Seatbelt) and on Linux via Replica Mode; **Linux Direct Mode currently enforces write controls, not read isolation** (tracked in #268). `network: filtered` is proxy-mediated best-effort (see the [egress proxy threat model](docs/egress-proxy-threat-model.md)).
+
 ## How It Works
 
 ```
@@ -304,11 +322,15 @@ Run `clawcrate doctor` to check your system's capabilities.
 
 ## Roadmap
 
-- [x] Project specification (v3.1.1)
+Detailed, sequenced plan: [docs/roadmap-2026-07-05.md](docs/roadmap-2026-07-05.md) (active). Strategic basis: [docs/strategic-audit-2026-07-05.md](docs/strategic-audit-2026-07-05.md). GitHub milestones/issues are the scope source of truth.
+
 - [x] **Alpha** — `run`, `plan`, `doctor`, `api`, `bridge pennyprompt`. Profiles. Dual-platform sandbox. Replica mode. Artifacts.
-- [x] **P1** — Egress proxy (proxy-mediated domain filtering; see threat-model caveats). Approval workflow. Community profiles.
-- [x] **P2** — SQLite audit storage. API/bridge hardening and expanded integration contracts.
-- [ ] **v1.0** — Production hardening. Windows (WSL2). Plugin system.
+- [x] **P1/P2** — Egress proxy (proxy-mediated domain filtering; see threat-model caveats). Approval workflow. Community profiles. SQLite audit storage. API/bridge hardening.
+- [x] **v0.2.0** — **Compliance Kit** (SHA-256 hash chain, canonical JSON, offline `verify`, Ed25519 signing, SIEM export) + **MCP Server Firewall** (`clawcrate mcp wrap` transparent JSON-RPC relay).
+- [ ] **v0.2.0 (Adoption Wave)** — one-command `mcp install`, demoable exfil→blocked story, consolidated narrative, EU AI Act statement. _(Epic 8 · #270)_
+- [ ] **v0.3.0 (Foundations)** — Linux read-isolation parity (Landlock read-allowlisting) + hardening _(Epic 6 · #268)_ and scalability/maintainability paydown _(Epic 7 · #269)_.
+- [ ] **v0.4.0 (Adoption & Ecosystem)** — `clawcrate learn` auto-policy _(Epic 1 · #222)_, `profiles.dev` marketplace _(Epic 3 · #221)_, distribution: GitHub Action + integrations + VS Code _(Epic 5 · #220)_.
+- [ ] **v1.0** — Structural network enforcement, `replay`, certifications, plugin system, surface freeze _(Epic 9 · #271)_.
 
 Transition note:
 The latest alpha release is published on GitHub Releases. Quickstart installs from the latest published release assets; see `CHANGELOG.md` for version-specific details.
