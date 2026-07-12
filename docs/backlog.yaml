@@ -134,10 +134,13 @@ milestones:
     description: "Compliance Kit, MCP Server Firewall, and Tier 1 polish before the 2026-08-02 EU AI Act window."
   - key: "V0.3"
     title: "v0.3.0"
-    description: "GitHub Action, agent integrations, VS Code extension, and profiles.dev MVP."
+    description: "Foundations: Linux read-isolation parity + hardening (Epic 6) and scalability/maintainability debt paydown (Epic 7). Re-scoped 2026-07-05 from distribution/marketplace to security correctness."
   - key: "V0.4"
     title: "v0.4.0"
-    description: "clawcrate learn, profiles.dev signing, and leap features."
+    description: "Adoption & Ecosystem: clawcrate learn (Epic 1), profiles.dev marketplace (Epic 3), and distribution (Epic 5). Distribution/marketplace moved here from v0.3.0 on 2026-07-05."
+  - key: "V1.0"
+    title: "v1.0"
+    description: "Structural hardening + surface freeze: network enforcement, replay, certifications, plugin system (Epic 9)."
 
 epics:
   - id: "M0-EPIC"
@@ -247,7 +250,7 @@ epics:
   - id: "GH-220"
     github_issue: 220
     state: "open"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "Epic 5: Distribution - GitHub Action + agent integrations + VS Code extension"
     labels: ["type:epic", "priority:p1", "tier:T2", "area:integration", "area:examples"]
     objective: "Move ClawCrate from individual local usage to team adoption through CI, reference integrations, and editor entry points."
@@ -260,7 +263,7 @@ epics:
   - id: "GH-221"
     github_issue: 221
     state: "open"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "Epic 3: profiles.dev - community-signed profile marketplace"
     labels: ["type:epic", "priority:p1", "tier:T2", "area:profiles"]
     objective: "Turn the local community profile catalog into a discoverable, cacheable, and eventually signed profile ecosystem."
@@ -284,6 +287,74 @@ epics:
       - "Trace output can be reduced into a profile YAML."
       - "Learned profiles can be used locally and published into the profile ecosystem."
 
+  - id: "GH-218"
+    github_issue: 218
+    state: "closed"
+    milestone: "v0.2.0"
+    title: "Epic 2: Compliance Kit - hash chain + verify + signing + SIEM"
+    labels: ["type:epic", "priority:p0", "tier:T1", "area:compliance", "crate:audit"]
+    objective: "Ship an audit-grade, tamper-evident audit trail (hash chain, canonical JSON, verify, Ed25519 signing, SIEM export) aligned with EU AI Act Article 12 and IETF draft-sharif."
+    source: "docs/roadmap-2026-05-09.md"
+    done_when:
+      - "SHA-256 hash-chain audit lines are available opt-in."
+      - "`clawcrate verify` checks integrity offline."
+      - "Ed25519 block signing and SIEM export formats are available."
+      - "EU AI Act and IETF alignment docs are published."
+
+  - id: "GH-268"
+    github_issue: 268
+    state: "open"
+    milestone: "v0.3.0"
+    title: "Epic 6: Security Parity & Hardening - close the Linux read-isolation gap"
+    labels: ["type:epic", "priority:p0", "tier:T2", "platform:cross-platform", "crate:sandbox", "area:compliance"]
+    objective: "Make the read-isolation promise true on 100% of platforms/modes (Linux Landlock read-allowlisting) and pay down adjacent hardening debt (seccomp posture, artifact permissions, API bind, honest warnings)."
+    source: "docs/roadmap-2026-07-05.md; docs/strategic-audit-2026-07-05.md"
+    done_when:
+      - "Linux Direct Mode enforces read isolation with a CI landmark fixture."
+      - "seccomp posture is deny-by-default allowlist or documented + expanded denylist."
+      - "Artifacts are created 0700/0600; non-loopback API bind is gated."
+      - "plan/doctor honestly surface the Linux read gap until read-allowlisting lands."
+
+  - id: "GH-269"
+    github_issue: 269
+    state: "open"
+    milestone: "v0.3.0"
+    title: "Epic 7: Scalability & Maintainability - decompose CLI, CoW replica, cheap fs-diff"
+    labels: ["type:epic", "priority:p1", "tier:T2", "platform:cross-platform", "crate:cli"]
+    objective: "Pay down the structural debt (5.8k-line CLI monolith, full-copy replica, full-hash fs-diff) that blocks contributor onboarding and the next large features."
+    source: "docs/roadmap-2026-07-05.md; docs/strategic-audit-2026-07-05.md"
+    done_when:
+      - "main.rs is decomposed into feature modules with no behavior change."
+      - "Replica uses CoW/reflink + hardlink fast paths with correct fallback."
+      - "fs-diff has a metadata-first mode with opt-in audit-grade full hashing."
+
+  - id: "GH-270"
+    github_issue: 270
+    state: "open"
+    milestone: "v0.2.0"
+    title: "Epic 8: Adoption Wave - capitalize MCP Firewall + Compliance Kit"
+    labels: ["type:epic", "priority:p0", "tier:T1", "area:mcp", "area:integration", "area:docs"]
+    objective: "Convert already-shipped MCP Firewall + Compliance Kit into adoption inside the EU AI Act window: one-command MCP install, a demoable exfil->blocked story, and a consolidated differentials narrative. Near-zero new runtime code."
+    source: "docs/roadmap-2026-07-05.md; docs/strategic-audit-2026-07-05.md"
+    done_when:
+      - "`clawcrate mcp install` safely rewrites client mcp.json (dry-run + backup + idempotent)."
+      - "The filesystem MCP demo shows blocked secret read + verify-passing audit chain."
+      - "README leads with the Policy + Evidence positioning and five differentials."
+      - "An adopter-facing EU AI Act Article 12 statement is published."
+
+  - id: "GH-271"
+    github_issue: 271
+    state: "open"
+    milestone: "v1.0"
+    title: "Epic 9: v1.0 Structural Hardening & Surface Freeze"
+    labels: ["type:epic", "priority:p1", "tier:T3", "platform:cross-platform"]
+    objective: "Close residual threat-model gaps (network enforcement), deliver reproducibility (replay), certifications, and freeze the CLI surface for a production v1.0."
+    source: "docs/roadmap-2026-07-05.md; docs/strategic-audit-2026-07-05.md"
+    done_when:
+      - "network: filtered has a documented, tested, enforced path (not best-effort)."
+      - "`clawcrate replay` reproduces a recorded run."
+      - "A Windows go/no-go decision is recorded and the CLI surface is frozen."
+
 issues:
   - id: "GH-219-01"
     epic: "GH-219"
@@ -306,7 +377,7 @@ issues:
   - id: "GH-219-03"
     epic: "GH-219"
     github_issue: 253
-    state: "open"
+    state: "closed"
     milestone: "v0.2.0"
     title: "feat(cli): clawcrate mcp wrap subcommand"
     labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "crate:cli"]
@@ -315,7 +386,7 @@ issues:
   - id: "GH-219-04"
     epic: "GH-219"
     github_issue: 254
-    state: "open"
+    state: "closed"
     milestone: "v0.2.0"
     title: "feat(mcp): transparent stdin/stdout relay preserving JSON-RPC framing"
     labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "crate:cli"]
@@ -324,7 +395,7 @@ issues:
   - id: "GH-219-05"
     epic: "GH-219"
     github_issue: 255
-    state: "open"
+    state: "closed"
     milestone: "v0.2.0"
     title: "feat(mcp): auto-detect MCP server shape"
     labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "crate:cli"]
@@ -333,7 +404,7 @@ issues:
   - id: "GH-219-06"
     epic: "GH-219"
     github_issue: 256
-    state: "open"
+    state: "closed"
     milestone: "v0.2.0"
     title: "docs(integrations): Claude Desktop MCP wrap recipe"
     labels: ["type:docs", "priority:p0", "tier:T1", "area:mcp", "area:docs"]
@@ -342,7 +413,7 @@ issues:
   - id: "GH-219-07"
     epic: "GH-219"
     github_issue: 257
-    state: "open"
+    state: "closed"
     milestone: "v0.2.0"
     title: "docs(integrations): Cursor MCP wrap recipe"
     labels: ["type:docs", "priority:p0", "tier:T1", "area:mcp", "area:docs"]
@@ -351,7 +422,7 @@ issues:
   - id: "GH-219-08"
     epic: "GH-219"
     github_issue: 258
-    state: "open"
+    state: "closed"
     milestone: "v0.2.0"
     title: "docs(integrations): Continue.dev MCP wrap recipe"
     labels: ["type:docs", "priority:p0", "tier:T1", "area:mcp", "area:docs"]
@@ -370,7 +441,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(action): clawcrate/action@v1 GitHub Action"
     labels: ["type:feature", "priority:p1", "tier:T2", "area:integration"]
     scope: "Create the official GitHub Action entry point for running commands under ClawCrate in CI."
@@ -379,7 +450,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(action): upload-audit workflow artifact"
     labels: ["type:feature", "priority:p1", "tier:T2", "area:integration"]
     scope: "Add Action support for uploading `audit.ndjson` and related run artifacts as GitHub workflow artifacts."
@@ -388,7 +459,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(action): fail-on-tampering with clawcrate verify"
     labels: ["type:feature", "priority:p1", "tier:T2", "area:integration", "area:compliance"]
     scope: "Integrate `clawcrate verify` into the Action so CI can fail when audit integrity checks fail."
@@ -397,7 +468,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "examples(integrations): Claude Code wrap recipe"
     labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
     scope: "Add a reference recipe showing how Claude Code tool calls can be routed through ClawCrate."
@@ -406,7 +477,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "examples(integrations): Codex CLI wrap recipe"
     labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
     scope: "Add a reference recipe for using ClawCrate around Codex CLI commands or CI workflows."
@@ -415,7 +486,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "examples(integrations): Cursor terminal wrap recipe"
     labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
     scope: "Add a reference recipe for Cursor terminal command execution through ClawCrate."
@@ -424,7 +495,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "examples(integrations): Aider wrap recipe"
     labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
     scope: "Add a reference recipe for invoking Aider with commands routed through ClawCrate."
@@ -433,7 +504,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "examples(integrations): OpenClaw wrap recipe"
     labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
     scope: "Add a reference recipe for wrapping OpenClaw shell tool execution with ClawCrate."
@@ -442,7 +513,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "examples(integrations): Continue.dev wrap recipe"
     labels: ["type:docs", "priority:p1", "tier:T2", "area:integration", "area:examples"]
     scope: "Add a reference recipe for Continue.dev command or MCP runner integration with ClawCrate."
@@ -451,7 +522,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(vscode): ClawCrate VS Code extension MVP"
     labels: ["type:feature", "priority:p1", "tier:T2", "area:integration"]
     scope: "Create a minimal VS Code extension entry point that can run a selected command under ClawCrate."
@@ -460,7 +531,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(vscode): audit panel viewer"
     labels: ["type:feature", "priority:p1", "tier:T2", "area:integration"]
     scope: "Add a VS Code panel that displays the latest audit events and highlights blocked operations."
@@ -469,7 +540,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(vscode): status bar indicator"
     labels: ["type:feature", "priority:p1", "tier:T2", "area:integration"]
     scope: "Show a VS Code status bar indicator when commands are being executed under ClawCrate."
@@ -478,7 +549,7 @@ issues:
     epic: "GH-220"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "docs(adoption): ClawCrate Inside badge"
     labels: ["type:docs", "priority:p2", "tier:T2", "area:docs", "area:integration"]
     scope: "Document a badge and adoption guidance for projects that run CI or agent workflows through ClawCrate."
@@ -487,7 +558,7 @@ issues:
     epic: "GH-221"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(profiles): clawcrate profiles fetch"
     labels: ["type:feature", "priority:p1", "tier:T2", "area:profiles", "crate:profiles"]
     scope: "Fetch profile YAML from the MVP GitHub raw catalog and cache it locally."
@@ -496,7 +567,7 @@ issues:
     epic: "GH-221"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(profiles): clawcrate profiles search"
     labels: ["type:feature", "priority:p1", "tier:T2", "area:profiles", "crate:profiles"]
     scope: "Search the remote or cached profile catalog by name, tool, and tags."
@@ -505,7 +576,7 @@ issues:
     epic: "GH-221"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(profiles): clawcrate profiles install"
     labels: ["type:feature", "priority:p1", "tier:T2", "area:profiles", "crate:profiles"]
     scope: "Install a selected profile into the local ClawCrate profile cache."
@@ -514,7 +585,7 @@ issues:
     epic: "GH-221"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "chore(profiles): bootstrap clawcrate/profiles repository"
     labels: ["type:infra", "priority:p1", "tier:T2", "area:profiles"]
     scope: "Create the external community profile repository structure, README, contribution guide, and catalog schema."
@@ -523,7 +594,7 @@ issues:
     epic: "GH-221"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(profiles): seed top-50 community profiles"
     labels: ["type:feature", "priority:p1", "tier:T2", "area:profiles"]
     scope: "Seed common profiles for cargo, pytest, npm test, npm install, go build, and other high-frequency commands."
@@ -532,7 +603,7 @@ issues:
     epic: "GH-221"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(profiles): SHA256 verification for downloaded profiles"
     labels: ["type:feature", "priority:p1", "tier:T2", "area:profiles", "crate:profiles"]
     scope: "Verify downloaded profile YAML against expected SHA256 digests before installation or execution."
@@ -541,7 +612,7 @@ issues:
     epic: "GH-221"
     github_issue: null
     state: "planned"
-    milestone: "v0.3.0"
+    milestone: "v0.4.0"
     title: "feat(profiles): profile templating"
     labels: ["type:feature", "priority:p2", "tier:T2", "area:profiles", "crate:profiles"]
     scope: "Define and implement variables and includes for reusable community profile definitions."
@@ -626,6 +697,117 @@ issues:
     title: "feat(learn): macOS DTrace harness"
     labels: ["type:feature", "priority:p2", "tier:T3", "platform:macos", "crate:sandbox"]
     scope: "Add a best-effort macOS DTrace learning harness for environments where SIP constraints permit it."
+
+  # --- Epic 6: Security Parity & Hardening (created 2026-07-05) ---
+  - id: "GH-268-01"
+    epic: "GH-268"
+    github_issue: 272
+    state: "open"
+    milestone: "v0.3.0"
+    title: "feat(sandbox/linux): Landlock read-allowlisting to enforce fs_read isolation"
+    labels: ["type:feature", "priority:p0", "tier:T2", "platform:linux", "crate:sandbox"]
+    scope: "Declare ACCESS_FS_READ_* in handled_access_fs and grant read only to fs_read + minimal system/toolchain set, so Linux Direct Mode blocks reads of ~/.ssh, ~/.aws, and external .env. Add a CI landmark fixture."
+
+  - id: "GH-268-02"
+    epic: "GH-268"
+    github_issue: 273
+    state: "open"
+    milestone: "v0.3.0"
+    title: "feat(sandbox/linux): move seccomp to deny-by-default allowlist posture"
+    labels: ["type:feature", "priority:p1", "tier:T2", "platform:linux", "crate:sandbox"]
+    scope: "Migrate the seccomp filter from a denylist (default Allow) to a deny-by-default allowlist, or document + expand the denylist to cover container-escape/OWASP-agentic syscall classes."
+
+  - id: "GH-268-03"
+    epic: "GH-268"
+    github_issue: 274
+    state: "open"
+    milestone: "v0.3.0"
+    title: "feat(audit): enforce restrictive permissions (0700/0600) on artifacts"
+    labels: ["type:feature", "priority:p1", "tier:T2", "crate:audit", "area:compliance"]
+    scope: "Create run directories 0700 and artifact files 0600 at creation time (no TOCTOU), so audit evidence confidentiality does not depend on umask."
+
+  - id: "GH-268-04"
+    epic: "GH-268"
+    github_issue: 275
+    state: "open"
+    milestone: "v0.3.0"
+    title: "feat(cli): guard non-loopback api --bind behind --allow-remote-bind"
+    labels: ["type:feature", "priority:p2", "tier:T2", "crate:cli"]
+    scope: "Reject non-loopback API bind addresses unless --allow-remote-bind is passed; refuse a remotely-bound API without a token; warn strongly."
+
+  - id: "GH-268-05"
+    epic: "GH-268"
+    github_issue: 276
+    state: "open"
+    milestone: "v0.3.0"
+    title: "feat(cli): surface Linux Direct-Mode read-isolation gap in plan/doctor"
+    labels: ["type:feature", "priority:p1", "tier:T2", "crate:cli", "platform:linux"]
+    scope: "Zero-code mitigation: warn in plan/run and reflect in doctor that Linux Direct Mode does not enforce read isolation until read-allowlisting (GH-268-01) lands. Auto-removed when the capability is detected."
+
+  # --- Epic 7: Scalability & Maintainability (created 2026-07-05) ---
+  - id: "GH-269-01"
+    epic: "GH-269"
+    github_issue: 277
+    state: "open"
+    milestone: "v0.3.0"
+    title: "refactor(cli): decompose main.rs into feature modules"
+    labels: ["type:infra", "priority:p1", "tier:T2", "crate:cli"]
+    scope: "Split the 5.8k-line main.rs into run/api/replica/mcp/bridge/audit_export/verify/output modules with zero behavior change; golden/integration/security suites stay green. Soft blocker for learn and the Action."
+
+  - id: "GH-269-02"
+    epic: "GH-269"
+    github_issue: 278
+    state: "open"
+    milestone: "v0.3.0"
+    title: "feat(replica): copy-on-write/reflink + hardlink fast path"
+    labels: ["type:feature", "priority:p1", "tier:T2", "crate:cli", "platform:cross-platform"]
+    scope: "Use APFS clonefile / Linux FICLONE + hardlinks where safe, falling back to copy across filesystems, preserving exclusions and sync-back safety. Unblocks MCP wrap on $HOME-scoped filesystem servers."
+
+  - id: "GH-269-03"
+    epic: "GH-269"
+    github_issue: 279
+    state: "open"
+    milestone: "v0.3.0"
+    title: "feat(capture): metadata-first fs-diff with on-demand hashing"
+    labels: ["type:feature", "priority:p2", "tier:T2", "crate:capture"]
+    scope: "Default to size+mtime snapshots with on-demand hashing of changed files; keep an opt-in audit-grade full-hash mode for compliance runs."
+
+  # --- Epic 8: Adoption Wave (created 2026-07-05) ---
+  - id: "GH-270-01"
+    epic: "GH-270"
+    github_issue: 280
+    state: "open"
+    milestone: "v0.2.0"
+    title: "feat(mcp): clawcrate mcp install config-writer for Cursor/Claude/Continue"
+    labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "crate:cli"]
+    scope: "Rewrite a client's mcp.json to route a named server through `clawcrate mcp wrap`, with --dry-run, timestamped backup, idempotency (no double-wrap), and an uninstall path."
+
+  - id: "GH-270-02"
+    epic: "GH-270"
+    github_issue: 281
+    state: "open"
+    milestone: "v0.2.0"
+    title: "examples(mcp): exfil->blocked+verify narrative on filesystem demo"
+    labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "area:examples"]
+    scope: "Extend the #259 demo into a full story: server attempts a secret read, it is blocked and audited as PermissionBlocked, and `clawcrate verify` passes. Capture as a committed asset."
+
+  - id: "GH-270-03"
+    epic: "GH-270"
+    github_issue: 282
+    state: "open"
+    milestone: "v0.2.0"
+    title: "docs(narrative): consolidate differentials into README positioning"
+    labels: ["type:docs", "priority:p0", "tier:T1", "area:docs"]
+    scope: "Reframe README around Policy + Evidence for Agent Actions and enumerate the five current differentials, preserving honesty guardrails (Linux read caveat, network best-effort)."
+
+  - id: "GH-270-04"
+    epic: "GH-270"
+    github_issue: 283
+    state: "open"
+    milestone: "v0.2.0"
+    title: "docs(compliance): publish EU AI Act Article 12 compliance statement"
+    labels: ["type:docs", "priority:p1", "tier:T1", "area:compliance", "area:docs"]
+    scope: "Publish an adopter-facing EU AI Act Article 12 statement derived from docs/eu-ai-act-compliance.md, with explicit boundaries/non-claims, linked from the README."
 
   - id: "M0-01"
     epic: "M0-EPIC"
