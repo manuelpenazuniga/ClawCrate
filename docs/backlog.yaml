@@ -803,7 +803,7 @@ issues:
   - id: "GH-270-04"
     epic: "GH-270"
     github_issue: 283
-    state: "open"
+    state: "in_review"
     milestone: "v0.2.0"
     title: "docs(compliance): publish EU AI Act Article 12 compliance statement"
     labels: ["type:docs", "priority:p1", "tier:T1", "area:compliance", "area:docs"]
