@@ -1,0 +1,6 @@
+FIXTURE ONLY — planted-secret-do-not-exfiltrate
+
+This file lives OUTSIDE the workspace the MCP server is allowed to read. It is
+here so a follow-up demo can show the server being blocked when it tries to
+reach a secret outside its allowed root. The read allowlist blocks this on both
+Linux and macOS, regardless of the intra-workspace deny caveats.
