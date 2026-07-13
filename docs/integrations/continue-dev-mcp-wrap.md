@@ -44,6 +44,42 @@ server launch. If you use standalone block files under `.continue/mcpServers/`,
 keep the same `command` and `args` shape shown below and include Continue's
 required block metadata.
 
+## Automated setup: `clawcrate mcp install`
+
+Instead of hand-editing `config.yaml`, let ClawCrate rewrite the block. Continue
+identifies servers by their `name:` field, so pass that as `--server-name`:
+
+```bash
+# Preview the change (writes nothing):
+clawcrate mcp install --client continue \
+  --server-name Filesystem \
+  --profile mcp-readonly \
+  --dry-run \
+  -- npx -y @modelcontextprotocol/server-filesystem /Users/you/project
+
+# Apply it (writes a timestamped backup first):
+clawcrate mcp install --client continue \
+  --server-name Filesystem \
+  --profile mcp-readonly \
+  -- npx -y @modelcontextprotocol/server-filesystem /Users/you/project
+```
+
+This rewrites only the block whose `name:` is `Filesystem` so Continue launches
+`clawcrate mcp wrap --profile mcp-readonly -- <original command>`, preserving the
+block's `type` and other list entries. YAML sequence order is preserved. A second
+run refuses to double-wrap. To restore:
+
+```bash
+clawcrate mcp uninstall --client continue --server-name Filesystem
+```
+
+Defaults to `~/.continue/config.yaml`; pass `--config <path>` for a non-standard
+location. Use `--json` for machine-readable output.
+
+> The `install` writer sets `command`/`args` directly. If you need the
+> workspace-directory launcher behavior below, edit the block to point at the
+> launcher script instead.
+
 ## Before: direct MCP server launch
 
 This Continue config runs the MCP server directly as the current user:

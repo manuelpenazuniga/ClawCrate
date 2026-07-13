@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod mcp_install;
+
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -207,6 +209,10 @@ struct McpArgs {
 enum McpCommand {
     /// Wrap a stdio MCP server command
     Wrap(McpWrapArgs),
+    /// Rewrite an MCP client config to route a server through `clawcrate mcp wrap`
+    Install(mcp_install::McpInstallArgs),
+    /// Restore an MCP client config entry to its pre-wrap command
+    Uninstall(mcp_install::McpUninstallArgs),
 }
 
 #[derive(Debug, Args)]
@@ -359,6 +365,8 @@ fn handle_plan(
 fn handle_mcp(resolver: &ProfileResolver, args: McpArgs, output: &OutputOptions) -> Result<()> {
     match args.command {
         McpCommand::Wrap(args) => handle_mcp_wrap(resolver, args, output),
+        McpCommand::Install(args) => mcp_install::handle_install(args, output),
+        McpCommand::Uninstall(args) => mcp_install::handle_uninstall(args, output),
     }
 }
 
@@ -4156,6 +4164,7 @@ mod tests {
                     assert!(!args.replica);
                     assert!(!args.direct);
                 }
+                other => panic!("expected mcp wrap command, got {other:?}"),
             },
             _ => panic!("expected mcp wrap command"),
         }
@@ -4245,6 +4254,7 @@ mod tests {
                         ]
                     );
                 }
+                other => panic!("expected mcp wrap command, got {other:?}"),
             },
             _ => panic!("expected mcp wrap command"),
         }

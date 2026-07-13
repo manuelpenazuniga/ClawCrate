@@ -25,6 +25,41 @@ In Claude Desktop, open **Settings...**, go to **Developer**, and choose
 
 Claude Desktop must be fully restarted after editing this file.
 
+## Automated setup: `clawcrate mcp install`
+
+Instead of hand-editing the JSON, let ClawCrate rewrite the entry:
+
+```bash
+# Preview the change (writes nothing):
+clawcrate mcp install --client claude \
+  --server-name filesystem \
+  --profile mcp-readonly \
+  --dry-run \
+  -- npx -y @modelcontextprotocol/server-filesystem /Users/you/Desktop
+
+# Apply it (writes a timestamped backup first):
+clawcrate mcp install --client claude \
+  --server-name filesystem \
+  --profile mcp-readonly \
+  -- npx -y @modelcontextprotocol/server-filesystem /Users/you/Desktop
+```
+
+This rewrites only the named `filesystem` entry so Claude Desktop launches
+`clawcrate mcp wrap --profile mcp-readonly -- <original command>`. Other entries
+are preserved, and a second run refuses to double-wrap. To restore:
+
+```bash
+clawcrate mcp uninstall --client claude --server-name filesystem
+```
+
+Defaults to the macOS path above; pass `--config <path>` on other platforms or
+for a non-standard location. Use `--json` for machine-readable output. Restart
+Claude Desktop after the change.
+
+> The `install` writer sets `command`/`args` directly. If you need the
+> change-into-a-directory launcher behavior below, edit the entry to point at the
+> launcher script instead.
+
 ## Before: direct MCP server launch
 
 This is the shape shown by the upstream MCP local-server guide. The MCP server

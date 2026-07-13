@@ -776,7 +776,7 @@ issues:
   - id: "GH-270-01"
     epic: "GH-270"
     github_issue: 280
-    state: "open"
+    state: "in_review"
     milestone: "v0.2.0"
     title: "feat(mcp): clawcrate mcp install config-writer for Cursor/Claude/Continue"
     labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "crate:cli"]

@@ -30,6 +30,42 @@ project config. The launcher below still changes into the target directory
 explicitly so ClawCrate materializes Replica mode from the intended workspace and
 the wrapped MCP server receives relative paths.
 
+## Automated setup: `clawcrate mcp install`
+
+Instead of hand-editing `mcp.json`, let ClawCrate rewrite the entry for you:
+
+```bash
+# Preview the change (writes nothing):
+clawcrate mcp install --client cursor \
+  --server-name filesystem \
+  --profile mcp-readonly \
+  --dry-run \
+  -- npx -y @modelcontextprotocol/server-filesystem /Users/me/project
+
+# Apply it (writes a timestamped backup first):
+clawcrate mcp install --client cursor \
+  --server-name filesystem \
+  --profile mcp-readonly \
+  -- npx -y @modelcontextprotocol/server-filesystem /Users/me/project
+```
+
+This rewrites only the named `filesystem` entry so Cursor launches
+`clawcrate mcp wrap --profile mcp-readonly -- <original command>`. Other entries
+are untouched. Running it again refuses to double-wrap. To restore the original
+command:
+
+```bash
+clawcrate mcp uninstall --client cursor --server-name filesystem
+```
+
+Defaults to `~/.cursor/mcp.json`; pass `--config .cursor/mcp.json` to target a
+project-local config. Use `--json` for machine-readable output.
+
+> The `install` writer sets `command`/`args` directly. If you need the
+> workspace-directory launcher behavior shown below (Replica materialized from a
+> specific directory via `${workspaceFolder}`), edit the entry to point at the
+> launcher script instead.
+
 ## Before: direct MCP server launch
 
 This Cursor config runs the MCP server directly as the current user:

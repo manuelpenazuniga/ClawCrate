@@ -308,6 +308,7 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
+ "serde_yaml",
  "signal-hook",
  "tiny_http",
  "uuid",
