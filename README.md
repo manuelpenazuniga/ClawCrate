@@ -229,6 +229,9 @@ clawcrate [--verbose] [--no-color] run [--profile PROFILE] [--replica | --direct
 clawcrate [--verbose] [--no-color] plan [--profile PROFILE] [--replica | --direct] -- COMMAND...
 clawcrate [--verbose] [--no-color] doctor
 clawcrate [--verbose] [--no-color] api [--bind ADDR] [--token TOKEN]
+clawcrate [--verbose] [--no-color] mcp wrap [--profile PROFILE] [--replica | --direct] -- COMMAND...
+clawcrate [--verbose] [--no-color] mcp install --client <cursor|claude|continue> --server-name NAME [--profile PROFILE] [--config PATH] [--dry-run] [--json] [-- COMMAND...]
+clawcrate [--verbose] [--no-color] mcp uninstall --client <cursor|claude|continue> --server-name NAME [--config PATH] [--dry-run] [--json]
 clawcrate [--verbose] [--no-color] bridge pennyprompt [--pretty]
 ```
 
@@ -243,6 +246,9 @@ clawcrate [--verbose] [--no-color] bridge pennyprompt [--pretty]
 | `--no-color` | Disable ANSI colors in human-readable output |
 | `api --bind <addr>` | Start local HTTP API (default `127.0.0.1:8787`) |
 | `api --token <token>` | Set bearer token for API auth (or use `CLAWCRATE_API_TOKEN`) |
+| `mcp wrap -- COMMAND...` | Sandbox a stdio MCP server transparently behind a profile |
+| `mcp install --client <c>` | Rewrite a Cursor/Claude/Continue config to route a server through `mcp wrap` (`--dry-run` previews, always backs up, refuses to double-wrap) |
+| `mcp uninstall --client <c>` | Restore a wrapped config entry to its pre-wrap command |
 | `bridge pennyprompt` | One-shot JSON adapter for PennyPrompt shell dispatch |
 
 `clawcrate run` forwards `SIGINT`/`SIGTERM` to the sandboxed child and still writes final artifacts (`result.json`, logs, `fs-diff.json`) before exit. It also enforces a runtime timeout based on profile `resources.max_cpu_seconds`.
