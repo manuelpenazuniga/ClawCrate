@@ -431,7 +431,7 @@ issues:
   - id: "GH-219-09"
     epic: "GH-219"
     github_issue: 259
-    state: "open"
+    state: "in_review"
     milestone: "v0.2.0"
     title: "examples(mcp): demo wrap of @modelcontextprotocol/server-filesystem"
     labels: ["type:feature", "priority:p0", "tier:T1", "area:mcp", "area:examples"]
