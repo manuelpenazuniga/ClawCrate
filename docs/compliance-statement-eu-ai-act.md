@@ -118,7 +118,7 @@ deployer must:
 
 Recommended pattern: enable hash chaining (and signing) *before* the run,
 verify during ingestion, and export to retention-controlled infrastructure with
-`clawcrate audit export <run-id> --format elastic|cef|syslog`. Treat the
+`clawcrate audit export <run-id> --format <elastic|cef|syslog>`. Treat the
 original `audit.ndjson` as canonical evidence and SIEM exports as derived views.
 
 ## Article 26 deployer obligations: exposing evidence to authorities
@@ -179,9 +179,9 @@ verification runs before logs enter long-term retention.
 ## References
 
 - Technical article-by-article mapping:
-  [`docs/eu-ai-act-compliance.md`](eu-ai-act-compliance.md)
+  [`eu-ai-act-compliance.md`](eu-ai-act-compliance.md)
 - IETF Agent Audit Trail alignment:
-  [`docs/ietf-audit-trail-alignment.md`](ietf-audit-trail-alignment.md)
+  [`ietf-audit-trail-alignment.md`](ietf-audit-trail-alignment.md)
 - EU AI Act Service Desk, Article 12 (Record-keeping):
   <https://ai-act-service-desk.ec.europa.eu/en/ai-act/article-12>
 - EU AI Act Service Desk, Article 19 (Automatically generated logs):
