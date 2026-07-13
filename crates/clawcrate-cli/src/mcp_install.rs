@@ -299,8 +299,25 @@ impl ConfigDoc {
             ConfigDoc::Yaml(doc) => serde_yaml::to_string(doc)
                 .map_err(|err| anyhow!("failed to serialize config: {err}"))?,
         };
-        fs::write(path, serialized)
-            .map_err(|err| anyhow!("failed to write {}: {err}", path.display()))
+        // Write atomically: a truncated/partial write would corrupt the user's
+        // client config. Write to a sibling temp file (same directory, so the
+        // rename stays on one filesystem) and rename it over the target.
+        let file_name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| anyhow!("cannot derive temp name for {}", path.display()))?;
+        let temp_path =
+            path.with_file_name(format!("{file_name}.clawcrate-tmp-{}", std::process::id()));
+        fs::write(&temp_path, serialized).map_err(|err| {
+            anyhow!(
+                "failed to write temporary config {}: {err}",
+                temp_path.display()
+            )
+        })?;
+        fs::rename(&temp_path, path).map_err(|err| {
+            let _ = fs::remove_file(&temp_path);
+            anyhow!("failed to replace config {}: {err}", path.display())
+        })
     }
 }
 
