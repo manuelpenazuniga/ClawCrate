@@ -9,6 +9,11 @@ program, perform legal assessments, or replace organizational compliance work.
 
 This is not legal advice.
 
+For an adopter-facing summary of what ClawCrate does and does not claim, see the
+[EU AI Act compliance statement](compliance-statement-eu-ai-act.md). For how
+ClawCrate's audit records relate to the IETF Agent Audit Trail draft, see
+[ietf-audit-trail-alignment.md](ietf-audit-trail-alignment.md).
+
 ## Scope
 
 The relevant EU AI Act provisions for ClawCrate's domain are the provisions that

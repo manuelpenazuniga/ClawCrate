@@ -257,7 +257,7 @@ Set `NO_COLOR=1` to disable ANSI colors via environment variable.
 
 ## Architecture
 
-For regulated AI-agent deployments, see the [EU AI Act compliance mapping](docs/eu-ai-act-compliance.md) for ClawCrate's audit-log coverage and boundaries.
+For regulated AI-agent deployments, start with the adopter-facing [EU AI Act compliance statement](docs/compliance-statement-eu-ai-act.md) — what ClawCrate does and does not claim for Article 12/19/26 record-keeping — backed by the detailed [EU AI Act compliance mapping](docs/eu-ai-act-compliance.md) for ClawCrate's audit-log coverage and boundaries.
 
 ### Dual-Platform Native Sandboxing
 
