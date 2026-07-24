@@ -5,7 +5,7 @@
 <h1 align="center">ClawCrate</h1>
 
 <p align="center">
-  <strong>Secure execution for AI agents.</strong>
+  <strong>Policy + evidence for everything your AI agent executes.</strong>
 </p>
 
 <p align="center">
@@ -15,11 +15,12 @@
 <p align="center">
   <a href="#quickstart">Quickstart</a> •
   <a href="#why">Why</a> •
-  <a href="#how-it-works">How It Works</a> •
+  <a href="#differentials">Differentials</a> •
   <a href="#profiles">Profiles</a> •
   <a href="#replica-mode">Replica Mode</a> •
+  <a href="#mcp-server-firewall">MCP Firewall</a> •
+  <a href="#audit-trail-you-can-prove">Audit</a> •
   <a href="#cli-reference">CLI</a> •
-  <a href="#architecture">Architecture</a> •
   <a href="#contributing">Contributing</a>
 </p>
 
@@ -34,7 +35,7 @@
 
 Your AI agent just ran `npm install` on a repo with a malicious postinstall script. That script read `~/.ssh/id_rsa`, `~/.aws/credentials`, and every `.env` file in your project. It POST'd everything to a server in Eastern Europe. You didn't know until someone used your AWS keys to spin up $14,000 in GPU instances.
 
-**ClawCrate is a single Rust binary that sandboxes every command your AI agent executes.** Native kernel-level isolation on both Linux (Landlock + seccomp) and macOS (Seatbelt). No Docker. No VMs. No root. Overhead you can't measure.
+**ClawCrate is the governance layer for agent-executed commands: minimal authority going in, portable evidence coming out — for _any_ agent.** The mechanism is a single Rust binary that sandboxes every command with native kernel primitives (Landlock + seccomp on Linux, Seatbelt on macOS). No Docker. No VMs. No root. Overhead you can't measure. But the sandbox is not the product — the product is that your agent only ever gets the authority a profile grants, and every run leaves a tamper-evident audit trail you can verify offline.
 
 ```
 Agent says: "run npm test"
@@ -42,11 +43,11 @@ Agent says: "run npm test"
     ▼
 clawcrate run --profile build -- npm test
     │
-    ├── Sandbox applied (kernel-level, irremovible)
-    ├── Secrets blocked via env scrub, macOS denies, or Replica filtering
+    ├── Sandbox applied (kernel-level, irremovible, inherited by children)
     ├── Env vars scrubbed (AWS_SECRET_ACCESS_KEY → gone)
     ├── Filesystem: read project, write only target/
     ├── Network: blocked
+    ├── Audit: hash-chained evidence written to disk
     │
     ▼
 npm test runs normally. Your secrets never left the vault.
@@ -55,10 +56,7 @@ npm test runs normally. Your secrets never left the vault.
 ## Quickstart
 
 ```bash
-# Install (macOS)
-curl -fsSL https://github.com/manuelpenazuniga/ClawCrate/releases/latest/download/install.sh | sh
-
-# Install (Linux)
+# Install (macOS or Linux)
 curl -fsSL https://github.com/manuelpenazuniga/ClawCrate/releases/latest/download/install.sh | sh
 
 # Run your first sandboxed command
@@ -69,91 +67,80 @@ clawcrate plan --profile build -- cargo test
 
 # Check your system's sandboxing capabilities
 clawcrate doctor
+
+# Prove a past run wasn't tampered with
+clawcrate verify <run-id>
 ```
 
-Your first sandboxed execution in under 60 seconds.
+Your first sandboxed execution in under 60 seconds. Installs from the latest published GitHub Release; see [CHANGELOG.md](CHANGELOG.md) for version details.
 
 ## Why
 
-68.5% of OpenClaw users are on macOS. The rest are on Linux. All of them run AI agents that execute shell commands with full access to their machine.
-
-Every `npm install`, `pip install`, `cargo build`, or `git clone` your agent runs inherits **all your permissions**. Your SSH keys, your AWS credentials, your API tokens, your browser cookies, your Keychain. If a dependency has a malicious postinstall script, or if the agent hallucinates a plausible-sounding package name that turns out to be malware — the damage is complete.
+Every `npm install`, `pip install`, `cargo build`, or `git clone` your agent runs inherits **all your permissions**: SSH keys, AWS credentials, API tokens, browser cookies, Keychain. One malicious postinstall script — or one hallucinated package name that turns out to be malware — and the damage is complete.
 
 ClawCrate exists because:
 
 - **Agents shouldn't decide their own limits.** The sandbox is external, kernel-enforced, inherited by all child processes, and impossible to remove from inside.
 - **Filesystem isolation isn't enough.** Environment variables leak secrets too. ClawCrate scrubs `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, `SSH_AUTH_SOCK`, and dozens more — before the process even starts.
-- **Docker is too heavy for this.** 500ms-2s startup, hundreds of MB, daemon dependency. ClawCrate adds <5ms.
-- **macOS matters.** Two-thirds of the market. ClawCrate uses native Apple Silicon sandboxing — no VMs, no emulation, no performance loss.
+- **"It ran in a sandbox" isn't evidence.** Compliance teams, incident responders, and the EU AI Act want records. ClawCrate emits hash-chained, signable artifacts for every run.
+- **Docker is too heavy for this.** 500ms–2s startup, hundreds of MB, daemon dependency. ClawCrate adds <5ms.
+- **macOS matters.** Two-thirds of agent users run macOS. ClawCrate uses native Apple Silicon sandboxing — no VMs, no emulation, no performance loss.
 
 ### What ClawCrate is NOT
 
 - **Not an agent.** It doesn't make decisions, rewrite prompts, or talk to LLMs.
 - **Not a container runtime.** No images, no layers, no daemon.
-- **Not a replacement for VMs.** If you need kernel-level isolation against kernel exploits, use a VM. ClawCrate is defense-in-depth at the process level.
-- **Not magic.** If your agent has legitimate network access and legitimate credentials for an allowed domain, ClawCrate can't prevent misuse of that access.
+- **Not a VM replacement.** If you need isolation against kernel exploits, use a VM. ClawCrate is defense-in-depth at the process level.
+- **Not magic.** If your agent has legitimate access to a credential and a destination, ClawCrate can't prevent misuse of that access.
 
-## What Makes ClawCrate Different
+## Differentials
 
-The sandbox is not the product. Every agent vendor (Codex, Cursor, Claude Code) already ships one internally, and the kernel primitives are free. ClawCrate is **the governance layer for agent-executed commands: minimal authority + portable evidence, for _any_ agent** — three layers no single agent vendor can own without ceasing to be agent-agnostic:
+Every agent vendor already ships an internal sandbox, and the kernel primitives are free. What no single vendor can own without ceasing to be agent-agnostic is the combination of **least-authority policy + kernel enforcement + tamper-evident evidence**. Five differentials, defensible today:
 
-- **Least-authority policy** — profiles today; auto-generated policy (`learn`) and a signed community marketplace (`profiles.dev`) next.
-- **Kernel enforcement** — Landlock + seccomp (Linux) / Seatbelt (macOS).
-- **Tamper-evident evidence** — a hash-chained, signable, verifiable audit trail.
-
-Five differentials, defensible today:
-
-1. **Only standalone dual-platform native sandbox** — Landlock+seccomp / Seatbelt, no Docker, no root, one Rust binary. (Alternatives are agent-internal, Docker-based, or macOS-only.)
-2. **Audit-grade by default, MIT** — SHA-256 hash chain + canonical JSON (RFC 8785) + offline `clawcrate verify` + Ed25519 signing + SIEM export. Matches closed-source tools; beats the plain logs of agents' internal sandboxes.
+1. **Only standalone dual-platform native sandbox** — Landlock + seccomp (Linux) and Seatbelt (macOS), no Docker, no root, one Rust binary. Alternatives are agent-internal, Docker-based, or single-platform.
+2. **Audit-grade by default, MIT licensed** — SHA-256 hash chain, canonical JSON (RFC 8785), offline `clawcrate verify`, Ed25519 signing, SIEM export. Matches closed-source tools; beats the plain logs of agents' internal sandboxes.
 3. **MCP Server Firewall** — `clawcrate mcp wrap` transparently sandboxes any stdio MCP server; the client never notices. Nobody else does this.
 4. **Agent-agnostic** — the same binary serves OpenClaw, Claude Code, Codex, Cursor, Gemini CLI, and CI.
-5. **Concrete compliance narrative** — EU AI Act Article 12/19/26 mapping + IETF draft-sharif alignment. Turns "security" into regulatory evidence.
+5. **Concrete compliance narrative** — EU AI Act Article 12/19/26 mapping plus IETF draft-sharif alignment. Turns "security" into regulatory evidence.
 
-> **Honesty guardrails.** Read isolation is enforced on macOS (Seatbelt) and on Linux via Replica Mode; **Linux Direct Mode currently enforces write controls, not read isolation** (tracked in #268). `network: filtered` is proxy-mediated best-effort (see the [egress proxy threat model](docs/egress-proxy-threat-model.md)).
+Strategic basis: [strategic audit](docs/strategic-audit-2026-07-05.md) · execution plan: [roadmap](docs/roadmap-2026-07-05.md).
+
+> **Honesty guardrails.** Read isolation is enforced on macOS (Seatbelt) and on Linux via Replica Mode; **Linux Direct Mode currently enforces write controls, not read isolation** (tracked in [#268](https://github.com/manuelpenazuniga/ClawCrate/issues/268)). `network: filtered` is proxy-mediated best-effort (see the [egress proxy threat model](docs/egress-proxy-threat-model.md)).
+
+### How it compares
+
+| | ClawCrate | Docker / containers | Agent-internal sandboxes | WASM isolates |
+|---|---|---|---|---|
+| Startup overhead | <5 ms | 500 ms – 2 s + daemon | built in | low |
+| Runs native toolchains (node, python, git) | ✅ | ✅ | ✅ | ❌ (WASI can't) |
+| Works with any agent | ✅ | DIY glue per agent | ❌ locked to one vendor | SDK-specific |
+| Tamper-evident audit trail | ✅ hash-chained, signable, offline-verifiable | plain logs | plain logs | varies |
+| Root or daemon required | ❌ | daemon | ❌ | ❌ |
 
 ## How It Works
 
 ```
 clawcrate run --profile build -- cargo test --release
     │
-    ├─ 1. RESOLVE PROFILE
-    │     Profile "build" → read workspace + toolchain,
-    │     write target/, network blocked, env scrubbed
-    │
-    ├─ 2. PLAN
-    │     Generate execution plan with permissions granted/denied
-    │     (visible via `clawcrate plan`)
-    │
-    ├─ 3. MATERIALIZE WORKSPACE
-    │     Direct mode: run in-place
-    │     Replica mode: copy workspace excluding .env, secrets
-    │
-    ├─ 4. SCRUB ENVIRONMENT
-    │     Remove AWS_*, GITHUB_TOKEN, SSH_AUTH_SOCK, *_SECRET*, ...
-    │
-    ├─ 5. APPLY SANDBOX (kernel-level)
-    │     Linux: Landlock (filesystem) + seccomp-bpf (syscalls) + rlimits
-    │     macOS: Seatbelt SBPL profile (filesystem + network + process)
-    │     → Irremovible. Inherited by all child processes.
-    │
-    ├─ 6. LAUNCH
-    │     Linux: fork → apply sandbox in-process → exec
-    │     macOS: exec via sandbox-exec with generated SBPL
-    │
-    ├─ 7. CAPTURE
-    │     stdout/stderr piped to logs
-    │     fs-diff: snapshot before vs after
-    │
-    └─ 8. ARTIFACTS
-          ~/.clawcrate/runs/exec_{id}/
-          ├── plan.json, result.json
-          ├── stdout.log, stderr.log
-          ├── audit.ndjson, fs-diff.json
+    ├─ 1. RESOLVE PROFILE     build → read workspace + toolchain, write target/,
+    │                         network blocked, env scrubbed
+    ├─ 2. PLAN                permissions granted/denied (visible via `clawcrate plan`)
+    ├─ 3. MATERIALIZE         Direct: run in place · Replica: filtered copy, no secrets
+    ├─ 4. SCRUB ENV           AWS_*, GITHUB_TOKEN, SSH_AUTH_SOCK, *_SECRET*, ...
+    ├─ 5. APPLY SANDBOX       Linux: Landlock + seccomp-bpf + rlimits
+    │                         macOS: Seatbelt SBPL (filesystem + network + process)
+    │                         → irremovible, inherited by all child processes
+    ├─ 6. LAUNCH              Linux: fork → sandbox in-process → exec
+    │                         macOS: exec via sandbox-exec
+    ├─ 7. CAPTURE             stdout/stderr piped, fs-diff snapshot before/after
+    └─ 8. EVIDENCE            ~/.clawcrate/runs/exec_{id}/
+                              plan.json · result.json · stdout.log · stderr.log
+                              audit.ndjson (hash-chained) · fs-diff.json
 ```
 
 ## Profiles
 
-ClawCrate ships four built-in profiles. No YAML required.
+Four built-in profiles. No YAML required.
 
 | Profile | Filesystem | Network | Env | Workspace Mode | Use Case |
 |---------|-----------|---------|-----|---------------|----------|
@@ -163,20 +150,15 @@ ClawCrate ships four built-in profiles. No YAML required.
 | **open** | Read/Write: workspace | Open | Partially scrubbed | Direct | General-purpose scripts |
 
 ```bash
-# Safe: read-only, no network
 clawcrate run --profile safe -- pytest -q
-
-# Build: write to target/, no network
 clawcrate run --profile build -- cargo test --release
-
-# Install: network enabled, replica mode automatic
-clawcrate run --profile install -- npm install express
-
-# Open: full workspace access, network enabled
+clawcrate run --profile install -- npm install express   # replica mode automatic
 clawcrate run --profile open -- ./deploy.sh
 ```
 
 > **`install` uses Replica Mode by default** because it's the highest-risk profile: postinstall scripts with network access. Use `--direct` to opt out (not recommended).
+
+Community profiles ship for MCP and inference workloads (`mcp-readonly`, `mcp-server`, `agent-inference-allowlist`) — see [community profiles](docs/community-profiles.md).
 
 ### Custom Profiles (YAML)
 
@@ -200,64 +182,86 @@ clawcrate run --profile .clawcrate/custom.yaml -- make build
 
 ## Replica Mode
 
-The most dangerous commands are the ones that need both write access and network access. `npm install` is the poster child: postinstall scripts can read your `.env` files and exfiltrate them.
+The most dangerous commands need both write access and network access. `npm install` is the poster child: postinstall scripts can read your `.env` files and exfiltrate them.
 
 **Replica Mode** creates a filtered copy of your workspace, runs the command there, and syncs changes back only with your explicit confirmation.
 
 ```bash
-# install uses replica automatically
-clawcrate run --profile install -- npm install express
-
-# force replica on any profile
-clawcrate run --replica --profile build -- cargo test
-
-# force direct on install (you accept the risk)
-clawcrate run --direct --profile install -- npm install
+clawcrate run --profile install -- npm install express   # replica automatic
+clawcrate run --replica --profile build -- cargo test    # force replica anywhere
+clawcrate run --direct --profile install -- npm install  # opt out (you accept the risk)
 ```
 
-Replica copy exclusions: default `.env`, `.env.*`, `.git/config`, plus any rules in `.clawcrateignore`.
+- Copy exclusions: `.env`, `.env.*`, `.git/config`, plus any rules in `.clawcrateignore`.
+- Precedence: `--replica` / `--direct` flags override the profile default.
+- **Sync-back always requires explicit confirmation** in interactive mode; with `--json` it is deterministically skipped.
 
-Mode precedence is explicit: `--replica` / `--direct` flags override the profile default mode. Without flags, the profile default applies (`install` => Replica, most others => Direct).
+## MCP Server Firewall
 
-**Syncing changes back always requires explicit confirmation in interactive mode.**
-When `--json` is enabled, sync-back is deterministically skipped (non-interactive behavior).
+Every MCP server your agent connects to runs with your full permissions — same problem, new surface. `clawcrate mcp wrap` puts any stdio MCP server behind a profile, transparently: the client speaks JSON-RPC to ClawCrate, ClawCrate relays to the sandboxed server, and nobody has to change a line of code.
+
+```bash
+# Sandbox a filesystem MCP server behind the mcp-readonly profile
+clawcrate mcp wrap --profile mcp-readonly -- npx -y @modelcontextprotocol/server-filesystem ./workspace
+
+# One command to rewrite your Cursor / Claude Desktop / Continue config
+clawcrate mcp install --client cursor --server-name filesystem --profile mcp-readonly
+
+# Undo it just as easily
+clawcrate mcp uninstall --client cursor --server-name filesystem
+```
+
+`mcp install` previews with `--dry-run`, always backs up the original config, and refuses to double-wrap. See the runnable demo at [`examples/mcp-filesystem-demo/`](examples/mcp-filesystem-demo/): normal reads work, secrets are unreachable, writes fail, env is scrubbed, network is blocked — all enforced by the kernel.
+
+## Audit Trail You Can Prove
+
+Every run writes evidence to `~/.clawcrate/runs/exec_{id}/`:
+
+```
+├── plan.json       What was permitted and denied
+├── result.json     Exit code, duration, status
+├── stdout.log      Complete stdout
+├── stderr.log      Complete stderr
+├── audit.ndjson    Every sandbox decision — SHA-256 hash-chained, one JSON line per event
+└── fs-diff.json    Files created, modified, deleted
+```
+
+The audit log is a hash chain over canonical JSON (RFC 8785), optionally signed with Ed25519:
+
+```bash
+clawcrate verify <run-id>                    # offline integrity check
+clawcrate verify <run-id> --pubkey key.pem   # + signature validation
+clawcrate audit export <run-id> --format cef # SIEM export: json | cef | syslog | elastic
+```
+
+For regulated AI-agent deployments, start with the adopter-facing [EU AI Act compliance statement](docs/compliance-statement-eu-ai-act.md) — what ClawCrate does and does not claim for Article 12/19/26 record-keeping — backed by the detailed [compliance mapping](docs/eu-ai-act-compliance.md) and [IETF audit-trail alignment](docs/ietf-audit-trail-alignment.md).
 
 ## CLI Reference
 
 ```
-clawcrate [--verbose] [--no-color] run [--profile PROFILE] [--replica | --direct] [--approve-out-of-profile] -- COMMAND...
-clawcrate [--verbose] [--no-color] plan [--profile PROFILE] [--replica | --direct] -- COMMAND...
-clawcrate [--verbose] [--no-color] doctor
-clawcrate [--verbose] [--no-color] api [--bind ADDR] [--token TOKEN]
-clawcrate [--verbose] [--no-color] mcp wrap [--profile PROFILE] [--replica | --direct] -- COMMAND...
-clawcrate [--verbose] [--no-color] mcp install --client <cursor|claude|continue> --server-name NAME [--profile PROFILE] [--config PATH] [--dry-run] [--json] [-- COMMAND...]
-clawcrate [--verbose] [--no-color] mcp uninstall --client <cursor|claude|continue> --server-name NAME [--config PATH] [--dry-run] [--json]
-clawcrate [--verbose] [--no-color] bridge pennyprompt [--pretty]
+clawcrate run     [--profile P] [--replica | --direct] [--approve-out-of-profile] [--json] -- COMMAND...
+clawcrate plan    [--profile P] [--replica | --direct] [--json] -- COMMAND...
+clawcrate doctor  [--json]
+clawcrate verify  RUN_ID [--pubkey KEY.pem] [--json]
+clawcrate audit   export RUN_ID [--format json|cef|syslog|elastic]
+clawcrate mcp     wrap [--profile P] -- COMMAND...
+clawcrate mcp     install|uninstall --client <cursor|claude|continue> --server-name NAME [--dry-run]
+clawcrate api     [--bind ADDR] [--token TOKEN]
+clawcrate bridge  pennyprompt [--pretty]
 ```
 
 | Flag | Effect |
 |------|--------|
-| `--profile <name>` | Use built-in profile (safe, build, install, open) or path to YAML |
-| `--replica` | Force Replica Mode (for profiles that default to Direct) |
-| `--direct` | Force Direct Mode (for profiles that default to Replica) |
-| `--approve-out-of-profile` | Bypass approval prompt for detected permission requests outside active profile |
+| `--profile <name>` | Built-in profile (safe, build, install, open) or path to YAML |
+| `--replica` / `--direct` | Force workspace mode, overriding the profile default |
+| `--approve-out-of-profile` | Bypass approval prompt for permission requests outside the active profile |
 | `--json` | Machine-readable output (for agent integration) |
-| `--verbose` / `-v` | Show detailed diagnostic logs (error chain, execution stages) |
-| `--no-color` | Disable ANSI colors in human-readable output |
-| `api --bind <addr>` | Start local HTTP API (default `127.0.0.1:8787`) |
-| `api --token <token>` | Set bearer token for API auth (or use `CLAWCRATE_API_TOKEN`) |
-| `mcp wrap -- COMMAND...` | Sandbox a stdio MCP server transparently behind a profile |
-| `mcp install --client <c>` | Rewrite a Cursor/Claude/Continue config to route a server through `mcp wrap` (`--dry-run` previews, always backs up, refuses to double-wrap) |
-| `mcp uninstall --client <c>` | Restore a wrapped config entry to its pre-wrap command |
-| `bridge pennyprompt` | One-shot JSON adapter for PennyPrompt shell dispatch |
+| `--verbose` / `-v` | Detailed diagnostic logs |
+| `--no-color` | Disable ANSI colors (also honors `NO_COLOR=1`) |
 
-`clawcrate run` forwards `SIGINT`/`SIGTERM` to the sandboxed child and still writes final artifacts (`result.json`, logs, `fs-diff.json`) before exit. It also enforces a runtime timeout based on profile `resources.max_cpu_seconds`.
-
-Set `NO_COLOR=1` to disable ANSI colors via environment variable.
+`clawcrate run` forwards `SIGINT`/`SIGTERM` to the sandboxed child, still writes final artifacts before exit, and enforces a runtime timeout from profile `resources.max_cpu_seconds`.
 
 ## Architecture
-
-For regulated AI-agent deployments, start with the adopter-facing [EU AI Act compliance statement](docs/compliance-statement-eu-ai-act.md) — what ClawCrate does and does not claim for Article 12/19/26 record-keeping — backed by the detailed [EU AI Act compliance mapping](docs/eu-ai-act-compliance.md) for ClawCrate's audit-log coverage and boundaries.
 
 ### Dual-Platform Native Sandboxing
 
@@ -267,7 +271,6 @@ For regulated AI-agent deployments, start with the adopter-facing [EU AI Act com
 | **Filesystem** | Landlock write controls; Replica Mode for secret read filtering | Path + regex deny (intra-workspace) |
 | **Syscalls** | seccomp-bpf per-syscall filtering | Seatbelt operation categories |
 | **Network** | Blocked by default | Blocked by default |
-| **Resources** | rlimits | rlimits |
 | **Root required** | No (kernel 5.13+) | No |
 | **Irremovible** | Yes | Yes |
 | **Performance** | Native | Native (Apple Silicon, no VM) |
@@ -284,38 +287,24 @@ crates/
 │   ├── env_scrub.rs       Cross-platform env scrubbing
 │   └── doctor.rs          System capability detection
 ├── clawcrate-capture/     stdout/stderr capture, fs-diff (snapshot pre/post)
-├── clawcrate-audit/       Artifact generation (ndjson)
+├── clawcrate-audit/       Artifact generation, hash chain, signing
 └── clawcrate-cli/         Clap CLI entry point
-```
-
-### Artifacts
-
-Every execution generates a directory:
-
-```
-~/.clawcrate/runs/exec_a1b2c3/
-├── plan.json       What was permitted and denied
-├── result.json     Exit code, duration, status
-├── stdout.log      Complete stdout
-├── stderr.log      Complete stderr
-├── audit.ndjson    Every sandbox decision, one JSON line per event
-└── fs-diff.json    Files created, modified, deleted
 ```
 
 ## Compatibility
 
-ClawCrate works with any agent that executes shell commands:
+ClawCrate works with any agent that executes shell commands — it integrates at the boundary where the agent delegates execution, not by wrapping the agent itself:
 
 | Agent | Integration |
 |-------|------------|
 | OpenClaw | Wrap tool calls: `clawcrate run --profile build -- <command>` |
 | Claude Code | Use as execution layer for shell tools |
 | Codex (OpenAI) | Wrap in CI or local dev |
-| Cursor | Wrap terminal commands |
+| Cursor / Continue | `clawcrate mcp install --client ...` for MCP servers; wrap terminal commands |
 | Gemini CLI | Same pattern |
 | Any CLI agent | `clawcrate run --profile safe -- <anything>` |
 
-ClawCrate integrates at the boundary where the agent delegates shell command execution — it doesn't wrap the agent itself.
+Recipes: [integration guide](docs/integration-guide.md) and [docs/integrations/](docs/integrations).
 
 ## System Requirements
 
@@ -324,25 +313,19 @@ ClawCrate integrates at the boundary where the agent delegates shell command exe
 | **Linux** | Kernel 5.13+ (Landlock v1) | Kernel 6.7+ for newer Landlock capabilities |
 | **macOS** | macOS 12+ (Monterey) | macOS 14+ (Sonoma) |
 
-Run `clawcrate doctor` to check your system's capabilities.
+Run `clawcrate doctor` to check your system.
 
 ## Roadmap
 
 Detailed, sequenced plan: [docs/roadmap-2026-07-05.md](docs/roadmap-2026-07-05.md) (active). Strategic basis: [docs/strategic-audit-2026-07-05.md](docs/strategic-audit-2026-07-05.md). GitHub milestones/issues are the scope source of truth.
 
-- [x] **Alpha** — `run`, `plan`, `doctor`, `api`, `bridge pennyprompt`. Profiles. Dual-platform sandbox. Replica mode. Artifacts.
+- [x] **Alpha** — `run`, `plan`, `doctor`, `api`, `bridge`. Profiles. Dual-platform sandbox. Replica mode. Artifacts.
 - [x] **P1/P2** — Egress proxy (proxy-mediated domain filtering; see threat-model caveats). Approval workflow. Community profiles. SQLite audit storage. API/bridge hardening.
-- [x] **v0.2.0** — **Compliance Kit** (SHA-256 hash chain, canonical JSON, offline `verify`, Ed25519 signing, SIEM export) + **MCP Server Firewall** (`clawcrate mcp wrap` transparent JSON-RPC relay).
-- [ ] **v0.2.0 (Adoption Wave)** — one-command `mcp install`, demoable exfil→blocked story, consolidated narrative, EU AI Act statement. _(Epic 8 · #270)_
-- [ ] **v0.3.0 (Foundations)** — Linux read-isolation parity (Landlock read-allowlisting) + hardening _(Epic 6 · #268)_ and scalability/maintainability paydown _(Epic 7 · #269)_.
-- [ ] **v0.4.0 (Adoption & Ecosystem)** — `clawcrate learn` auto-policy _(Epic 1 · #222)_, `profiles.dev` marketplace _(Epic 3 · #221)_, distribution: GitHub Action + integrations + VS Code _(Epic 5 · #220)_.
-- [ ] **v1.0** — Structural network enforcement, `replay`, certifications, plugin system, surface freeze _(Epic 9 · #271)_.
-
-Transition note:
-The latest alpha release is published on GitHub Releases. Quickstart installs from the latest published release assets; see `CHANGELOG.md` for version-specific details.
-
-Linux note:
-Direct Mode currently uses Landlock for filesystem write controls and seccomp for syscall/network restrictions. For Linux workflows that must exclude sensitive readable files inside or near an allowed workspace, use Replica Mode so `.env*`, `.git/config`, and `.clawcrateignore` exclusions are applied before launch.
+- [x] **v0.2.0 — Compliance Kit + MCP Firewall** — SHA-256 hash chain, canonical JSON, offline `verify`, Ed25519 signing, SIEM export; `clawcrate mcp wrap` transparent JSON-RPC relay.
+- [ ] **v0.2.0 — Adoption Wave** _(in progress — Epic 8 · [#270](https://github.com/manuelpenazuniga/ClawCrate/issues/270))_ — shipped: one-command `mcp install`, EU AI Act adopter statement, sandboxed filesystem MCP demo. Remaining: exfil→blocked demo narrative, launch assets.
+- [ ] **v0.3.0 — Foundations** — Linux read-isolation parity (Landlock read-allowlisting) + hardening _(Epic 6 · [#268](https://github.com/manuelpenazuniga/ClawCrate/issues/268))_, scalability/maintainability paydown _(Epic 7 · [#269](https://github.com/manuelpenazuniga/ClawCrate/issues/269))_.
+- [ ] **v0.4.0 — Adoption & Ecosystem** — `clawcrate learn` auto-policy _(Epic 1 · [#222](https://github.com/manuelpenazuniga/ClawCrate/issues/222))_, `profiles.dev` marketplace _(Epic 3 · [#221](https://github.com/manuelpenazuniga/ClawCrate/issues/221))_, distribution: GitHub Action + integrations + VS Code _(Epic 5 · [#220](https://github.com/manuelpenazuniga/ClawCrate/issues/220))_.
+- [ ] **v1.0** — Structural network enforcement, `replay`, certifications, plugin system, surface freeze _(Epic 9 · [#271](https://github.com/manuelpenazuniga/ClawCrate/issues/271))_.
 
 ## Contributing
 
@@ -356,14 +339,14 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 ```
 
-See [CLAUDE.md](CLAUDE.md) for the complete development guide with architecture decisions, coding standards, and step-by-step build instructions.
-See [docs/WORKFLOW.md](docs/WORKFLOW.md) for the operational issue-to-PR workflow used in this repository.
-See [CHANGELOG.md](CHANGELOG.md) for release notes and version history.
-See [docs/release-checklist.md](docs/release-checklist.md) for the alpha release and tagging runbook.
-See [docs/egress-proxy-threat-model.md](docs/egress-proxy-threat-model.md) for the post-alpha network-filtering design baseline.
-See [docs/community-profiles.md](docs/community-profiles.md) for the community profile catalog schema and contribution workflow.
-See [docs/wsl2-compatibility.md](docs/wsl2-compatibility.md) for the current WSL2 compatibility constraints report.
-See [docs/architecture.md](docs/architecture.md), [docs/profiles-reference.md](docs/profiles-reference.md), [docs/kernel-requirements.md](docs/kernel-requirements.md), and [docs/integration-guide.md](docs/integration-guide.md) for the alpha technical docs pack.
+**Key docs:**
+
+- [CLAUDE.md](CLAUDE.md) — development guide: architecture decisions, coding standards, build steps
+- [docs/WORKFLOW.md](docs/WORKFLOW.md) — issue-to-PR workflow used in this repository
+- [docs/architecture.md](docs/architecture.md) · [docs/profiles-reference.md](docs/profiles-reference.md) · [docs/kernel-requirements.md](docs/kernel-requirements.md) — technical reference
+- [docs/egress-proxy-threat-model.md](docs/egress-proxy-threat-model.md) — network-filtering design baseline
+- [docs/community-profiles.md](docs/community-profiles.md) — community profile catalog and contribution workflow
+- [CHANGELOG.md](CHANGELOG.md) · [docs/release-checklist.md](docs/release-checklist.md) — releases
 
 ## License
 
