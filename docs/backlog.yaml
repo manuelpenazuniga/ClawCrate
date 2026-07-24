@@ -720,7 +720,7 @@ issues:
   - id: "GH-268-03"
     epic: "GH-268"
     github_issue: 274
-    state: "open"
+    state: "in_review"
     milestone: "v0.3.0"
     title: "feat(audit): enforce restrictive permissions (0700/0600) on artifacts"
     labels: ["type:feature", "priority:p1", "tier:T2", "crate:audit", "area:compliance"]

@@ -18,6 +18,47 @@ pub const CRATE_NAME: &str = "clawcrate-audit";
 /// All-zeros SHA-256 used as the previous_hash of the first chained event.
 pub const GENESIS_HASH: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Create a directory and any missing parents with restrictive `0700`
+/// permissions on Unix, applied **at creation** (no post-hoc `chmod`, so there
+/// is no TOCTOU window). The mode only applies to directories this call
+/// creates, so an already-stricter existing directory is never weakened. On
+/// non-Unix targets this falls back to `create_dir_all` and confidentiality
+/// follows the platform's defaults.
+fn create_secure_dir_all(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+/// Open a file for writing, creating it with `0600` permissions on Unix applied
+/// **at creation** (no TOCTOU window). When `append` is false the file is
+/// truncated; when true, content is appended. The mode only applies when the
+/// file is newly created, so an existing file's permissions are not widened.
+fn open_secure_file(path: &Path, append: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true);
+    if append {
+        options.append(true);
+    } else {
+        options.write(true).truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
 pub const PLAN_JSON: &str = "plan.json";
 pub const RESULT_JSON: &str = "result.json";
 pub const AUDIT_NDJSON: &str = "audit.ndjson";
@@ -534,7 +575,7 @@ impl ArtifactWriter {
         artifacts_dir: P,
     ) -> Result<Self, ArtifactWriterError> {
         let artifacts_dir = artifacts_dir.into();
-        fs::create_dir_all(&artifacts_dir).map_err(|source| {
+        create_secure_dir_all(&artifacts_dir).map_err(|source| {
             ArtifactWriterError::CreateArtifactsDir {
                 path: artifacts_dir.clone(),
                 source,
@@ -577,11 +618,8 @@ impl ArtifactWriter {
 
     pub fn append_audit_event(&self, event: &AuditEvent) -> Result<(), ArtifactWriterError> {
         let path = self.audit_ndjson_path();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|source| ArtifactWriterError::OpenFile {
+        let mut file =
+            open_secure_file(&path, true).map_err(|source| ArtifactWriterError::OpenFile {
                 path: path.clone(),
                 source,
             })?;
@@ -687,10 +725,11 @@ pub enum ArtifactWriterError {
 }
 
 fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), ArtifactWriterError> {
-    let mut file = File::create(path).map_err(|source| ArtifactWriterError::OpenFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut file =
+        open_secure_file(path, false).map_err(|source| ArtifactWriterError::OpenFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
     serde_json::to_writer_pretty(&mut file, value).map_err(|source| {
         ArtifactWriterError::WriteJson {
             path: path.to_path_buf(),
@@ -727,7 +766,7 @@ impl SqliteAuditIndex {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SqliteAuditIndexError> {
         let db_path = path.as_ref().to_path_buf();
         if let Some(parent) = sqlite_db_parent_dir(&db_path) {
-            fs::create_dir_all(parent).map_err(|source| {
+            create_secure_dir_all(parent).map_err(|source| {
                 SqliteAuditIndexError::CreateParentDir {
                     path: parent.to_path_buf(),
                     source,
@@ -1206,6 +1245,66 @@ mod tests {
             writer.fs_diff_path(),
             root.join("exec-123").join(FS_DIFF_JSON)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifacts_are_created_with_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_tmp_dir("clawcrate_audit_perms");
+        let writer = ArtifactWriter::new(&root, "exec-perms").expect("create writer");
+
+        writer.write_plan(&test_plan()).expect("write plan");
+        writer.write_result(&test_result()).expect("write result");
+        writer
+            .append_audit_event(&AuditEvent {
+                timestamp: Utc::now(),
+                event: AuditEventKind::ProcessStarted {
+                    pid: 7,
+                    command: vec!["echo".to_string()],
+                },
+            })
+            .expect("append audit event");
+        writer
+            .write_fs_diff(&Vec::<u8>::new())
+            .expect("write fs-diff");
+
+        let dir_mode = std::fs::metadata(writer.artifacts_dir())
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "artifacts dir must be 0700, got {dir_mode:o}"
+        );
+
+        for name in [PLAN_JSON, RESULT_JSON, AUDIT_NDJSON, FS_DIFF_JSON] {
+            let path = writer.artifacts_dir().join(name);
+            let mode = std::fs::metadata(&path)
+                .expect("file metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{name} must be 0600, got {mode:o}");
+        }
+
+        // Defense in depth for the "signing key material is never >0600"
+        // guarantee: every file the writer creates in the run directory is
+        // exactly 0600, so nothing (signatures included) is group/other readable.
+        for entry in std::fs::read_dir(writer.artifacts_dir()).expect("read run dir") {
+            let entry = entry.expect("dir entry");
+            if entry.file_type().expect("file type").is_file() {
+                let mode = entry.metadata().expect("meta").permissions().mode() & 0o777;
+                assert_eq!(
+                    mode,
+                    0o600,
+                    "{:?} must be 0600, got {mode:o}",
+                    entry.file_name()
+                );
+            }
+        }
     }
 
     #[test]

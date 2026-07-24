@@ -181,7 +181,13 @@ architecture:
 ClawCrate's evidence is strongest when:
 
 - The sandboxed command cannot write to its own artifact directory.
-- Artifact directories have restrictive filesystem permissions.
+- Artifact directories have restrictive filesystem permissions. On Unix,
+  ClawCrate creates `~/.clawcrate` and each `runs/<run-id>/` directory with mode
+  `0700` and every artifact file (`plan.json`, `result.json`, `audit.ndjson`,
+  `fs-diff.json`, `stdout.log`, `stderr.log`) with mode `0600`, applied at
+  creation. Confidentiality no longer depends on the operator's umask, and
+  existing stricter permissions are never weakened. On non-Unix platforms,
+  permissions follow the platform defaults.
 - Hash-chain logging is enabled before execution starts.
 - Signing keys are kept outside the command workspace and outside the sandboxed
   process environment.
