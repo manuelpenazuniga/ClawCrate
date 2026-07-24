@@ -38,7 +38,7 @@ pub(crate) fn probe_system_capabilities() -> Result<SystemCapabilities> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn probe_system_capabilities() -> Result<SystemCapabilities> {
-    Err(anyhow!("unsupported platform for `doctor` command"))
+    Err(anyhow::anyhow!("unsupported platform for `doctor` command"))
 }
 
 pub(crate) fn print_human_doctor(capabilities: &SystemCapabilities, _output: &OutputOptions) {
