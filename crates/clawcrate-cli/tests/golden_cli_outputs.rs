@@ -60,6 +60,12 @@ fn normalize_plan_json(mut plan: Value) -> String {
     plan["id"] = json!("<EXECUTION_ID>");
     plan["cwd"] = json!("<EXECUTION_CWD>");
     plan["created_at"] = json!("<CREATED_AT>");
+    // Platform-conditional field (present only on the Linux Direct-Mode
+    // read-isolation gap). Drop it here so this golden stays platform-agnostic;
+    // it is asserted directly in read_isolation_integration.rs.
+    if let Some(object) = plan.as_object_mut() {
+        object.remove("read_isolation_enforced");
+    }
     serde_json::to_string_pretty(&plan).expect("serialize normalized plan")
 }
 
@@ -95,6 +101,7 @@ fn normalize_doctor_json(mut doctor: Value) -> String {
     doctor["user_namespaces"] = json!("<USER_NAMESPACES_BOOL>");
     doctor["macos_version"] = json!("<MACOS_VERSION_OR_NULL>");
     doctor["kernel_version"] = json!("<KERNEL_VERSION_OR_NULL>");
+    doctor["read_isolation_enforced"] = json!("<READ_ISOLATION_BOOL>");
     serde_json::to_string_pretty(&doctor).expect("serialize normalized doctor")
 }
 
@@ -103,6 +110,11 @@ fn normalize_run_json(mut summary: Value) -> String {
     summary["stdout_log"] = json!("<STDOUT_LOG>");
     summary["stderr_log"] = json!("<STDERR_LOG>");
     summary["scrubbed_env_vars"] = json!("<SCRUBBED_ENV_COUNT>");
+    // Platform-conditional field (Linux Direct-Mode read-isolation gap only);
+    // drop it to keep the golden platform-agnostic.
+    if let Some(object) = summary.as_object_mut() {
+        object.remove("read_isolation_enforced");
+    }
 
     if let Some(result) = summary.get_mut("result").and_then(Value::as_object_mut) {
         result.insert("id".to_string(), json!("<EXECUTION_ID>"));
@@ -250,6 +262,7 @@ fn doctor_text_matches_golden() {
             ("seccomp", "<SECCOMP_STATUS>"),
             ("Seatbelt", "<SEATBELT_STATUS>"),
             ("User Namespaces", "<USER_NAMESPACES_STATUS>"),
+            ("Read Isolation (Direct Mode)", "<READ_ISOLATION_STATUS>"),
         ],
     );
     assert_golden("doctor_text", &normalized);

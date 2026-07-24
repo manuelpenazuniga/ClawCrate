@@ -20,7 +20,8 @@ use clawcrate_sandbox::darwin::DarwinSandbox;
 #[cfg(target_os = "linux")]
 use clawcrate_sandbox::linux::LinuxSandbox;
 use clawcrate_types::{
-    Actor, AuditEventKind, ExecutionPlan, ExecutionResult, Status, WorkspaceMode,
+    Actor, AuditEventKind, ExecutionPlan, ExecutionResult, Platform, ResolvedProfile, Status,
+    WorkspaceMode,
 };
 #[cfg(unix)]
 use nix::errno::Errno;
@@ -60,9 +61,24 @@ pub(crate) fn handle_plan(
         println!("{}", serde_json::to_string_pretty(&plan)?);
     } else {
         print_human_plan(&plan, output);
+        warn_read_isolation_gap(&plan);
     }
 
     Ok(())
+}
+
+/// Emit a read-isolation warning to stderr when a plan has the Direct-Mode
+/// read-isolation gap. Human output only — JSON callers get the structured
+/// `read_isolation_enforced` field instead.
+pub(crate) fn warn_read_isolation_gap(plan: &ExecutionPlan) {
+    if plan.read_isolation_enforced == Some(false) {
+        eprintln!(
+            "warning: read isolation is NOT enforced in Linux Direct Mode. This profile \
+             restricts filesystem reads, but until Landlock read-allowlisting lands the \
+             sandboxed command can still read files outside the profile's read set. Use \
+             `--replica` for read isolation on Linux (tracked in #268)."
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -97,6 +113,10 @@ pub(crate) struct RunSummary {
     pub(crate) dropped_output_bytes: u64,
     pub(crate) stdout_log: PathBuf,
     pub(crate) stderr_log: PathBuf,
+    /// Mirrors `ExecutionPlan.read_isolation_enforced`: present (and `false`)
+    /// only when the run had a Direct-Mode read-isolation gap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) read_isolation_enforced: Option<bool>,
 }
 
 pub(crate) fn handle_run(
@@ -195,12 +215,14 @@ pub(crate) fn handle_run(
         dropped_output_bytes: pipeline.execution.capture_summary.total_dropped_bytes,
         stdout_log: writer.artifacts_dir().join("stdout.log"),
         stderr_log: writer.artifacts_dir().join("stderr.log"),
+        read_isolation_enforced: plan.read_isolation_enforced,
     };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
         print_human_run_summary(&summary, output);
+        warn_read_isolation_gap(&plan);
     }
 
     Ok(())
@@ -715,6 +737,8 @@ pub(crate) fn build_execution_plan(
     };
     normalize_profile_filesystem_paths(&mut profile, &execution_cwd);
 
+    let read_isolation_enforced = read_isolation_gap(&profile, &mode);
+
     Ok(ExecutionPlan {
         id: execution_id,
         command: args.command.clone(),
@@ -723,5 +747,41 @@ pub(crate) fn build_execution_plan(
         mode,
         actor: Actor::Human,
         created_at: Utc::now(),
+        read_isolation_enforced,
     })
+}
+
+/// Whether the current platform enforces filesystem read isolation in Direct
+/// Mode. Delegates to the single source of truth in `clawcrate-sandbox`.
+pub(crate) fn current_platform_direct_read_isolation() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        clawcrate_sandbox::direct_mode_read_isolation_enforced(Platform::MacOS)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        clawcrate_sandbox::direct_mode_read_isolation_enforced(Platform::Linux)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// A profile "implies read isolation" when it does not grant read access to the
+/// whole machine (i.e. `fs_read` does not include the filesystem root `/`).
+fn profile_restricts_reads(profile: &ResolvedProfile) -> bool {
+    !profile.fs_read.iter().any(|path| path == Path::new("/"))
+}
+
+/// `Some(false)` when this plan has a read-isolation gap — Direct Mode, a
+/// read-restricting profile, on a platform that does not enforce read isolation
+/// (Linux today). `None` when read isolation is enforced or not applicable.
+pub(crate) fn read_isolation_gap(profile: &ResolvedProfile, mode: &WorkspaceMode) -> Option<bool> {
+    let is_direct = matches!(mode, WorkspaceMode::Direct);
+    if is_direct && profile_restricts_reads(profile) && !current_platform_direct_read_isolation() {
+        Some(false)
+    } else {
+        None
+    }
 }

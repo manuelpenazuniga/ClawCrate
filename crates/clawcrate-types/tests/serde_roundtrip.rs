@@ -81,6 +81,7 @@ fn execution_plan_roundtrip() {
             name: "codex".to_string(),
         },
         created_at: ts("2026-04-11T14:30:00Z"),
+        read_isolation_enforced: Some(false),
     };
 
     assert_json_roundtrip(&value);
@@ -140,6 +141,7 @@ fn system_capabilities_roundtrip() {
         user_namespaces: true,
         macos_version: None,
         kernel_version: Some("6.8.0".to_string()),
+        read_isolation_enforced: false,
     };
 
     assert_json_roundtrip(&value);

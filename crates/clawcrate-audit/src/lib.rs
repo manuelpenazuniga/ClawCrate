@@ -1213,6 +1213,7 @@ mod tests {
             mode: WorkspaceMode::Direct,
             actor: Actor::Human,
             created_at: Utc::now(),
+            read_isolation_enforced: None,
         }
     }
 
