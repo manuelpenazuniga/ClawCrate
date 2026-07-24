@@ -14,15 +14,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$SCRIPT_DIR/workspace"
 
-# Locate clawcrate: prefer an installed binary, fall back to the debug build.
+# Locate clawcrate: prefer a local build (release then debug) so local changes
+# are exercised, then fall back to an installed binary.
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+RELEASE_BIN="$REPO_ROOT/target/release/clawcrate"
 DEBUG_BIN="$REPO_ROOT/target/debug/clawcrate"
-if command -v clawcrate &>/dev/null; then
-  CLAWCRATE_BIN="clawcrate"
+if [[ -x "$RELEASE_BIN" ]]; then
+  CLAWCRATE_BIN="$RELEASE_BIN"
+  echo "Note: using local release build at $RELEASE_BIN"
 elif [[ -x "$DEBUG_BIN" ]]; then
   CLAWCRATE_BIN="$DEBUG_BIN"
-  echo "Note: using debug build at $DEBUG_BIN"
+  echo "Note: using local debug build at $DEBUG_BIN"
   echo "      Run 'cargo build -p clawcrate-cli' first if this is stale."
+elif command -v clawcrate &>/dev/null; then
+  CLAWCRATE_BIN="clawcrate"
 else
   echo "Error: clawcrate not found. Install from:" >&2
   echo "  https://github.com/manuelpenazuniga/ClawCrate/releases" >&2
