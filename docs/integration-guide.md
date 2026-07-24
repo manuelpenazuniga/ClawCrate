@@ -20,6 +20,10 @@ Do not pass a shell command string unless you explicitly need shell features.
 - [Continue.dev MCP wrap recipe](integrations/continue-dev-mcp-wrap.md)
 - [Cursor MCP wrap recipe](integrations/cursor-mcp-wrap.md)
 
+### Runnable example
+
+- [Sandboxed filesystem MCP server demo](../examples/mcp-filesystem-demo/README.md) — wraps `@modelcontextprotocol/server-filesystem` behind `clawcrate mcp wrap --profile mcp-readonly` against a fixture workspace, showing normal reads, excluded secret files, blocked writes, environment scrubbing, and blocked outbound network, plus where to inspect the `~/.clawcrate/runs/<run-id>/` audit artifacts.
+
 ## Plan before execution
 
 ```bash

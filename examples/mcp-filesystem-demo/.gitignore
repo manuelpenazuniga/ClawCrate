@@ -1,0 +1,5 @@
+# Local cruft from running the demo — never commit these.
+node_modules/
+package-lock.json
+package.json
+.venv/

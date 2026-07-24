@@ -1,0 +1,10 @@
+# Extra secret files to exclude from the Replica workspace copy, on top of
+# ClawCrate's built-in exclusions (.env, .env.*, **/.git/config).
+#
+# Why this file exists: the mcp-readonly profile *denies* these paths, but on
+# Linux, Landlock cannot deny a file inside a directory it granted read access
+# to (see CLAUDE.md decision #9). The cross-platform guarantee that the server
+# never sees these files is that they are excluded from the Replica copy here.
+.npmrc
+.netrc
+.pypirc
