@@ -748,7 +748,7 @@ issues:
   - id: "GH-269-01"
     epic: "GH-269"
     github_issue: 277
-    state: "open"
+    state: "in_review"
     milestone: "v0.3.0"
     title: "refactor(cli): decompose main.rs into feature modules"
     labels: ["type:infra", "priority:p1", "tier:T2", "crate:cli"]
