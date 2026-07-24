@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, ExitStatus};
@@ -14,6 +14,37 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 pub const CRATE_NAME: &str = "clawcrate-capture";
+
+/// Create a directory and any missing parents with `0700` permissions on Unix,
+/// applied at creation (no TOCTOU). Existing directories are not weakened. On
+/// non-Unix this falls back to `create_dir_all`.
+fn create_secure_dir_all(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+/// Create (truncating) a log file with `0600` permissions on Unix applied at
+/// creation (no TOCTOU). On non-Unix this falls back to `File::create`.
+fn create_secure_log_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
 
 const STDOUT_LOG: &str = "stdout.log";
 const STDERR_LOG: &str = "stderr.log";
@@ -156,11 +187,11 @@ where
     R1: Read + Send + 'static,
     R2: Read + Send + 'static,
 {
-    fs::create_dir_all(&config.artifacts_dir).map_err(CaptureError::CreateArtifactsDir)?;
+    create_secure_dir_all(&config.artifacts_dir).map_err(CaptureError::CreateArtifactsDir)?;
 
     let stdout_log_path = config.stdout_log_path();
     let stdout_log =
-        File::create(&stdout_log_path).map_err(|source| CaptureError::CreateLogFile {
+        create_secure_log_file(&stdout_log_path).map_err(|source| CaptureError::CreateLogFile {
             stream: StreamKind::Stdout.label(),
             path: stdout_log_path,
             source,
@@ -168,7 +199,7 @@ where
 
     let stderr_log_path = config.stderr_log_path();
     let stderr_log =
-        File::create(&stderr_log_path).map_err(|source| CaptureError::CreateLogFile {
+        create_secure_log_file(&stderr_log_path).map_err(|source| CaptureError::CreateLogFile {
             stream: StreamKind::Stderr.label(),
             path: stderr_log_path,
             source,
@@ -469,6 +500,46 @@ mod tests {
             fs::read_to_string(config.stderr_log_path()).expect("read stderr log"),
             "hello stderr\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_creates_logs_and_dir_with_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = unique_tmp_dir("clawcrate_capture_perms");
+        // Use a not-yet-existing subdirectory so capture creates it and we can
+        // observe the mode it applied at creation.
+        let config = CaptureConfig {
+            artifacts_dir: tmp.join("run"),
+            max_output_bytes: 1024,
+        };
+
+        capture_streams(
+            Cursor::new(b"out\n".to_vec()),
+            Cursor::new(b"err\n".to_vec()),
+            &config,
+        )
+        .expect("capture streams");
+
+        let dir_mode = fs::metadata(&config.artifacts_dir)
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "artifacts dir must be 0700, got {dir_mode:o}"
+        );
+
+        for path in [config.stdout_log_path(), config.stderr_log_path()] {
+            let mode = fs::metadata(&path)
+                .expect("log metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{path:?} must be 0600, got {mode:o}");
+        }
     }
 
     #[test]
