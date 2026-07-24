@@ -39,6 +39,7 @@ fn probe_macos_capabilities_with_paths(paths: &MacOsProbePaths) -> SystemCapabil
         user_namespaces: false,
         macos_version,
         kernel_version,
+        read_isolation_enforced: crate::direct_mode_read_isolation_enforced(Platform::MacOS),
     }
 }
 

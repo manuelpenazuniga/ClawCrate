@@ -91,6 +91,12 @@ pub(crate) fn doctor_rows(capabilities: &SystemCapabilities) -> Vec<(String, Str
         "n/a".to_string()
     };
 
+    let read_isolation_status = if capabilities.read_isolation_enforced {
+        "✅ enforced".to_string()
+    } else {
+        "⚠️ write-controls only (use Replica Mode for read isolation)".to_string()
+    };
+
     vec![
         (
             "Platform".to_string(),
@@ -102,6 +108,10 @@ pub(crate) fn doctor_rows(capabilities: &SystemCapabilities) -> Vec<(String, Str
         ("seccomp".to_string(), seccomp_status),
         ("Seatbelt".to_string(), seatbelt_status),
         ("User Namespaces".to_string(), user_namespaces_status),
+        (
+            "Read Isolation (Direct Mode)".to_string(),
+            read_isolation_status,
+        ),
     ]
 }
 

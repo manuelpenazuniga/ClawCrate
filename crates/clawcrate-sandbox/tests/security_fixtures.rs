@@ -74,6 +74,7 @@ fn fixture_plan(paths: &FixturePaths, command: Vec<String>, net: NetLevel) -> Ex
         mode: WorkspaceMode::Direct,
         actor: Actor::Human,
         created_at: Utc::now(),
+        read_isolation_enforced: None,
     }
 }
 

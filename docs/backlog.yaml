@@ -738,7 +738,7 @@ issues:
   - id: "GH-268-05"
     epic: "GH-268"
     github_issue: 276
-    state: "open"
+    state: "in_review"
     milestone: "v0.3.0"
     title: "feat(cli): surface Linux Direct-Mode read-isolation gap in plan/doctor"
     labels: ["type:feature", "priority:p1", "tier:T2", "crate:cli", "platform:linux"]

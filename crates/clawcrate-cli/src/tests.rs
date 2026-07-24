@@ -65,6 +65,7 @@ fn mock_plan(net: NetLevel, command: &[&str]) -> ExecutionPlan {
         mode: WorkspaceMode::Direct,
         actor: Actor::Human,
         created_at: Utc::now(),
+        read_isolation_enforced: None,
     }
 }
 
@@ -1319,6 +1320,7 @@ fn doctor_rows_render_linux_specific_capabilities() {
         user_namespaces: true,
         macos_version: None,
         kernel_version: Some("6.8.12".to_string()),
+        read_isolation_enforced: false,
     };
 
     let rows = doctor_rows(&capabilities);
@@ -1346,6 +1348,7 @@ fn doctor_rows_render_macos_specific_capabilities() {
         user_namespaces: false,
         macos_version: Some("14.5".to_string()),
         kernel_version: Some("23.5.0".to_string()),
+        read_isolation_enforced: true,
     };
 
     let rows = doctor_rows(&capabilities);

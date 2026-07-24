@@ -39,6 +39,13 @@ pub struct ExecutionPlan {
     pub mode: WorkspaceMode,
     pub actor: Actor,
     pub created_at: DateTime<Utc>,
+    /// Present (and `false`) only when this plan has a read-isolation gap:
+    /// Direct Mode on a platform that cannot yet enforce read isolation for a
+    /// profile that restricts filesystem reads (Linux, until Landlock
+    /// read-allowlisting lands). Absent when read isolation is enforced or not
+    /// applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_isolation_enforced: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +140,11 @@ pub struct SystemCapabilities {
     pub user_namespaces: bool,
     pub macos_version: Option<String>,
     pub kernel_version: Option<String>,
+    /// Whether ClawCrate enforces filesystem read isolation in Direct Mode on
+    /// this platform. True on macOS (Seatbelt). False on Linux until Landlock
+    /// read-allowlisting lands; Replica Mode is the cross-platform mitigation.
+    #[serde(default)]
+    pub read_isolation_enforced: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
