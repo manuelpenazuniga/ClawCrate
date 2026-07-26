@@ -325,16 +325,24 @@ fn open_linux_landlock_read_path_fds(
 ) -> io::Result<Vec<LandlockPathGrant>> {
     let mut unique_anchors = BTreeSet::new();
 
-    // Workspace/profile read set, plus write paths (a writable path the process
-    // cannot read would break nearly every tool).
+    // Workspace/profile read set, plus write paths (an existing writable path
+    // the process cannot read would break nearly every tool).
+    //
+    // A read anchor is used ONLY when the path itself exists. Unlike write
+    // anchors, a missing read path must never walk up to its nearest existing
+    // ancestor: a profile listing `~/.cargo` on a machine without it would
+    // otherwise anchor on `$HOME` and grant read access to every secret in the
+    // home directory. There is nothing to read at a path that does not exist,
+    // so skipping is both safe and sufficient.
     for path in prepared.fs_read.iter().chain(prepared.fs_write.iter()) {
         let resolved = if path.is_absolute() {
             path.clone()
         } else {
             prepared.cwd.join(path)
         };
-        let anchor = nearest_existing_landlock_anchor(&resolved)?;
-        unique_anchors.insert(anchor);
+        if resolved.exists() {
+            unique_anchors.insert(resolved);
+        }
     }
 
     // Minimal system/toolchain read set. Missing entries are skipped.
@@ -405,11 +413,27 @@ fn nearest_existing_landlock_anchor(path: &Path) -> io::Result<PathBuf> {
 
 /// Open a Landlock anchor and record whether it is a directory, so the rule can
 /// be masked to the rights valid for that file type.
+///
+/// The file type is read from the opened descriptor with `fstat`, not from the
+/// path: querying the path first would leave a window in which the path could be
+/// swapped between the check and the open, so the recorded type would not
+/// describe the descriptor the rule is applied to.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn open_linux_landlock_grant(path: &Path) -> io::Result<LandlockPathGrant> {
-    // `metadata` follows symlinks, matching `open(O_PATH)` without `O_NOFOLLOW`.
-    let is_dir = std::fs::metadata(path)?.is_dir();
     let fd = open_linux_landlock_path(path)?;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fd` is a valid open descriptor (`O_PATH` supports `fstat`), and
+    // the pointer refers to correctly sized, writable stack storage.
+    let stat_result = unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) };
+    if stat_result < 0 {
+        return Err(io::Error::from_raw_os_error(Errno::last_raw()));
+    }
+    // SAFETY: `fstat` returned success, so the struct is fully initialized.
+    let stat = unsafe { stat.assume_init() };
+    let is_dir = (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+
     Ok(LandlockPathGrant { fd, is_dir })
 }
 
@@ -796,9 +820,12 @@ fn apply_linux_landlock_restrictions(context: &LinuxLandlockContext) -> io::Resu
 
     // Writable paths are granted read as well: a path the process may write but
     // not read would break nearly every tool.
-    let write_rule_access = context.write_access_mask | context.read_access_mask;
+    // Write rules carry write rights only. Read rights come from the read set,
+    // which already contains every writable path that exists. Unioning read into
+    // the write rules would leak reads whenever a missing write path anchored on
+    // a broad ancestor (for example `./target` under a nonexistent parent).
     let rule_sets = [
-        (&context.allowed_write_paths, write_rule_access),
+        (&context.allowed_write_paths, context.write_access_mask),
         (&context.allowed_read_paths, context.read_access_mask),
     ];
 
