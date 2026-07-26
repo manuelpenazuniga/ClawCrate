@@ -371,9 +371,12 @@ fn fixture_linux_landlock_denies_read_outside_allowed_workspace() {
             "/bin/sh".to_string(),
             "-c".to_string(),
             format!(
-                // Reading the workspace file must succeed; reading the secret
-                // outside the workspace must fail.
-                "cat public.txt && ! cat {}",
+                // Uses only shell builtins and redirections: RLIMIT_NPROC is a
+                // per-UID limit, so forking an external binary is unreliable on
+                // a busy CI runner. Reading the workspace file must succeed;
+                // opening the secret outside the workspace must be denied.
+                "read line < public.txt && printf 'workspace=%s;' \"$line\"; \
+                 if read secret < {}; then printf 'leaked'; else printf 'denied'; fi",
                 fixtures.home_ssh_key.display()
             ),
         ],
@@ -406,15 +409,19 @@ fn fixture_linux_landlock_denies_read_outside_allowed_workspace() {
 
     assert!(
         output.status.success(),
-        "workspace read must succeed and secret read must be denied\nstdout: {stdout}\nstderr: {stderr}"
+        "fixture shell should run to completion\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        stdout.contains("workspace-visible"),
-        "workspace file should be readable inside the sandbox, got stdout: {stdout}"
+        stdout.contains("workspace=workspace-visible;"),
+        "workspace file must stay readable inside the sandbox\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        !stdout.contains("fixture-only-key-material"),
-        "sandboxed process must not be able to read the out-of-workspace secret"
+        stdout.contains("denied"),
+        "reading the out-of-workspace secret must be denied\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("leaked"),
+        "sandboxed process must not be able to read the out-of-workspace secret\nstdout: {stdout}"
     );
 }
 
