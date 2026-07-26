@@ -362,7 +362,10 @@ fn fixture_linux_landlock_denies_read_outside_allowed_workspace() {
     let fixtures = fixture_paths();
     let workspace = TempPathGuard::new("clawcrate_fixture_landlock_read_workspace");
     fs::create_dir_all(workspace.path()).expect("create temporary workspace");
-    fs::write(workspace.path().join("public.txt"), "workspace-visible")
+    // Trailing newline matters: the shell's `read` builtin returns non-zero when
+    // it reaches EOF without one, which would short-circuit the `&&` chain even
+    // though the read itself succeeded.
+    fs::write(workspace.path().join("public.txt"), "workspace-visible\n")
         .expect("write workspace file");
 
     let mut plan = fixture_plan(
