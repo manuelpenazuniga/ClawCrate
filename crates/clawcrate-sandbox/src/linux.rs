@@ -131,35 +131,73 @@ const LANDLOCK_ACCESS_FS_FILE_APPLICABLE: u64 =
 /// particular `$HOME`, `/root`, and user data outside the workspace) stays
 /// unreadable. Missing entries are skipped, so this list is safe across
 /// distributions that do not ship every path.
+///
+/// Entries are enumerated rather than coarse: Landlock cannot deny a path
+/// inside a granted one, so granting `/usr` would also grant `/usr/local/etc`,
+/// and granting `/opt` would expose vendor software configuration. A toolchain
+/// installed outside these prefixes must be declared by the profile, the way
+/// the `build` profile already declares `~/.cargo` and `~/.rustup`.
 #[cfg(target_os = "linux")]
 const LINUX_SYSTEM_READ_PATHS: &[&str] = &[
-    "/usr",
-    "/lib",
-    "/lib64",
-    "/lib32",
+    // Executables.
     "/bin",
     "/sbin",
-    "/opt",
-    "/etc/ssl",
-    "/etc/ca-certificates",
-    "/etc/pki",
-    "/etc/alternatives",
-    "/etc/ld.so.cache",
-    "/etc/ld.so.conf",
-    "/etc/ld.so.conf.d",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    // Dynamic loader and shared libraries. The architecture triplet directories
+    // (for example `/usr/lib/x86_64-linux-gnu`) sit beneath these prefixes.
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/usr/local/lib64",
+    "/usr/libexec",
+    // Read-only shared data: locale, timezone, terminfo, CA bundles.
+    "/usr/share",
+    // Name resolution. `/run/systemd/resolve` is required on systemd-resolved
+    // distributions, otherwise DNS fails for network-enabled profiles.
     "/etc/resolv.conf",
     "/etc/hosts",
     "/etc/nsswitch.conf",
+    "/etc/gai.conf",
+    "/etc/services",
+    "/run/systemd/resolve",
+    // TLS trust stores.
+    "/etc/ssl",
+    "/etc/pki",
+    "/etc/ca-certificates",
+    "/etc/crypto-policies",
+    // Loader configuration.
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/alternatives",
+    // Locale, timezone, and account lookups (`getpwuid`, `getgrgid`). Shadow
+    // password material lives in `/etc/shadow`, which is not granted.
     "/etc/localtime",
+    "/etc/timezone",
+    "/etc/os-release",
+    "/etc/terminfo",
     "/etc/passwd",
     "/etc/group",
-    "/proc/self",
+    // Devices.
     "/dev/null",
     "/dev/zero",
     "/dev/urandom",
     "/dev/random",
     "/dev/full",
     "/dev/tty",
+    // procfs: runtimes probe these to locate themselves and size thread pools.
+    "/proc/self",
+    "/proc/cpuinfo",
+    "/proc/meminfo",
+    "/proc/stat",
+    "/proc/loadavg",
+    "/proc/version",
+    "/proc/filesystems",
 ];
 
 #[cfg(target_os = "linux")]
@@ -960,11 +998,48 @@ mod tests {
         Actor, DefaultMode, ExecutionPlan, NetLevel, ResolvedProfile, ResourceLimits, WorkspaceMode,
     };
 
+    #[cfg(target_os = "linux")]
+    use super::LINUX_SYSTEM_READ_PATHS;
     use super::{
         apply_enforcement_steps, EnforcementStep, LinuxEnforcer, LinuxSandbox, PreparedLinuxSandbox,
     };
     #[cfg(target_os = "linux")]
     use super::{landlock_errno_to_io_error, seccomp_apply_error_as_io_error};
+
+    /// The system read set must stay enumerated. Landlock cannot deny a path
+    /// inside a granted one, so a coarse prefix silently grants everything
+    /// nested under it — `/usr` would expose `/usr/local/etc`, and `/opt` would
+    /// expose vendor software configuration.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_read_paths_are_enumerated_not_coarse() {
+        for coarse in [
+            "/", "/usr", "/opt", "/etc", "/var", "/home", "/root", "/proc",
+        ] {
+            assert!(
+                !LINUX_SYSTEM_READ_PATHS.contains(&coarse),
+                "`{coarse}` must not be granted as a whole: everything beneath it \
+                 becomes readable and Landlock cannot carve out exceptions"
+            );
+        }
+
+        // Paths that are load-bearing rather than hardening: without them a
+        // sandboxed process fails to start or cannot resolve names.
+        for required in [
+            "/bin",
+            "/lib",
+            "/usr/bin",
+            "/usr/lib",
+            "/etc/ld.so.cache",
+            "/etc/resolv.conf",
+            "/run/systemd/resolve",
+        ] {
+            assert!(
+                LINUX_SYSTEM_READ_PATHS.contains(&required),
+                "`{required}` must stay in the system read set"
+            );
+        }
+    }
 
     #[derive(Default)]
     struct MockEnforcer {

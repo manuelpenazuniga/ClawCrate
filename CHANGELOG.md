@@ -21,6 +21,15 @@ with alpha pre-release tags.
 - `clawcrate doctor` now reports Direct-Mode read isolation as enforced on
   Linux, and `plan`/`run` no longer emit the Linux read-isolation warning
   introduced for the pre-enforcement gap.
+- The Linux system read allowlist is enumerated instead of coarse. `/usr` and
+  `/opt` are no longer granted as a whole (which would have exposed
+  `/usr/local/etc` and vendor configuration, since Landlock cannot deny a path
+  inside a granted one); the specific executable, library, shared-data,
+  name-resolution, TLS-trust, loader, locale, device, and procfs entries are
+  granted individually. `/run/systemd/resolve` was added, without which DNS
+  resolution fails on systemd-resolved distributions for network-enabled
+  profiles. A toolchain installed outside these prefixes must be declared by the
+  profile, as the `build` profile already does for `~/.cargo` and `~/.rustup`.
 
 ## [0.2.0-alpha.0] - 2026-06-20
 
