@@ -353,6 +353,71 @@ fn fixture_linux_landlock_denies_write_outside_allowed_workspace() {
     );
 }
 
+/// The Linux read-isolation landmark: a sandboxed process must not be able to
+/// read secrets outside its workspace (mirrors the macOS Seatbelt fixture),
+/// while workspace reads and the toolchain keep working.
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_linux_landlock_denies_read_outside_allowed_workspace() {
+    let fixtures = fixture_paths();
+    let workspace = TempPathGuard::new("clawcrate_fixture_landlock_read_workspace");
+    fs::create_dir_all(workspace.path()).expect("create temporary workspace");
+    fs::write(workspace.path().join("public.txt"), "workspace-visible")
+        .expect("write workspace file");
+
+    let mut plan = fixture_plan(
+        &fixtures,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                // Reading the workspace file must succeed; reading the secret
+                // outside the workspace must fail.
+                "cat public.txt && ! cat {}",
+                fixtures.home_ssh_key.display()
+            ),
+        ],
+        NetLevel::None,
+    );
+    plan.cwd = workspace.path().to_path_buf();
+    plan.profile.fs_read = vec![workspace.path().to_path_buf()];
+    plan.profile.fs_write = vec![workspace.path().to_path_buf()];
+
+    let sandbox = LinuxSandbox::new();
+    let prepared = sandbox.prepare_with_env(
+        &plan,
+        vec![
+            (
+                "HOME".to_string(),
+                fixtures.home_root.to_string_lossy().to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ],
+    );
+
+    let output = sandbox
+        .launch(&prepared)
+        .expect("launch fixture command")
+        .wait_with_output()
+        .expect("wait for fixture command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "workspace read must succeed and secret read must be denied\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("workspace-visible"),
+        "workspace file should be readable inside the sandbox, got stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("fixture-only-key-material"),
+        "sandboxed process must not be able to read the out-of-workspace secret"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn temp_path_guard_removes_symlink_without_deleting_target_directory() {

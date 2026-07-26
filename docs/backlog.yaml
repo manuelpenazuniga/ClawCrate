@@ -702,7 +702,7 @@ issues:
   - id: "GH-268-01"
     epic: "GH-268"
     github_issue: 272
-    state: "open"
+    state: "in_review"
     milestone: "v0.3.0"
     title: "feat(sandbox/linux): Landlock read-allowlisting to enforce fs_read isolation"
     labels: ["type:feature", "priority:p0", "tier:T2", "platform:linux", "crate:sandbox"]
