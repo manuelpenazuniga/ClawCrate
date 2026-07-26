@@ -105,7 +105,7 @@ Every agent vendor already ships an internal sandbox, and the kernel primitives 
 
 Strategic basis: [strategic audit](docs/strategic-audit-2026-07-05.md) · execution plan: [roadmap](docs/roadmap-2026-07-05.md).
 
-> **Honesty guardrails.** Read isolation is enforced on macOS (Seatbelt) and on Linux (Landlock read-allowlisting): the sandboxed process may read only the profile's read/write set plus a minimal system/toolchain allowlist. Custom profiles that grant broad read paths are only as narrow as you make them, and Replica Mode remains the strongest option for filtering secrets out of the workspace itself. `network: filtered` is proxy-mediated best-effort (see the [egress proxy threat model](docs/egress-proxy-threat-model.md)).
+> **Honesty guardrails.** Read isolation is enforced on macOS (Seatbelt) and on Linux (Landlock read-allowlisting): the sandboxed process may read only the profile's read/write set plus a minimal system allowlist (loader, libraries, name resolution, TLS trust). A toolchain installed outside those prefixes — for example under `/opt` — must be declared by the profile. Custom profiles that grant broad read paths are only as narrow as you make them, and Replica Mode remains the strongest option for filtering secrets out of the workspace itself. `network: filtered` is proxy-mediated best-effort (see the [egress proxy threat model](docs/egress-proxy-threat-model.md)).
 
 ### How it compares
 
