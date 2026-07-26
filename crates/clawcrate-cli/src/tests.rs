@@ -1332,7 +1332,8 @@ fn doctor_rows_render_linux_specific_capabilities() {
         .any(|(name, value)| name == "Landlock ABI" && value == "✅ ABI 4"));
     assert!(rows
         .iter()
-        .any(|(name, value)| name == "seccomp" && value == "✅ available"));
+        .any(|(name, value)| name == "seccomp"
+            && value == "✅ available (deny-by-default allowlist)"));
     assert!(rows
         .iter()
         .any(|(name, value)| name == "Seatbelt" && value == "n/a"));

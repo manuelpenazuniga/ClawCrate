@@ -18,6 +18,14 @@ with alpha pre-release tags.
   existing macOS fixture.
 
 ### Changed
+- The Linux seccomp filter is now a **deny-by-default allowlist**: the filter's
+  mismatch action is `EPERM` and the rule set enumerates the syscalls a
+  sandboxed process may make. Previously it was a denylist, so any syscall that
+  was new, obscure, or simply unforeseen passed through. Escape-relevant classes
+  stay unreachable by omission: process inspection and injection, namespace and
+  mount manipulation, kernel and module control, key management, host-wide time
+  and identity, and the asynchronous-execution surface. Network syscalls remain
+  gated on the profile's network level. `clawcrate doctor` states the posture.
 - `clawcrate doctor` now reports Direct-Mode read isolation as enforced on
   Linux, and `plan`/`run` no longer emit the Linux read-isolation warning
   introduced for the pre-enforcement gap.

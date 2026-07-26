@@ -74,7 +74,13 @@ pub(crate) fn doctor_rows(capabilities: &SystemCapabilities) -> Vec<(String, Str
     };
 
     let seccomp_status = if capabilities.platform == Platform::Linux {
-        bool_status(capabilities.seccomp_available)
+        // State the posture, not just availability: the filter is an allowlist,
+        // so a syscall that is not granted is denied rather than passed through.
+        if capabilities.seccomp_available {
+            "✅ available (deny-by-default allowlist)".to_string()
+        } else {
+            bool_status(false)
+        }
     } else {
         "n/a".to_string()
     };
