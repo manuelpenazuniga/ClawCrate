@@ -8,6 +8,20 @@ with alpha pre-release tags.
 
 ## [Unreleased]
 
+### Added
+- Linux filesystem **read isolation** via Landlock read-allowlisting: the
+  ruleset now declares `ACCESS_FS_READ_FILE` / `ACCESS_FS_READ_DIR` and grants
+  them only on the profile's read/write set plus a minimal system and toolchain
+  allowlist. A sandboxed process can no longer read secrets outside its
+  workspace (for example `~/.ssh/id_rsa` or `~/.aws/credentials`) in Direct
+  Mode. A CI security fixture asserts this landmark on Linux, mirroring the
+  existing macOS fixture.
+
+### Changed
+- `clawcrate doctor` now reports Direct-Mode read isolation as enforced on
+  Linux, and `plan`/`run` no longer emit the Linux read-isolation warning
+  introduced for the pre-enforcement gap.
+
 ## [0.2.0-alpha.0] - 2026-06-20
 
 ### Added

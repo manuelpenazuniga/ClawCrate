@@ -41,8 +41,11 @@ fn run_json(args: &[&str], cwd: &Path, home: &Path) -> Value {
 }
 
 #[test]
-fn plan_json_flags_read_isolation_gap_per_platform() {
-    // `safe` is Direct Mode and restricts reads to the workspace.
+fn plan_json_has_no_read_isolation_gap_on_supported_platforms() {
+    // `safe` is Direct Mode and restricts reads to the workspace. Both
+    // supported platforms now enforce read isolation in Direct Mode — macOS via
+    // Seatbelt, Linux via Landlock read-allowlisting (#272) — so the
+    // gap field must be absent.
     let workspace = unique_tmp_dir("clawcrate_cli_it_read_iso_ws");
     let home = unique_tmp_dir("clawcrate_cli_it_read_iso_home");
     let plan = run_json(
@@ -60,18 +63,9 @@ fn plan_json_flags_read_isolation_gap_per_platform() {
     );
 
     let field = plan.get("read_isolation_enforced");
-
-    #[cfg(target_os = "linux")]
-    assert_eq!(
-        field,
-        Some(&Value::Bool(false)),
-        "Linux Direct Mode must surface the read-isolation gap as read_isolation_enforced=false"
-    );
-
-    #[cfg(target_os = "macos")]
     assert!(
         field.is_none(),
-        "macOS enforces read isolation (Seatbelt); no gap field expected, got {field:?}"
+        "Direct Mode read isolation is enforced on this platform; no gap field expected, got {field:?}"
     );
 }
 
@@ -104,7 +98,7 @@ fn plan_json_replica_mode_has_no_read_isolation_gap() {
 }
 
 #[test]
-fn doctor_json_reports_read_isolation_capability_per_platform() {
+fn doctor_json_reports_read_isolation_capability() {
     let workspace = unique_tmp_dir("clawcrate_cli_it_read_iso_doctor_ws");
     let home = unique_tmp_dir("clawcrate_cli_it_read_iso_doctor_home");
     let doctor = run_json(&["doctor", "--json"], &workspace, &home);
@@ -114,15 +108,9 @@ fn doctor_json_reports_read_isolation_capability_per_platform() {
         .and_then(Value::as_bool)
         .expect("doctor JSON should carry read_isolation_enforced");
 
-    #[cfg(target_os = "linux")]
-    assert!(
-        !enforced,
-        "Linux does not yet enforce Direct-Mode read isolation"
-    );
-
-    #[cfg(target_os = "macos")]
+    // macOS enforces via Seatbelt; Linux via Landlock read-allowlisting (#272).
     assert!(
         enforced,
-        "macOS enforces Direct-Mode read isolation (Seatbelt)"
+        "Direct-Mode read isolation should be reported as enforced on this platform"
     );
 }

@@ -353,6 +353,149 @@ fn fixture_linux_landlock_denies_write_outside_allowed_workspace() {
     );
 }
 
+/// The Linux read-isolation landmark: a sandboxed process must not be able to
+/// read secrets outside its workspace (mirrors the macOS Seatbelt fixture),
+/// while workspace reads and the toolchain keep working.
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_linux_landlock_denies_read_outside_allowed_workspace() {
+    let fixtures = fixture_paths();
+    let workspace = TempPathGuard::new("clawcrate_fixture_landlock_read_workspace");
+    fs::create_dir_all(workspace.path()).expect("create temporary workspace");
+    // Trailing newline matters: the shell's `read` builtin returns non-zero when
+    // it reaches EOF without one, which would short-circuit the `&&` chain even
+    // though the read itself succeeded.
+    fs::write(workspace.path().join("public.txt"), "workspace-visible\n")
+        .expect("write workspace file");
+
+    let mut plan = fixture_plan(
+        &fixtures,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                // Uses only shell builtins and redirections: RLIMIT_NPROC is a
+                // per-UID limit, so forking an external binary is unreliable on
+                // a busy CI runner. Reading the workspace file must succeed;
+                // opening the secret outside the workspace must be denied.
+                "read line < public.txt && printf 'workspace=%s;' \"$line\"; \
+                 if read secret < {}; then printf 'leaked'; else printf 'denied'; fi",
+                fixtures.home_ssh_key.display()
+            ),
+        ],
+        NetLevel::None,
+    );
+    plan.cwd = workspace.path().to_path_buf();
+    plan.profile.fs_read = vec![workspace.path().to_path_buf()];
+    plan.profile.fs_write = vec![workspace.path().to_path_buf()];
+
+    let sandbox = LinuxSandbox::new();
+    let prepared = sandbox.prepare_with_env(
+        &plan,
+        vec![
+            (
+                "HOME".to_string(),
+                fixtures.home_root.to_string_lossy().to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ],
+    );
+
+    let output = sandbox
+        .launch(&prepared)
+        .expect("launch fixture command")
+        .wait_with_output()
+        .expect("wait for fixture command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "fixture shell should run to completion\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("workspace=workspace-visible;"),
+        "workspace file must stay readable inside the sandbox\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("denied"),
+        "reading the out-of-workspace secret must be denied\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("leaked"),
+        "sandboxed process must not be able to read the out-of-workspace secret\nstdout: {stdout}"
+    );
+}
+
+/// Regression guard: a profile read path that does not exist must not widen the
+/// grant to its nearest existing ancestor. The built-in `build` profile lists
+/// `~/.cargo` and `~/.rustup`, so on a machine without them an ancestor-walking
+/// anchor would grant read access to the whole home directory.
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_linux_landlock_missing_read_path_does_not_grant_home() {
+    let fixtures = fixture_paths();
+    let workspace = TempPathGuard::new("clawcrate_fixture_landlock_missing_read_workspace");
+    fs::create_dir_all(workspace.path()).expect("create temporary workspace");
+    fs::write(workspace.path().join("public.txt"), "workspace-visible\n")
+        .expect("write workspace file");
+
+    let mut plan = fixture_plan(
+        &fixtures,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "if read secret < {}; then printf 'leaked'; else printf 'denied'; fi",
+                fixtures.home_ssh_key.display()
+            ),
+        ],
+        NetLevel::None,
+    );
+    plan.cwd = workspace.path().to_path_buf();
+    // A read path nested under the simulated home that does not exist: walking
+    // up would land on the home directory holding `.ssh/id_rsa`.
+    plan.profile.fs_read = vec![
+        workspace.path().to_path_buf(),
+        fixtures
+            .home_root
+            .join("missing-dir")
+            .join("missing-child.txt"),
+    ];
+    plan.profile.fs_write = vec![workspace.path().to_path_buf()];
+
+    let sandbox = LinuxSandbox::new();
+    let prepared = sandbox.prepare_with_env(
+        &plan,
+        vec![
+            (
+                "HOME".to_string(),
+                fixtures.home_root.to_string_lossy().to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ],
+    );
+
+    let output = sandbox
+        .launch(&prepared)
+        .expect("launch fixture command")
+        .wait_with_output()
+        .expect("wait for fixture command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.contains("denied"),
+        "a missing read path must not widen the grant to its ancestor\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("leaked"),
+        "sandboxed process read a secret through an ancestor-widened grant\nstdout: {stdout}"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn temp_path_guard_removes_symlink_without_deleting_target_directory() {

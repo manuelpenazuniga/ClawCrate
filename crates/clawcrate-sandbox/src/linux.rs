@@ -75,6 +75,10 @@ const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 #[cfg(target_os = "linux")]
 const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
 #[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
+#[cfg(target_os = "linux")]
 const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
 #[cfg(target_os = "linux")]
 const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
@@ -107,6 +111,56 @@ const LANDLOCK_ACCESS_FS_BASE_WRITE: u64 = LANDLOCK_ACCESS_FS_WRITE_FILE
     | LANDLOCK_ACCESS_FS_MAKE_FIFO
     | LANDLOCK_ACCESS_FS_MAKE_BLOCK
     | LANDLOCK_ACCESS_FS_MAKE_SYM;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_BASE_READ: u64 =
+    LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+/// Rights that are meaningful for a non-directory. Landlock rejects a rule
+/// (`EINVAL`) that grants directory-only rights such as `READ_DIR`, `MAKE_*`,
+/// or `REMOVE_*` on a regular file, so a rule anchored on a file must be masked
+/// down to these bits.
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_FILE_APPLICABLE: u64 =
+    LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_TRUNCATE;
+
+/// System paths a sandboxed process must be able to read in order to start and
+/// run at all: the dynamic loader, shared libraries, interpreters/toolchains,
+/// and the minimal `/etc` entries used for name resolution and TLS trust.
+///
+/// This is deliberately a fixed, conservative allowlist of read-only system
+/// locations rather than a blanket grant on `/`. Anything not listed here (in
+/// particular `$HOME`, `/root`, and user data outside the workspace) stays
+/// unreadable. Missing entries are skipped, so this list is safe across
+/// distributions that do not ship every path.
+#[cfg(target_os = "linux")]
+const LINUX_SYSTEM_READ_PATHS: &[&str] = &[
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/lib32",
+    "/bin",
+    "/sbin",
+    "/opt",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+    "/etc/pki",
+    "/etc/alternatives",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/localtime",
+    "/etc/passwd",
+    "/etc/group",
+    "/proc/self",
+    "/dev/null",
+    "/dev/zero",
+    "/dev/urandom",
+    "/dev/random",
+    "/dev/full",
+    "/dev/tty",
+];
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
@@ -119,7 +173,29 @@ struct LinuxRlimitTarget {
 #[derive(Debug)]
 struct LinuxLandlockContext {
     write_access_mask: u64,
-    allowed_write_path_fds: Vec<OwnedFd>,
+    read_access_mask: u64,
+    allowed_write_paths: Vec<LandlockPathGrant>,
+    allowed_read_paths: Vec<LandlockPathGrant>,
+}
+
+/// An opened Landlock anchor plus whether it is a directory. Directory-only
+/// rights must be stripped for non-directory anchors or `landlock_add_rule`
+/// fails with `EINVAL`.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LandlockPathGrant {
+    fd: OwnedFd,
+    is_dir: bool,
+}
+
+/// Mask an access set down to the rights valid for the anchor's file type.
+#[cfg(target_os = "linux")]
+fn landlock_access_for_path_type(access_mask: u64, is_dir: bool) -> u64 {
+    if is_dir {
+        access_mask
+    } else {
+        access_mask & LANDLOCK_ACCESS_FS_FILE_APPLICABLE
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -187,10 +263,14 @@ fn prepare_linux_landlock_context(
 ) -> io::Result<LinuxLandlockContext> {
     let abi_version = probe_linux_landlock_abi()?;
     let write_access_mask = landlock_write_access_mask_for_abi(abi_version);
-    let allowed_write_path_fds = open_linux_landlock_write_path_fds(prepared)?;
+    let read_access_mask = landlock_read_access_mask_for_abi(abi_version);
+    let allowed_write_paths = open_linux_landlock_write_path_fds(prepared)?;
+    let allowed_read_paths = open_linux_landlock_read_path_fds(prepared)?;
     Ok(LinuxLandlockContext {
         write_access_mask,
-        allowed_write_path_fds,
+        read_access_mask,
+        allowed_write_paths,
+        allowed_read_paths,
     })
 }
 
@@ -224,8 +304,72 @@ fn landlock_write_access_mask_for_abi(abi_version: i32) -> u64 {
     mask
 }
 
+/// Read rights handled by the ruleset. `ACCESS_FS_READ_FILE` and
+/// `ACCESS_FS_READ_DIR` exist since Landlock ABI v1, so every kernel that
+/// supports Landlock at all supports read-allowlisting; no ABI gating is
+/// needed here (unlike `REFER`/`TRUNCATE` on the write mask).
 #[cfg(target_os = "linux")]
-fn open_linux_landlock_write_path_fds(prepared: &PreparedLinuxSandbox) -> io::Result<Vec<OwnedFd>> {
+fn landlock_read_access_mask_for_abi(_abi_version: i32) -> u64 {
+    LANDLOCK_ACCESS_FS_BASE_READ
+}
+
+/// Open anchors for every path the sandboxed process may read: the profile's
+/// `fs_read` set (and `fs_write`, since writable paths must remain readable),
+/// plus the minimal system/toolchain locations from `LINUX_SYSTEM_READ_PATHS`.
+///
+/// System paths that do not exist on the host are skipped rather than treated
+/// as an error, so the same allowlist works across distributions.
+#[cfg(target_os = "linux")]
+fn open_linux_landlock_read_path_fds(
+    prepared: &PreparedLinuxSandbox,
+) -> io::Result<Vec<LandlockPathGrant>> {
+    let mut unique_anchors = BTreeSet::new();
+
+    // Workspace/profile read set, plus write paths (an existing writable path
+    // the process cannot read would break nearly every tool).
+    //
+    // A read anchor is used ONLY when the path itself exists. Unlike write
+    // anchors, a missing read path must never walk up to its nearest existing
+    // ancestor: a profile listing `~/.cargo` on a machine without it would
+    // otherwise anchor on `$HOME` and grant read access to every secret in the
+    // home directory. There is nothing to read at a path that does not exist,
+    // so skipping is both safe and sufficient.
+    for path in prepared.fs_read.iter().chain(prepared.fs_write.iter()) {
+        let resolved = if path.is_absolute() {
+            path.clone()
+        } else {
+            prepared.cwd.join(path)
+        };
+        if resolved.exists() {
+            unique_anchors.insert(resolved);
+        }
+    }
+
+    // Minimal system/toolchain read set. Missing entries are skipped.
+    for path in LINUX_SYSTEM_READ_PATHS {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            unique_anchors.insert(candidate);
+        }
+    }
+
+    let mut grants = Vec::with_capacity(unique_anchors.len());
+    for anchor in unique_anchors {
+        // A path can disappear between the existence check and the open; skip
+        // it rather than failing the whole sandbox setup.
+        match open_linux_landlock_grant(&anchor) {
+            Ok(grant) => grants.push(grant),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(grants)
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux_landlock_write_path_fds(
+    prepared: &PreparedLinuxSandbox,
+) -> io::Result<Vec<LandlockPathGrant>> {
     let mut unique_anchors = BTreeSet::new();
     for path in &prepared.fs_write {
         let resolved = if path.is_absolute() {
@@ -237,11 +381,11 @@ fn open_linux_landlock_write_path_fds(prepared: &PreparedLinuxSandbox) -> io::Re
         unique_anchors.insert(anchor);
     }
 
-    let mut fds = Vec::with_capacity(unique_anchors.len());
+    let mut grants = Vec::with_capacity(unique_anchors.len());
     for anchor in unique_anchors {
-        fds.push(open_linux_landlock_path(&anchor)?);
+        grants.push(open_linux_landlock_grant(&anchor)?);
     }
-    Ok(fds)
+    Ok(grants)
 }
 
 #[cfg(target_os = "linux")]
@@ -265,6 +409,32 @@ fn nearest_existing_landlock_anchor(path: &Path) -> io::Result<PathBuf> {
             path.display()
         ),
     ))
+}
+
+/// Open a Landlock anchor and record whether it is a directory, so the rule can
+/// be masked to the rights valid for that file type.
+///
+/// The file type is read from the opened descriptor with `fstat`, not from the
+/// path: querying the path first would leave a window in which the path could be
+/// swapped between the check and the open, so the recorded type would not
+/// describe the descriptor the rule is applied to.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn open_linux_landlock_grant(path: &Path) -> io::Result<LandlockPathGrant> {
+    let fd = open_linux_landlock_path(path)?;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fd` is a valid open descriptor (`O_PATH` supports `fstat`), and
+    // the pointer refers to correctly sized, writable stack storage.
+    let stat_result = unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) };
+    if stat_result < 0 {
+        return Err(io::Error::from_raw_os_error(Errno::last_raw()));
+    }
+    // SAFETY: `fstat` returned success, so the struct is fully initialized.
+    let stat = unsafe { stat.assume_init() };
+    let is_dir = (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+
+    Ok(LandlockPathGrant { fd, is_dir })
 }
 
 #[cfg(target_os = "linux")]
@@ -628,8 +798,11 @@ fn configure_linux_landlock_pre_exec(command: &mut Command, context: LinuxLandlo
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn apply_linux_landlock_restrictions(context: &LinuxLandlockContext) -> io::Result<()> {
+    // Landlock only mediates a right that is declared here. Declaring the read
+    // rights alongside the write rights is what makes `fs_read` an actual
+    // allowlist: anything not granted below becomes unreadable.
     let ruleset_attr = LandlockRulesetAttr {
-        handled_access_fs: context.write_access_mask,
+        handled_access_fs: context.write_access_mask | context.read_access_mask,
     };
     // SAFETY: syscall args follow landlock_create_ruleset ABI with valid pointer+size.
     let ruleset_fd = unsafe {
@@ -645,26 +818,45 @@ fn apply_linux_landlock_restrictions(context: &LinuxLandlockContext) -> io::Resu
     }
     let ruleset_fd = ruleset_fd as i32;
 
-    for parent_fd in &context.allowed_write_path_fds {
-        let path_rule = LandlockPathBeneathAttr {
-            allowed_access: context.write_access_mask,
-            parent_fd: parent_fd.as_raw_fd(),
-        };
-        // SAFETY: syscall args follow landlock_add_rule ABI with valid descriptors and pointer.
-        let add_result = unsafe {
-            libc::syscall(
-                libc::SYS_landlock_add_rule,
-                ruleset_fd,
-                LANDLOCK_RULE_PATH_BENEATH,
-                &path_rule as *const LandlockPathBeneathAttr,
-                0u32,
-            )
-        };
-        if add_result < 0 {
-            let add_errno = Errno::last_raw();
-            // SAFETY: closing best-effort descriptor obtained from create_ruleset.
-            let _ = unsafe { libc::close(ruleset_fd) };
-            return Err(io::Error::from_raw_os_error(add_errno));
+    // Writable paths are granted read as well: a path the process may write but
+    // not read would break nearly every tool.
+    // Write rules carry write rights only. Read rights come from the read set,
+    // which already contains every writable path that exists. Unioning read into
+    // the write rules would leak reads whenever a missing write path anchored on
+    // a broad ancestor (for example `./target` under a nonexistent parent).
+    let rule_sets = [
+        (&context.allowed_write_paths, context.write_access_mask),
+        (&context.allowed_read_paths, context.read_access_mask),
+    ];
+
+    for (path_grants, allowed_access) in rule_sets {
+        for grant in path_grants {
+            // Directory-only rights on a non-directory anchor are rejected with
+            // EINVAL, so mask the access set down to the anchor's file type.
+            let allowed_access = landlock_access_for_path_type(allowed_access, grant.is_dir);
+            if allowed_access == 0 {
+                continue;
+            }
+            let path_rule = LandlockPathBeneathAttr {
+                allowed_access,
+                parent_fd: grant.fd.as_raw_fd(),
+            };
+            // SAFETY: syscall args follow landlock_add_rule ABI with valid descriptors and pointer.
+            let add_result = unsafe {
+                libc::syscall(
+                    libc::SYS_landlock_add_rule,
+                    ruleset_fd,
+                    LANDLOCK_RULE_PATH_BENEATH,
+                    &path_rule as *const LandlockPathBeneathAttr,
+                    0u32,
+                )
+            };
+            if add_result < 0 {
+                let add_errno = Errno::last_raw();
+                // SAFETY: closing best-effort descriptor obtained from create_ruleset.
+                let _ = unsafe { libc::close(ruleset_fd) };
+                return Err(io::Error::from_raw_os_error(add_errno));
+            }
         }
     }
 
