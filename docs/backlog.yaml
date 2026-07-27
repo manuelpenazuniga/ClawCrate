@@ -711,7 +711,7 @@ issues:
   - id: "GH-268-02"
     epic: "GH-268"
     github_issue: 273
-    state: "open"
+    state: "in_review"
     milestone: "v0.3.0"
     title: "feat(sandbox/linux): move seccomp to deny-by-default allowlist posture"
     labels: ["type:feature", "priority:p1", "tier:T2", "platform:linux", "crate:sandbox"]

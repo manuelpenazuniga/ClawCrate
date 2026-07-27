@@ -508,10 +508,14 @@ fn prepare_linux_seccomp_context(
             format!("unsupported seccomp target architecture: {source}"),
         )
     })?;
+    // Deny-by-default: syscalls in the rule set are allowed, everything else
+    // returns EPERM. `EPERM` rather than `KillProcess` keeps a missing syscall
+    // diagnosable — the program reports a permission error instead of dying
+    // without explanation.
     let filter = SeccompFilter::new(
         build_linux_seccomp_rules(&prepared.net),
-        SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
+        SeccompAction::Allow,
         target_arch,
     )
     .map_err(|source| io::Error::other(format!("failed to build seccomp filter: {source}")))?;
@@ -524,44 +528,364 @@ fn prepare_linux_seccomp_context(
 #[cfg(target_os = "linux")]
 fn build_linux_seccomp_rules(net: &NetLevel) -> BTreeMap<i64, Vec<SeccompRule>> {
     let mut rules = BTreeMap::new();
-    for syscall in linux_default_seccomp_denied_syscalls() {
-        rules.insert(*syscall, Vec::new());
-    }
-    if matches!(net, NetLevel::None) {
-        for syscall in linux_none_net_seccomp_denied_syscalls() {
-            rules.insert(*syscall, Vec::new());
-        }
+    // Rules describe the ALLOWED syscalls. Everything absent from this map hits
+    // the filter's mismatch action (`EPERM`), so a syscall that is new, obscure,
+    // or simply unforeseen is denied instead of silently permitted.
+    for syscall in linux_seccomp_allowed_syscalls(net) {
+        rules.insert(syscall, Vec::new());
     }
     rules
 }
 
+/// Syscalls a sandboxed process is allowed to make.
+///
+/// The posture is deny-by-default: this set is what the filter permits, and
+/// anything else returns `EPERM`. The set is deliberately *generous* rather than
+/// minimal. The security property being bought here is that unknown and future
+/// syscalls are denied; it is not improved by withholding syscalls that ordinary
+/// programs need, and withholding them would break real workloads for no gain.
+///
+/// What is deliberately absent is the dangerous surface: process inspection and
+/// injection (`ptrace`, `process_vm_readv`/`writev`, `pidfd_getfd`, `kcmp`),
+/// namespace and mount manipulation (`unshare`, `setns`, `mount`, `pivot_root`,
+/// `chroot`, the `fsopen` family), kernel and module control (`init_module`,
+/// `kexec_load`, `bpf`, `perf_event_open`, `iopl`, `syslog`), key management
+/// (`add_key`, `keyctl`, `request_key`), host-wide time and identity
+/// (`settimeofday`, `clock_settime`, `adjtimex`, `sethostname`), and the
+/// asynchronous-execution surface (`io_uring_*`, `userfaultfd`).
 #[cfg(target_os = "linux")]
-fn linux_default_seccomp_denied_syscalls() -> &'static [i64] {
-    &[
+fn linux_seccomp_allowed_syscalls(net: &NetLevel) -> Vec<i64> {
+    let mut allowed: Vec<i64> = vec![
+        // Process and thread lifecycle.
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+        libc::SYS_clone,
+        libc::SYS_wait4,
+        libc::SYS_waitid,
+        libc::SYS_set_tid_address,
+        libc::SYS_set_robust_list,
+        libc::SYS_get_robust_list,
+        libc::SYS_gettid,
+        libc::SYS_getpid,
+        libc::SYS_getppid,
+        libc::SYS_getpgid,
+        libc::SYS_setpgid,
+        libc::SYS_getsid,
+        libc::SYS_setsid,
+        libc::SYS_prctl,
+        libc::SYS_rseq,
+        libc::SYS_sched_yield,
+        libc::SYS_sched_getaffinity,
+        libc::SYS_sched_setaffinity,
+        libc::SYS_sched_getparam,
+        libc::SYS_sched_setparam,
+        libc::SYS_sched_getscheduler,
+        libc::SYS_sched_get_priority_max,
+        libc::SYS_sched_get_priority_min,
+        libc::SYS_getpriority,
+        libc::SYS_setpriority,
+        libc::SYS_capget,
+        libc::SYS_membarrier,
+        // Memory management.
+        libc::SYS_brk,
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_mprotect,
+        libc::SYS_mremap,
+        libc::SYS_madvise,
+        libc::SYS_msync,
+        libc::SYS_mincore,
+        libc::SYS_mlock,
+        libc::SYS_munlock,
+        libc::SYS_mlockall,
+        libc::SYS_munlockall,
+        libc::SYS_memfd_create,
+        // File descriptors and I/O.
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_readv,
+        libc::SYS_writev,
+        libc::SYS_pread64,
+        libc::SYS_pwrite64,
+        libc::SYS_preadv,
+        libc::SYS_pwritev,
+        libc::SYS_openat,
+        libc::SYS_close,
+        libc::SYS_lseek,
+        libc::SYS_dup,
+        libc::SYS_dup3,
+        libc::SYS_pipe2,
+        libc::SYS_fcntl,
+        libc::SYS_ioctl,
+        libc::SYS_flock,
+        libc::SYS_fsync,
+        libc::SYS_fdatasync,
+        libc::SYS_ftruncate,
+        libc::SYS_truncate,
+        libc::SYS_fallocate,
+        libc::SYS_splice,
+        libc::SYS_tee,
+        libc::SYS_copy_file_range,
+        // Metadata and directory traversal.
+        libc::SYS_fstat,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_statfs,
+        libc::SYS_fstatfs,
+        libc::SYS_faccessat,
+        libc::SYS_readlinkat,
+        libc::SYS_getcwd,
+        libc::SYS_chdir,
+        libc::SYS_fchdir,
+        libc::SYS_getdents64,
+        libc::SYS_umask,
+        libc::SYS_fchmod,
+        libc::SYS_fchmodat,
+        libc::SYS_fchown,
+        libc::SYS_fchownat,
+        libc::SYS_utimensat,
+        // Namespace-local filesystem mutation (still gated by Landlock).
+        libc::SYS_mkdirat,
+        libc::SYS_unlinkat,
+        libc::SYS_renameat2,
+        libc::SYS_linkat,
+        libc::SYS_symlinkat,
+        libc::SYS_mknodat,
+        // Extended attributes.
+        libc::SYS_getxattr,
+        libc::SYS_lgetxattr,
+        libc::SYS_fgetxattr,
+        libc::SYS_listxattr,
+        libc::SYS_llistxattr,
+        libc::SYS_flistxattr,
+        libc::SYS_setxattr,
+        libc::SYS_lsetxattr,
+        libc::SYS_fsetxattr,
+        libc::SYS_removexattr,
+        libc::SYS_lremovexattr,
+        libc::SYS_fremovexattr,
+        // Signals.
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_rt_sigpending,
+        libc::SYS_rt_sigsuspend,
+        libc::SYS_rt_sigtimedwait,
+        libc::SYS_rt_sigqueueinfo,
+        libc::SYS_rt_tgsigqueueinfo,
+        libc::SYS_sigaltstack,
+        libc::SYS_kill,
+        libc::SYS_tkill,
+        libc::SYS_tgkill,
+        libc::SYS_restart_syscall,
+        libc::SYS_signalfd4,
+        // Time.
+        libc::SYS_clock_gettime,
+        libc::SYS_clock_getres,
+        libc::SYS_clock_nanosleep,
+        libc::SYS_gettimeofday,
+        libc::SYS_nanosleep,
+        libc::SYS_times,
+        libc::SYS_timer_create,
+        libc::SYS_timer_settime,
+        libc::SYS_timer_gettime,
+        libc::SYS_timer_getoverrun,
+        libc::SYS_timer_delete,
+        libc::SYS_timerfd_create,
+        libc::SYS_timerfd_settime,
+        libc::SYS_timerfd_gettime,
+        libc::SYS_setitimer,
+        libc::SYS_getitimer,
+        // Waiting and event notification.
+        libc::SYS_futex,
+        libc::SYS_ppoll,
+        libc::SYS_pselect6,
+        libc::SYS_epoll_create1,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_pwait,
+        libc::SYS_eventfd2,
+        libc::SYS_inotify_init1,
+        libc::SYS_inotify_add_watch,
+        libc::SYS_inotify_rm_watch,
+        // Credentials (read-mostly; `NO_NEW_PRIVS` prevents escalation).
+        libc::SYS_getuid,
+        libc::SYS_geteuid,
+        libc::SYS_getgid,
+        libc::SYS_getegid,
+        libc::SYS_getgroups,
+        libc::SYS_getresuid,
+        libc::SYS_getresgid,
+        libc::SYS_setuid,
+        libc::SYS_setgid,
+        libc::SYS_setgroups,
+        libc::SYS_setresuid,
+        libc::SYS_setresgid,
+        // Resource limits and accounting.
+        libc::SYS_getrlimit,
+        libc::SYS_setrlimit,
+        libc::SYS_prlimit64,
+        libc::SYS_getrusage,
+        // System information and entropy.
+        libc::SYS_uname,
+        libc::SYS_sysinfo,
+        libc::SYS_getrandom,
+        // System V IPC (used by runtimes such as CPython's multiprocessing).
+        libc::SYS_shmget,
+        libc::SYS_shmat,
+        libc::SYS_shmdt,
+        libc::SYS_shmctl,
+        libc::SYS_semget,
+        libc::SYS_semop,
+        libc::SYS_semctl,
+        libc::SYS_msgget,
+        libc::SYS_msgsnd,
+        libc::SYS_msgrcv,
+        libc::SYS_msgctl,
+    ];
+
+    // Syscalls the `libc` crate only exposes on x86_64. arm64 either provides
+    // the `*at` variant listed above instead, or (for `sendfile`) simply does
+    // not export the constant. Gating keeps the crate building for both release
+    // targets; on arm64 a caller that invokes one of these directly receives
+    // EPERM and is expected to fall back, as glibc and Go runtimes do.
+    #[cfg(target_arch = "x86_64")]
+    allowed.extend_from_slice(&[
+        libc::SYS_sendfile,
+        libc::SYS_open,
+        libc::SYS_stat,
+        libc::SYS_lstat,
+        libc::SYS_access,
+        libc::SYS_poll,
+        libc::SYS_select,
+        libc::SYS_pipe,
+        libc::SYS_dup2,
+        libc::SYS_fork,
+        libc::SYS_vfork,
+        libc::SYS_getdents,
+        libc::SYS_readlink,
+        libc::SYS_unlink,
+        libc::SYS_rename,
+        libc::SYS_rmdir,
+        libc::SYS_mkdir,
+        libc::SYS_link,
+        libc::SYS_symlink,
+        libc::SYS_chmod,
+        libc::SYS_chown,
+        libc::SYS_lchown,
+        libc::SYS_utime,
+        libc::SYS_utimes,
+        libc::SYS_futimesat,
+        libc::SYS_creat,
+        libc::SYS_mknod,
+        libc::SYS_epoll_create,
+        libc::SYS_epoll_wait,
+        libc::SYS_inotify_init,
+        libc::SYS_eventfd,
+        libc::SYS_signalfd,
+        libc::SYS_alarm,
+        libc::SYS_pause,
+        libc::SYS_time,
+        libc::SYS_getpgrp,
+        libc::SYS_arch_prctl,
+        libc::SYS_renameat,
+    ]);
+
+    // Network syscalls are granted only when the profile allows network access.
+    // Under `NetLevel::None` they stay out of the allowlist, so socket creation
+    // fails at the syscall layer.
+    if !matches!(net, NetLevel::None) {
+        allowed.extend_from_slice(&[
+            libc::SYS_socket,
+            libc::SYS_socketpair,
+            libc::SYS_connect,
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_accept,
+            libc::SYS_accept4,
+            libc::SYS_getsockname,
+            libc::SYS_getpeername,
+            libc::SYS_setsockopt,
+            libc::SYS_getsockopt,
+            libc::SYS_sendto,
+            libc::SYS_recvfrom,
+            libc::SYS_sendmsg,
+            libc::SYS_recvmsg,
+            libc::SYS_sendmmsg,
+            libc::SYS_recvmmsg,
+            libc::SYS_shutdown,
+        ]);
+    }
+
+    allowed
+}
+
+/// Syscalls that must never appear in the allowlist, whatever the profile.
+///
+/// With a deny-by-default filter these are already denied by omission; the list
+/// exists so a regression that widens the allowlist is caught by a test rather
+/// than by an incident. It covers the classes that matter for a sandbox escape:
+/// process inspection and injection, namespace and mount manipulation, kernel
+/// and module control, key management, host-wide time and identity, and the
+/// asynchronous-execution surface.
+#[cfg(all(target_os = "linux", test))]
+fn linux_seccomp_forbidden_syscalls() -> Vec<i64> {
+    let mut forbidden = vec![
+        // Process inspection and injection.
         libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_kcmp,
+        // Namespaces, mounts, and root pivoting.
         libc::SYS_mount,
         libc::SYS_umount2,
-        libc::SYS_reboot,
-        libc::SYS_kexec_load,
-        libc::SYS_swapon,
-        libc::SYS_swapoff,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_pivot_root,
+        libc::SYS_chroot,
+        // Kernel and module control.
         libc::SYS_init_module,
         libc::SYS_finit_module,
         libc::SYS_delete_module,
-    ]
+        libc::SYS_kexec_load,
+        libc::SYS_reboot,
+        libc::SYS_swapon,
+        libc::SYS_swapoff,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_syslog,
+        // Key management.
+        libc::SYS_add_key,
+        libc::SYS_keyctl,
+        libc::SYS_request_key,
+        // Host-wide time and identity.
+        libc::SYS_settimeofday,
+        libc::SYS_clock_settime,
+        libc::SYS_adjtimex,
+        libc::SYS_sethostname,
+        libc::SYS_setdomainname,
+        // Asynchronous execution and descriptor stealing.
+        libc::SYS_userfaultfd,
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+        libc::SYS_pidfd_getfd,
+    ];
+    forbidden.extend_from_slice(linux_seccomp_forbidden_arch_syscalls());
+    forbidden
 }
 
-#[cfg(target_os = "linux")]
-fn linux_none_net_seccomp_denied_syscalls() -> &'static [i64] {
-    &[
-        libc::SYS_socket,
-        libc::SYS_socketpair,
-        libc::SYS_connect,
-        libc::SYS_bind,
-        libc::SYS_listen,
-        libc::SYS_accept,
-        libc::SYS_accept4,
-    ]
+/// Architecture-specific additions to the forbidden set: x86_64 exposes direct
+/// I/O-port and LDT manipulation that other architectures do not have.
+#[cfg(all(target_os = "linux", test, target_arch = "x86_64"))]
+fn linux_seccomp_forbidden_arch_syscalls() -> &'static [i64] {
+    &[libc::SYS_iopl, libc::SYS_ioperm, libc::SYS_modify_ldt]
+}
+
+#[cfg(all(target_os = "linux", test, not(target_arch = "x86_64")))]
+fn linux_seccomp_forbidden_arch_syscalls() -> &'static [i64] {
+    &[]
 }
 
 pub trait LinuxEnforcer: Send + Sync {
@@ -1005,6 +1329,58 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use super::{landlock_errno_to_io_error, seccomp_apply_error_as_io_error};
+    #[cfg(target_os = "linux")]
+    use nix::libc;
+
+    /// The seccomp posture is deny-by-default: the escape-relevant syscall
+    /// classes must never be reachable through the allowlist, with or without
+    /// network access.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_allowlist_never_contains_escape_syscalls() {
+        for net in [NetLevel::None, NetLevel::Open] {
+            let allowed = super::linux_seccomp_allowed_syscalls(&net);
+            for forbidden in super::linux_seccomp_forbidden_syscalls() {
+                assert!(
+                    !allowed.contains(&forbidden),
+                    "syscall {forbidden} must never be allowed (net: {net:?})"
+                );
+            }
+        }
+    }
+
+    /// Network syscalls are gated on the profile: absent under `NetLevel::None`,
+    /// present once the profile grants network access.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_allowlist_gates_socket_syscalls_on_network_level() {
+        let denied = super::linux_seccomp_allowed_syscalls(&NetLevel::None);
+        let granted = super::linux_seccomp_allowed_syscalls(&NetLevel::Open);
+
+        assert!(!denied.contains(&libc::SYS_socket));
+        assert!(!denied.contains(&libc::SYS_connect));
+        assert!(granted.contains(&libc::SYS_socket));
+        assert!(granted.contains(&libc::SYS_connect));
+
+        // Everything a process needs to start must be present regardless.
+        for required in [
+            libc::SYS_execve,
+            libc::SYS_exit_group,
+            libc::SYS_mmap,
+            libc::SYS_mprotect,
+            libc::SYS_brk,
+            libc::SYS_futex,
+            libc::SYS_read,
+            libc::SYS_write,
+            libc::SYS_openat,
+            libc::SYS_close,
+        ] {
+            assert!(
+                denied.contains(&required),
+                "syscall {required} is required for any process to run"
+            );
+        }
+    }
 
     /// The system read set must stay enumerated. Landlock cannot deny a path
     /// inside a granted one, so a coarse prefix silently grants everything
