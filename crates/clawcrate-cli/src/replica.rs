@@ -190,13 +190,7 @@ pub(crate) fn copy_directory_recursive(
         }
 
         if file_type.is_file() {
-            std::fs::copy(&source_path, &target_path).map_err(|source_error| {
-                anyhow!(
-                    "failed to copy source file {} to {}: {source_error}",
-                    source_path.display(),
-                    target_path.display()
-                )
-            })?;
+            materialize_replica_file(&source_path, &target_path)?;
             continue;
         }
 
@@ -205,6 +199,31 @@ pub(crate) fn copy_directory_recursive(
         }
     }
 
+    Ok(())
+}
+
+/// Materialize one workspace file into the replica.
+///
+/// Prefers a copy-on-write clone, which shares extents instead of duplicating
+/// data and turns materialization of a large tree into a metadata operation.
+/// Falls back to a regular copy when the filesystem does not support cloning or
+/// the replica lives on a different filesystem than the workspace.
+///
+/// Cloning is copy-on-write, never a hardlink: the sandbox is granted write
+/// access to the replica, so sharing an inode with the source would let an
+/// in-place write reach the user's real file.
+pub(crate) fn materialize_replica_file(source_path: &Path, target_path: &Path) -> Result<()> {
+    if clawcrate_sandbox::fs_clone::try_clone_file(source_path, target_path) {
+        return Ok(());
+    }
+
+    std::fs::copy(source_path, target_path).map_err(|source_error| {
+        anyhow!(
+            "failed to copy source file {} to {}: {source_error}",
+            source_path.display(),
+            target_path.display()
+        )
+    })?;
     Ok(())
 }
 

@@ -1747,6 +1747,62 @@ fn apply_replica_sync_back_applies_created_modified_and_deleted_files() {
     assert!(!source.join("remove.txt").exists());
 }
 
+/// Whatever path materialization takes — copy-on-write clone or plain copy —
+/// the replica must be independent of the workspace. Writing to a replica file
+/// must never reach the user's file. This is the property a hardlink fast path
+/// would silently break, and the sandbox is granted write access to the replica.
+#[test]
+fn replica_materialization_isolates_the_copy_from_the_workspace() {
+    let source = unique_tmp_dir("clawcrate_cli_replica_isolation_source");
+    let copy = unique_tmp_dir("clawcrate_cli_replica_isolation_copy");
+    fs::create_dir_all(source.join("src")).expect("create source tree");
+    fs::write(source.join("src/main.rs"), "original\n").expect("write workspace file");
+
+    let ignore_config = load_replica_ignore_config(&source).expect("load ignore config");
+    copy_workspace_with_default_exclusions(&source, &copy, &ignore_config).expect("materialize");
+
+    let replica_file = copy.join("src/main.rs");
+    assert_eq!(
+        fs::read_to_string(&replica_file).expect("read replica file"),
+        "original\n",
+        "materialization must reproduce the workspace contents"
+    );
+
+    // Stand in for the sandboxed process writing inside the replica.
+    fs::write(&replica_file, "modified-by-sandbox\n").expect("write replica file");
+
+    assert_eq!(
+        fs::read_to_string(source.join("src/main.rs")).expect("read workspace file"),
+        "original\n",
+        "a write inside the replica must not reach the workspace"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn replica_materialization_preserves_executable_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source = unique_tmp_dir("clawcrate_cli_replica_mode_source");
+    let copy = unique_tmp_dir("clawcrate_cli_replica_mode_copy");
+    let script = source.join("build.sh");
+    fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("mark executable");
+
+    let ignore_config = load_replica_ignore_config(&source).expect("load ignore config");
+    copy_workspace_with_default_exclusions(&source, &copy, &ignore_config).expect("materialize");
+
+    let mode = fs::metadata(copy.join("build.sh"))
+        .expect("replica script metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o755,
+        "an executable must stay executable inside the replica, got {mode:o}"
+    );
+}
+
 /// Sync-back must never read through a symlink planted inside the replica.
 /// A sandboxed process can create `replica/evil -> ~/.ssh/id_rsa`; sync-back
 /// runs unsandboxed on the host, so following that link would copy the secret's
