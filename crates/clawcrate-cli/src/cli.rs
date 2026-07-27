@@ -141,6 +141,13 @@ pub(crate) struct ApiArgs {
     /// Bearer token for API authentication (fallback: CLAWCRATE_API_TOKEN)
     #[arg(long)]
     pub(crate) token: Option<String>,
+
+    /// Allow binding the API to a non-loopback address, exposing it to the
+    /// network. The API can dispatch sandboxed runs, so it is protected only by
+    /// the bearer token. Required for any bind address outside 127.0.0.0/8,
+    /// ::1, or localhost.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub(crate) allow_remote_bind: bool,
 }
 
 #[derive(Debug, Args)]

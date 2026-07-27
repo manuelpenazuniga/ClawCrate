@@ -246,7 +246,7 @@ clawcrate verify  RUN_ID [--pubkey KEY.pem] [--json]
 clawcrate audit   export RUN_ID [--format json|cef|syslog|elastic]
 clawcrate mcp     wrap [--profile P] -- COMMAND...
 clawcrate mcp     install|uninstall --client <cursor|claude|continue> --server-name NAME [--dry-run]
-clawcrate api     [--bind ADDR] [--token TOKEN]
+clawcrate api     [--bind ADDR] [--token TOKEN] [--allow-remote-bind]
 clawcrate bridge  pennyprompt [--pretty]
 ```
 
@@ -258,6 +258,7 @@ clawcrate bridge  pennyprompt [--pretty]
 | `--json` | Machine-readable output (for agent integration) |
 | `--verbose` / `-v` | Detailed diagnostic logs |
 | `--no-color` | Disable ANSI colors (also honors `NO_COLOR=1`) |
+| `--allow-remote-bind` | Required to bind `api` to a non-loopback address. The API can start sandboxed runs, so it is loopback-only by default |
 
 `clawcrate run` forwards `SIGINT`/`SIGTERM` to the sandboxed child, still writes final artifacts before exit, and enforces a runtime timeout from profile `resources.max_cpu_seconds`.
 

@@ -729,7 +729,7 @@ issues:
   - id: "GH-268-04"
     epic: "GH-268"
     github_issue: 275
-    state: "open"
+    state: "in_review"
     milestone: "v0.3.0"
     title: "feat(cli): guard non-loopback api --bind behind --allow-remote-bind"
     labels: ["type:feature", "priority:p2", "tier:T2", "crate:cli"]

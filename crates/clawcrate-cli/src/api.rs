@@ -1,6 +1,7 @@
 //! api module (extracted from main.rs; see #277).
 
 use std::collections::VecDeque;
+use std::net::{IpAddr, SocketAddr};
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -123,8 +124,63 @@ pub(crate) struct ApiCommandError {
 pub(crate) const API_MAX_WORKERS: usize = 4;
 const API_MAX_QUEUE_DEPTH: usize = 16;
 
+/// Whether a bind address is loopback-only.
+///
+/// Anything that cannot be classified with certainty is treated as remote, so
+/// an address this function does not understand requires the explicit opt-in
+/// rather than silently exposing the API.
+pub(crate) fn bind_address_is_loopback(bind: &str) -> bool {
+    let bind = bind.trim();
+
+    // `host:port` forms that parse as a socket address, including bracketed
+    // IPv6 such as `[::1]:8787`. `is_loopback` covers 127.0.0.0/8 and ::1.
+    if let Ok(address) = bind.parse::<SocketAddr>() {
+        return address.ip().is_loopback();
+    }
+
+    // A bare IP with no port.
+    if let Ok(address) = bind.parse::<IpAddr>() {
+        return address.is_loopback();
+    }
+
+    // Hostname forms. Only the literal loopback name is accepted; resolving
+    // arbitrary names here would make the guard depend on DNS.
+    let host = match bind.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => host,
+        _ => bind,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+}
+
 pub(crate) fn handle_api(args: ApiArgs, output: &OutputOptions) -> Result<()> {
     let token = resolve_api_token(&args)?;
+
+    // The API can dispatch sandboxed runs, so a non-loopback bind exposes that
+    // capability to the network behind only a bearer token. Require an explicit
+    // opt-in, and make the consequence unmissable when it is used.
+    if !bind_address_is_loopback(&args.bind) {
+        if !args.allow_remote_bind {
+            return Err(anyhow!(
+                "refusing to bind the API to the non-loopback address `{}`.\n\
+                 The API can start sandboxed runs, so exposing it to the network puts that \
+                 capability behind only the bearer token.\n\
+                 Bind to a loopback address (for example `127.0.0.1:8787`), or pass \
+                 `--allow-remote-bind` if you intend to expose it.",
+                args.bind
+            ));
+        }
+
+        eprintln!(
+            "warning: the ClawCrate API is bound to {}, which is reachable from the network.",
+            args.bind
+        );
+        eprintln!(
+            "warning: anyone who reaches this address and holds the bearer token can start \
+             sandboxed runs on this machine."
+        );
+    }
+
     let server = Server::http(&args.bind)
         .map_err(|source| anyhow!("failed to bind local API on {}: {source}", args.bind))?;
     let delegated_queue = Arc::new(BoundedWorkQueue::<ApiDelegatedRequest>::new(

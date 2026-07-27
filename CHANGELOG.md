@@ -18,6 +18,12 @@ with alpha pre-release tags.
   existing macOS fixture.
 
 ### Changed
+- `clawcrate api` is **loopback-only by default**. Binding to a non-loopback
+  address now requires the explicit `--allow-remote-bind` flag and prints a
+  warning on startup, because `POST /v1/run` starts sandboxed commands on the
+  host and a network-reachable API puts that capability behind only the bearer
+  token. `127.0.0.0/8`, `::1`, and `localhost` count as loopback; an address
+  that cannot be classified fails closed. A token was, and remains, mandatory.
 - The Linux seccomp filter is now a **deny-by-default allowlist**: the filter's
   mismatch action is `EPERM` and the rule set enumerates the syscalls a
   sandboxed process may make. Previously it was a denylist, so any syscall that
