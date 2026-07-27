@@ -460,9 +460,102 @@ fn parses_api_command_with_bind_and_token() {
         Commands::Api(args) => {
             assert_eq!(args.bind, "127.0.0.1:9999");
             assert_eq!(args.token.as_deref(), Some("super-secret"));
+            assert!(!args.allow_remote_bind);
         }
         _ => panic!("expected api command"),
     }
+}
+
+#[test]
+fn bind_address_loopback_classification_covers_ipv4_and_ipv6() {
+    for loopback in [
+        "127.0.0.1:8787",
+        "127.0.0.1",
+        "127.0.0.53:8787",
+        "127.255.255.254:8787",
+        "[::1]:8787",
+        "::1",
+        "localhost:8787",
+        "localhost",
+        "LocalHost:8787",
+    ] {
+        assert!(
+            bind_address_is_loopback(loopback),
+            "{loopback} should be treated as loopback"
+        );
+    }
+
+    for remote in [
+        "0.0.0.0:8787",
+        "0.0.0.0",
+        "192.168.1.10:8787",
+        "10.0.0.1:8787",
+        "[::]:8787",
+        "::",
+        "[2001:db8::1]:8787",
+        "example.com:8787",
+        // IPv4-mapped loopback is not classified as loopback by the standard
+        // library; failing closed here is the safe outcome.
+        "[::ffff:127.0.0.1]:8787",
+        // Unparseable input must fail closed rather than be assumed local.
+        "not-an-address",
+        "",
+    ] {
+        assert!(
+            !bind_address_is_loopback(remote),
+            "{remote} should require --allow-remote-bind"
+        );
+    }
+}
+
+#[test]
+fn api_refuses_non_loopback_bind_without_explicit_opt_in() {
+    let args = ApiArgs {
+        bind: "0.0.0.0:8787".to_string(),
+        token: Some("super-secret".to_string()),
+        allow_remote_bind: false,
+    };
+
+    let error = handle_api(
+        args,
+        &OutputOptions {
+            verbose: 0,
+            color: false,
+        },
+    )
+    .expect_err("non-loopback bind must be refused without --allow-remote-bind");
+    let message = error.to_string();
+
+    assert!(message.contains("0.0.0.0:8787"));
+    assert!(message.contains("--allow-remote-bind"));
+}
+
+#[test]
+fn api_refuses_to_start_without_a_token() {
+    // The token is resolved before the bind guard, so a remotely bound API with
+    // no token is refused on the token requirement alone.
+    let previous = std::env::var("CLAWCRATE_API_TOKEN").ok();
+    std::env::remove_var("CLAWCRATE_API_TOKEN");
+
+    let args = ApiArgs {
+        bind: "0.0.0.0:8787".to_string(),
+        token: None,
+        allow_remote_bind: true,
+    };
+    let error = handle_api(
+        args,
+        &OutputOptions {
+            verbose: 0,
+            color: false,
+        },
+    )
+    .expect_err("api must refuse to start without a token");
+
+    if let Some(previous) = previous {
+        std::env::set_var("CLAWCRATE_API_TOKEN", previous);
+    }
+
+    assert!(error.to_string().contains("missing API token"));
 }
 
 #[test]

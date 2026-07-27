@@ -77,6 +77,27 @@ Authentication:
 
 - header `Authorization: Bearer <token>`
 - token source: `--token` or `CLAWCRATE_API_TOKEN`
+- a token is always required; the API refuses to start without one
+
+Bind address:
+
+- the API is **loopback-only by default**, and refuses to start on a
+  non-loopback address unless `--allow-remote-bind` is passed
+- `127.0.0.0/8`, `::1`, and `localhost` count as loopback; anything else — an
+  address that cannot be classified included — requires the flag
+- the reason for the guard: `POST /v1/run` starts sandboxed commands on the
+  host, so a network-reachable API puts that capability behind only the bearer
+  token. If you do expose it, treat the token as a credential of the same weight
+  as shell access, terminate TLS in front of it, and restrict who can reach the
+  port
+
+```bash
+# Refused: exposes run dispatch to the network.
+clawcrate api --bind 0.0.0.0:8787
+
+# Explicit opt-in, with a warning printed on startup.
+clawcrate api --bind 0.0.0.0:8787 --allow-remote-bind
+```
 
 ## PennyPrompt Bridge (P2)
 
