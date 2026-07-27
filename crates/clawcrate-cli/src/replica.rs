@@ -460,7 +460,17 @@ pub(crate) fn apply_replica_sync_back(
         match change.kind {
             FsChangeKind::Created | FsChangeKind::Modified => {
                 let replica_path = copy_root.join(&change.relative_path);
-                if !replica_path.is_file() {
+
+                // Classify without following symlinks. `Path::is_file` resolves
+                // the link, so a symlink planted in the replica that points at a
+                // host secret (`~/.ssh/id_rsa`) would be read by this
+                // unsandboxed process and its contents copied into the user's
+                // workspace — an exfiltration path around the sandbox.
+                let Ok(metadata) = std::fs::symlink_metadata(&replica_path) else {
+                    continue;
+                };
+                let file_type = metadata.file_type();
+                if !file_type.is_symlink() && !file_type.is_file() {
                     continue;
                 }
 
@@ -472,13 +482,34 @@ pub(crate) fn apply_replica_sync_back(
                         )
                     })?;
                 }
-                std::fs::copy(&replica_path, &source_path).map_err(|source_error| {
-                    anyhow!(
-                        "failed to sync-back file {} to {}: {source_error}",
-                        replica_path.display(),
-                        source_path.display()
-                    )
-                })?;
+
+                // Remove whatever is at the destination first. Without this, a
+                // symlink already present in the source tree would be followed
+                // by the copy (writing through it to its target), and recreating
+                // a symlink over an existing entry would fail with AlreadyExists.
+                if let Ok(existing) = std::fs::symlink_metadata(&source_path) {
+                    if !existing.file_type().is_dir() {
+                        std::fs::remove_file(&source_path).map_err(|source_error| {
+                            anyhow!(
+                                "failed to replace sync-back path {}: {source_error}",
+                                source_path.display()
+                            )
+                        })?;
+                    }
+                }
+
+                if file_type.is_symlink() {
+                    // Recreate the link itself, never its contents.
+                    copy_symlink(&replica_path, &source_path)?;
+                } else {
+                    std::fs::copy(&replica_path, &source_path).map_err(|source_error| {
+                        anyhow!(
+                            "failed to sync-back file {} to {}: {source_error}",
+                            replica_path.display(),
+                            source_path.display()
+                        )
+                    })?;
+                }
             }
             FsChangeKind::Deleted => {
                 if source_path.exists() {
