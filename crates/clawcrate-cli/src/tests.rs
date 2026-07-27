@@ -761,6 +761,76 @@ fn constant_time_compare_handles_length_and_content_mismatches() {
     assert!(!constant_time_eq(b"abc", b"abd"));
     assert!(!constant_time_eq(b"abc", b"ab"));
     assert!(!constant_time_eq(b"ab", b"abc"));
+    assert!(constant_time_eq(b"", b""));
+    assert!(!constant_time_eq(b"", b"a"));
+}
+
+/// A reader that yields a fixed number of bytes while recording how many were
+/// actually consumed, so a test can prove the read stopped early.
+struct CountingReader {
+    remaining: usize,
+    consumed: Arc<AtomicUsize>,
+}
+
+impl io::Read for CountingReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let count = buf.len().min(self.remaining);
+        buf[..count].fill(b'x');
+        self.remaining -= count;
+        self.consumed.fetch_add(count, Ordering::SeqCst);
+        Ok(count)
+    }
+}
+
+#[test]
+fn api_payload_read_stops_at_the_limit_instead_of_buffering_the_whole_body() {
+    // The DoS protection is that the read *stops*, not merely that an oversized
+    // body is reported. Offer far more data than the limit and assert the reader
+    // was not drained: without the bound the whole body would be buffered.
+    let available = (API_MAX_BODY_BYTES as usize) + 8 * 1024 * 1024;
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let reader = CountingReader {
+        remaining: available,
+        consumed: Arc::clone(&consumed),
+    };
+
+    let error =
+        parse_api_command_payload_from_reader(reader).expect_err("oversized body must be rejected");
+
+    assert!(
+        error.contains("exceeds"),
+        "expected a size error, got: {error}"
+    );
+
+    let consumed = consumed.load(Ordering::SeqCst) as u64;
+    assert!(
+        consumed <= API_MAX_BODY_BYTES + 1,
+        "read must stop at the limit; consumed {consumed} of {available} bytes"
+    );
+}
+
+#[test]
+fn api_payload_accepts_a_normal_body() {
+    let payload = br#"{"profile":"safe","command":["echo","hi"]}"#;
+    let parsed =
+        parse_api_command_payload_from_reader(payload.as_slice()).expect("valid payload parses");
+
+    assert_eq!(parsed.profile.as_deref(), Some("safe"));
+    assert_eq!(parsed.command, vec!["echo".to_string(), "hi".to_string()]);
+}
+
+#[test]
+fn api_payload_rejects_invalid_json_below_the_limit() {
+    let error = parse_api_command_payload_from_reader(b"not json".as_slice())
+        .expect_err("invalid JSON must be rejected");
+
+    assert!(
+        error.contains("invalid JSON"),
+        "expected a JSON error, got: {error}"
+    );
 }
 
 #[test]
