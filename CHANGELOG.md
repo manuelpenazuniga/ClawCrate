@@ -17,6 +17,17 @@ with alpha pre-release tags.
   Mode. A CI security fixture asserts this landmark on Linux, mirroring the
   existing macOS fixture.
 
+### Fixed
+- **Replica sync-back no longer follows symlinks out of the replica.** A
+  sandboxed process could plant a link inside the replica pointing at a host
+  secret (for example `~/.ssh/id_rsa`); sync-back runs unsandboxed on the host,
+  so it followed the link and copied the secret's contents into the user's
+  workspace, bypassing the sandbox's read restrictions. Entries are now
+  classified with `symlink_metadata`, links are recreated as links rather than
+  materialized, and an existing entry at the destination is replaced instead of
+  being written through. Reachable via `clawcrate run --profile install` (which
+  defaults to Replica Mode) when sync-back was approved interactively.
+
 ### Changed
 - `clawcrate api` is **loopback-only by default**. Binding to a non-loopback
   address now requires the explicit `--allow-remote-bind` flag and prints a

@@ -1677,6 +1677,95 @@ fn apply_replica_sync_back_applies_created_modified_and_deleted_files() {
     assert!(!source.join("remove.txt").exists());
 }
 
+/// Sync-back must never read through a symlink planted inside the replica.
+/// A sandboxed process can create `replica/evil -> ~/.ssh/id_rsa`; sync-back
+/// runs unsandboxed on the host, so following that link would copy the secret's
+/// contents into the user's workspace, around the sandbox's read restrictions.
+#[cfg(unix)]
+#[test]
+fn apply_replica_sync_back_never_follows_symlinks_out_of_the_replica() {
+    use std::os::unix::fs::symlink;
+
+    let source = unique_tmp_dir("clawcrate_cli_sync_symlink_source");
+    let copy = unique_tmp_dir("clawcrate_cli_sync_symlink_copy");
+    let outside = unique_tmp_dir("clawcrate_cli_sync_symlink_outside");
+
+    let secret_path = outside.join("id_rsa");
+    fs::write(&secret_path, "fixture-only-secret-material\n").expect("write out-of-sandbox secret");
+
+    // The sandboxed process plants a link to a host secret inside the replica.
+    symlink(&secret_path, copy.join("exfil.txt")).expect("plant symlink in replica");
+
+    let changes = vec![ReplicaSyncChange {
+        relative_path: PathBuf::from("exfil.txt"),
+        kind: FsChangeKind::Created,
+    }];
+
+    apply_replica_sync_back(&source, &copy, &changes).expect("apply sync-back");
+
+    let synced = source.join("exfil.txt");
+    let metadata = fs::symlink_metadata(&synced).expect("synced entry should exist");
+
+    assert!(
+        metadata.file_type().is_symlink(),
+        "the link must be recreated as a link, not materialized as a file"
+    );
+    assert_eq!(
+        fs::read_link(&synced).expect("read recreated link"),
+        secret_path,
+        "the recreated link should point at the same target"
+    );
+
+    // The decisive assertion: the secret's bytes never landed in the workspace.
+    for entry in fs::read_dir(&source).expect("read source dir") {
+        let entry = entry.expect("dir entry");
+        if entry.file_type().expect("file type").is_file() {
+            let contents = fs::read_to_string(entry.path()).unwrap_or_default();
+            assert!(
+                !contents.contains("fixture-only-secret-material"),
+                "secret contents were copied into the workspace via {:?}",
+                entry.file_name()
+            );
+        }
+    }
+}
+
+/// A symlink already present at the destination must not be written through:
+/// sync-back replaces the entry itself rather than following it to its target.
+#[cfg(unix)]
+#[test]
+fn apply_replica_sync_back_replaces_destination_symlink_without_writing_through_it() {
+    use std::os::unix::fs::symlink;
+
+    let source = unique_tmp_dir("clawcrate_cli_sync_dest_symlink_source");
+    let copy = unique_tmp_dir("clawcrate_cli_sync_dest_symlink_copy");
+    let outside = unique_tmp_dir("clawcrate_cli_sync_dest_symlink_outside");
+
+    let victim_path = outside.join("victim.txt");
+    fs::write(&victim_path, "original-victim-contents\n").expect("write victim file");
+
+    // The workspace already contains a link pointing outside it.
+    symlink(&victim_path, source.join("notes.txt")).expect("plant destination symlink");
+    fs::write(copy.join("notes.txt"), "replica-contents\n").expect("write replica file");
+
+    let changes = vec![ReplicaSyncChange {
+        relative_path: PathBuf::from("notes.txt"),
+        kind: FsChangeKind::Modified,
+    }];
+
+    apply_replica_sync_back(&source, &copy, &changes).expect("apply sync-back");
+
+    assert_eq!(
+        fs::read_to_string(&victim_path).expect("read victim file"),
+        "original-victim-contents\n",
+        "sync-back must not write through a symlink at the destination"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("notes.txt")).expect("read synced file"),
+        "replica-contents\n"
+    );
+}
+
 #[test]
 fn replica_sync_back_interactive_requires_both_stdin_and_stdout_terminals() {
     assert!(is_replica_sync_back_interactive(true, true));
