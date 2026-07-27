@@ -37,6 +37,12 @@ with alpha pre-release tags.
   defaults to Replica Mode) when sync-back was approved interactively.
 
 ### Changed
+- Replica materialization prefers a copy-on-write clone before falling back to a
+  regular copy. On Linux this issues `FICLONE`, which reflinks on btrfs and XFS
+  and falls back cleanly on filesystems without reflink support; permissions are
+  restored, since `FICLONE` clones data only. Cloning is copy-on-write and never
+  a hardlink: the sandbox is granted write access to the replica, so sharing an
+  inode with the source would let an in-place write reach the user's real file.
 - `clawcrate api` is **loopback-only by default**. Binding to a non-loopback
   address now requires the explicit `--allow-remote-bind` flag and prints a
   warning on startup, because `POST /v1/run` starts sandboxed commands on the

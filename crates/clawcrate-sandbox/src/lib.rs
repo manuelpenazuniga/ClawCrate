@@ -26,6 +26,7 @@ pub const fn direct_mode_read_isolation_enforced(platform: Platform) -> bool {
 pub mod darwin;
 pub mod egress_proxy;
 pub mod env_scrub;
+pub mod fs_clone;
 pub mod linux;
 pub mod linux_probe;
 #[cfg(target_os = "macos")]

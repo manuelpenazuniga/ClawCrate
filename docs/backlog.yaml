@@ -757,7 +757,7 @@ issues:
   - id: "GH-269-02"
     epic: "GH-269"
     github_issue: 278
-    state: "open"
+    state: "in_review"
     milestone: "v0.3.0"
     title: "feat(replica): copy-on-write/reflink + hardlink fast path"
     labels: ["type:feature", "priority:p1", "tier:T2", "crate:cli", "platform:cross-platform"]
