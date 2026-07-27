@@ -18,6 +18,14 @@ with alpha pre-release tags.
   existing macOS fixture.
 
 ### Fixed
+- The local API bounds the request body it reads (10 MiB). Previously
+  `parse_api_command_payload` used an unbounded `read_to_string`, so a client
+  could exhaust the server's memory with an arbitrarily large body. An oversized
+  body is now reported as such rather than truncated into a misleading JSON
+  error, and the read stops instead of buffering the whole payload.
+- `constant_time_eq` compares lengths first and then runs a branchless XOR over
+  equal-length slices. The previous loop used `.get()` on the longer length,
+  whose bounds checks added a per-byte branch that leaked length anyway.
 - **Replica sync-back no longer follows symlinks out of the replica.** A
   sandboxed process could plant a link inside the replica pointing at a host
   secret (for example `~/.ssh/id_rsa`); sync-back runs unsandboxed on the host,

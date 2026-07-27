@@ -1,6 +1,7 @@
 //! api module (extracted from main.rs; see #277).
 
 use std::collections::VecDeque;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
@@ -120,6 +121,11 @@ pub(crate) struct ApiCommandError {
     pub(crate) stdout: String,
     pub(crate) stderr: String,
 }
+
+/// Upper bound on a request body. The API only ever receives small JSON command
+/// payloads, so this is generous; its purpose is to stop an unbounded read from
+/// exhausting memory.
+pub(crate) const API_MAX_BODY_BYTES: u64 = 10 * 1024 * 1024;
 
 pub(crate) const API_MAX_WORKERS: usize = 4;
 const API_MAX_QUEUE_DEPTH: usize = 16;
@@ -348,11 +354,30 @@ pub(crate) fn handle_api_delegated_route(
 pub(crate) fn parse_api_command_payload(
     request: &mut Request,
 ) -> std::result::Result<ApiCommandRequest, String> {
+    parse_api_command_payload_from_reader(request.as_reader())
+}
+
+/// Read and parse a command payload from a request body.
+///
+/// The read is bounded: an unbounded `read_to_string` lets a client exhaust the
+/// server's memory with an arbitrarily large body. One byte past the limit is
+/// read so an oversized body is reported as such instead of being silently
+/// truncated into a confusing JSON parse error.
+pub(crate) fn parse_api_command_payload_from_reader<R: std::io::Read>(
+    reader: R,
+) -> std::result::Result<ApiCommandRequest, String> {
     let mut body = String::new();
-    request
-        .as_reader()
+    reader
+        .take(API_MAX_BODY_BYTES + 1)
         .read_to_string(&mut body)
         .map_err(|source| format!("failed to read request body: {source}"))?;
+
+    if body.len() as u64 > API_MAX_BODY_BYTES {
+        return Err(format!(
+            "request body exceeds the {API_MAX_BODY_BYTES} byte limit"
+        ));
+    }
+
     serde_json::from_str::<ApiCommandRequest>(&body)
         .map_err(|source| format!("invalid JSON body: {source}"))
 }
@@ -417,13 +442,21 @@ pub(crate) fn request_authorized(headers: &[Header], expected_token: &str) -> bo
         .unwrap_or(false)
 }
 
+/// Compare two byte strings without leaking *content* through timing.
+///
+/// Length is compared first and returns early. That is deliberate: the previous
+/// version looped to the longer length using `.get()`, whose bounds checks
+/// introduced a per-byte branch that leaked length anyway, while making the
+/// content comparison harder for the compiler to keep branchless. Comparing
+/// equal-length slices with a plain XOR accumulator keeps the loop uniform.
 pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-    for idx in 0..max_len {
-        let left_byte = left.get(idx).copied().unwrap_or(0);
-        let right_byte = right.get(idx).copied().unwrap_or(0);
-        diff |= usize::from(left_byte ^ right_byte);
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (left_byte, right_byte) in left.iter().zip(right.iter()) {
+        diff |= left_byte ^ right_byte;
     }
     diff == 0
 }
