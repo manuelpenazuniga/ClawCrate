@@ -766,7 +766,7 @@ issues:
   - id: "GH-269-03"
     epic: "GH-269"
     github_issue: 279
-    state: "open"
+    state: "in_review"
     milestone: "v0.3.0"
     title: "feat(capture): metadata-first fs-diff with on-demand hashing"
     labels: ["type:feature", "priority:p2", "tier:T2", "crate:capture"]

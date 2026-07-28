@@ -240,6 +240,32 @@ When a command appears to request permissions outside the active profile,
 - non-interactive / `--json`: fail-closed by default
 - automation override: `--approve-out-of-profile`
 
+## Filesystem Diff Fidelity
+
+`fs-diff.json` records what the sandboxed command changed. By default the
+snapshot compares file size and modification time, and computes a content hash
+only for the files that actually changed:
+
+```bash
+clawcrate run --profile build -- cargo test        # metadata-first (default)
+```
+
+This keeps the cost proportional to what changed rather than to the size of the
+writable tree. On a 293 MB, 3,000-file tree the snapshot-and-diff phase drops
+from ~2,500 ms to ~15 ms.
+
+The trade-off is explicit: metadata comparison cannot detect a modification that
+preserves both size and modification time. For regulated or tamper-evidence
+runs, hash the whole writable set:
+
+```bash
+CLAWCRATE_FSDIFF_FULLHASH=1 clawcrate run --profile build -- cargo test
+```
+
+Accepted values are `1`, `true`, and `yes`. In `fs-diff.json` the per-change
+`sha256` field is present whenever a hash was computed, and omitted otherwise,
+so consumers should treat it as optional.
+
 ## Optional SQLite Audit Index (P2)
 
 File artifacts remain the primary source of truth (`plan.json`, `result.json`, `audit.ndjson`).

@@ -1680,21 +1680,25 @@ fn collect_syncable_replica_changes_filters_exclusions_and_outside_paths() {
             path: copy.join("keep.txt"),
             kind: FsChangeKind::Created,
             size_bytes: Some(10),
+            sha256: None,
         },
         FsChange {
             path: copy.join("drop.log"),
             kind: FsChangeKind::Created,
             size_bytes: Some(8),
+            sha256: None,
         },
         FsChange {
             path: copy.join(".env"),
             kind: FsChangeKind::Created,
             size_bytes: Some(6),
+            sha256: None,
         },
         FsChange {
             path: source.join("outside.txt"),
             kind: FsChangeKind::Created,
             size_bytes: Some(5),
+            sha256: None,
         },
     ];
 
