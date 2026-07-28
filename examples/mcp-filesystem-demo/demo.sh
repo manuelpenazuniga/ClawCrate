@@ -142,10 +142,31 @@ echo ""
   printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_directory","arguments":{"path":"."}}}'
   printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_text_file","arguments":{"path":"README.md"}}}'
   printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_text_file","arguments":{"path":".env"}}}'
-  sleep 2
+  # Keep stdin open while the server starts and answers. Node startup plus
+  # Replica materialization can take a while on a cold or loaded machine.
+  sleep "${CLAWCRATE_DEMO_WAIT_SECONDS:-8}"
 } | (cd "$WORKSPACE" && "$CLAWCRATE_BIN" mcp wrap --profile mcp-readonly -- \
       node "$SERVER_ENTRYPOINT" .) 2>/dev/null | python3 -c '
 import sys, json
+
+SECRET_MARKER = "API_TOKEN"
+seen = set()
+
+
+def call_result(message):
+    """(text, is_error) for a tools/call reply, or (None, None) if malformed."""
+    if "error" in message:
+        return message["error"].get("message", "no message"), True
+    result = message.get("result")
+    if not isinstance(result, dict):
+        return None, None
+    content = result.get("content") or []
+    text = content[0].get("text", "") if content else ""
+    # The filesystem server reports a refused or missing path as a result with
+    # `isError`, not as a JSON-RPC error.
+    return text, bool(result.get("isError"))
+
+
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -154,21 +175,36 @@ for line in sys.stdin:
         message = json.loads(line)
     except ValueError:
         continue
+
     request_id = message.get("id")
-    result = message.get("result", {})
-    text = ""
-    if result:
-        content = result.get("content", [{}])
-        text = content[0].get("text", "") if content else ""
+    if request_id not in (2, 3, 4):
+        continue
+    seen.add(request_id)
+    text, is_error = call_result(message)
+
     if request_id == 2:
-        entries = " | ".join(text.splitlines())
+        entries = " | ".join(text.splitlines()) if text and not is_error else "FAILED"
         print(f"  list_directory .   -> {entries}")
     elif request_id == 3:
-        print(f"  read README.md     -> {text.strip()!r}")
+        print(f"  read README.md     -> {text.strip()!r}" if text and not is_error
+              else "  read README.md     -> FAILED (the workspace should be readable)")
     elif request_id == 4:
-        leaked = "API_TOKEN" in text
-        state = "LEAKED" if leaked else "not visible"
-        print(f"  read .env          -> {state}")
+        # Each outcome is reported distinctly. Collapsing them would make this
+        # line unfalsifiable: a crashed server would look like an enforced
+        # denial, which is exactly the claim the demo exists to demonstrate.
+        if text is None:
+            print("  read .env          -> UNKNOWN (malformed response)")
+        elif is_error:
+            detail = text.strip()[:48]
+            print(f"  read .env          -> not visible (denied: {detail})")
+        elif SECRET_MARKER in text:
+            print(f"  read .env          -> LEAKED ({text.strip()[:48]!r})")
+        else:
+            print(f"  read .env          -> UNEXPECTED ({text.strip()[:48]!r})")
+
+for missing in sorted({2, 3, 4} - seen):
+    label = {2: "list_directory .", 3: "read README.md", 4: "read .env"}[missing]
+    print(f"  {label:<18} -> NO RESPONSE (the server did not reply; see stderr)")
 '
 
 cat <<'LIVE_NOTE'

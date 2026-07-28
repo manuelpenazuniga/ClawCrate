@@ -56,9 +56,14 @@ Defaults to the macOS path above; pass `--config <path>` on other platforms or
 for a non-standard location. Use `--json` for machine-readable output. Restart
 Claude Desktop after the change.
 
-> The `install` writer sets `command`/`args` directly. If you need the
-> change-into-a-directory launcher behavior below, edit the entry to point at the
-> launcher script instead.
+> **For filesystem-style servers, prefer the launcher below.** `mcp install`
+> rewrites `command`/`args` in place and does not set a working directory, so the
+> wrapped server inherits whatever directory the client happens to run in — which
+> is what `mcp-readonly` then materializes as the Replica. It also cannot wrap
+> `npx`, which fails to start inside the sandbox (see below). Use `mcp install`
+> for servers that do not need a specific workspace, and the launcher script for
+> the ones that do.
+
 
 ## Before: direct MCP server launch
 
@@ -110,9 +115,12 @@ exec clawcrate mcp wrap \
 > **Why not `npx`?** The sandbox grants read access to the workspace only, and
 > `npx` must read its own launcher and package cache from the Node installation,
 > which lies outside that set — so it cannot start. Installing the server into
-> the workspace keeps everything it reads inside the sandbox: it is both the
-> pattern that works and the narrower grant. Verified end to end on macOS, where
-> the wrapped server lists and reads the workspace while `.env` stays invisible.
+> the workspace keeps everything it reads inside the sandbox, so the profile
+> does not have to grant the Node installation as well. Verified end to end on
+> macOS, where the wrapped server lists and reads the workspace while `.env`
+> stays invisible. On Linux a distro-packaged `npx` may work, since the system
+> read set already covers `/usr/bin` and `/usr/lib`; the workspace-local
+> launcher was chosen because it behaves the same on both platforms.
 
 Make it executable:
 
@@ -196,6 +204,13 @@ npm install @modelcontextprotocol/server-filesystem
 That places the entrypoint at
 `node_modules/@modelcontextprotocol/server-filesystem/dist/index.js`, which is
 what the launcher above runs. Reinstall after upgrading the package.
+
+> **The install itself is not sandboxed.** `npm install` runs as you, on the
+> host, and a package's lifecycle scripts run with your privileges — the very
+> risk ClawCrate exists to contain. Install from a trusted registry, and if you
+> want that step contained too, run it under ClawCrate first:
+> `clawcrate run --profile install -- npm install <pkg>` (Replica Mode, so
+> review the diff and sync back deliberately).
 
 
 ## What ClawCrate enforces

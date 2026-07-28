@@ -150,3 +150,30 @@ fn demo_workspace_ships_fixture_and_planted_secrets() {
     // Out-of-root secret for the blocked-read story.
     assert!(demo.join("secret-vault/api-key.txt").is_file());
 }
+
+/// The launcher must always hand the server a root argument. It consumes the
+/// first argument as the workspace to enter, so without a default the server
+/// would be started with no path and refuse to run — the shape a GUI MCP client
+/// produces when it invokes the launcher with no arguments at all.
+#[test]
+fn demo_launcher_always_passes_a_server_root() {
+    let contents = fs::read_to_string(demo_dir().join("launcher.sh")).expect("read launcher");
+
+    assert!(
+        contents.contains("set -- ."),
+        "launcher must default the server root to `.` when no extra paths are given"
+    );
+
+    // The default must be applied after the workspace argument is shifted off,
+    // otherwise a one-argument invocation still reaches the server with none.
+    let shift_at = contents
+        .find("shift")
+        .expect("launcher shifts the workspace argument");
+    let default_at = contents
+        .find("set -- .")
+        .expect("launcher sets a default root");
+    assert!(
+        shift_at < default_at,
+        "the default root must be applied after the workspace argument is shifted off"
+    );
+}
