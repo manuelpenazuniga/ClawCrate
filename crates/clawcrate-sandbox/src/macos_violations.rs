@@ -10,6 +10,20 @@
 //! ClawCrate can report what the kernel actually refused, rather than inferring
 //! a denial from an error the child happened to surface.
 //!
+//! # This record is incomplete
+//!
+//! The kernel does not report every denial. It appears to apply a per-process
+//! reporting budget: the first denials a process hits are logged and later ones
+//! are frequently dropped. Measured against a sandboxed MCP server reading a
+//! planted secret outside its workspace, the Node binary's own startup denial
+//! was reported in 5 of 5 runs while the later secret read was reported in 5 of
+//! 8 — and the misses are permanent, not late, so querying again does not
+//! recover them. The read was refused every time; only the reporting is lossy.
+//!
+//! So a violation here proves a denial happened. The absence of one proves
+//! nothing. Callers must not present this as an exhaustive list of what the
+//! sandbox blocked.
+//!
 //! Two properties matter and are enforced below:
 //!
 //! * **Attribution.** The log is system-wide. Denials are attributed to a run

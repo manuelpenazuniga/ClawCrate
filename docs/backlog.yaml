@@ -798,7 +798,7 @@ issues:
     milestone: "v0.2.0"
     title: "feat(audit): emit PermissionBlocked from the channels that observe a denial"
     labels: ["type:feature", "priority:p0", "tier:T1", "area:audit", "crate:sandbox", "crate:cli"]
-    scope: "Emit PermissionBlocked for refused egress connections (both platforms, exact) and for macOS Seatbelt denials recovered from the unified log (opt-in via CLAWCRATE_SEATBELT_VIOLATIONS=1, strict PID attribution). Linux filesystem/syscall denials stay unobservable by design: Landlock reports only EACCES to the child and seccomp returns EPERM rather than killing. Blocks #281."
+    scope: "Emit PermissionBlocked for refused egress connections (both platforms, complete) and for macOS Seatbelt denials recovered from the unified log (opt-in via CLAWCRATE_SEATBELT_VIOLATIONS=1, strict PID attribution, best-effort: the kernel drops some reports, measured 5/8). Linux filesystem/syscall denials stay unobservable by design: Landlock reports only EACCES to the child and seccomp returns EPERM rather than killing. Blocks #281."
 
   - id: "GH-270-03"
     epic: "GH-270"

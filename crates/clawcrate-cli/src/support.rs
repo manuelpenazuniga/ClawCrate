@@ -156,7 +156,9 @@ pub(crate) const DENIAL_OVERFLOW_RESOURCE: &str = "clawcrate://denial-record-ove
 /// * The egress proxy reports refused connections on both platforms, exactly —
 ///   ClawCrate makes that decision itself.
 /// * macOS reports filesystem and other Seatbelt denials when
-///   `CLAWCRATE_SEATBELT_VIOLATIONS=1` is set.
+///   `CLAWCRATE_SEATBELT_VIOLATIONS=1` is set — best-effort only. The kernel
+///   drops some denial reports, so an event proves a denial happened while its
+///   absence proves nothing. See `clawcrate_sandbox::macos_violations`.
 /// * Linux reports neither filesystem nor syscall denials. Landlock surfaces
 ///   them to the child as `EACCES` and nowhere else, and the seccomp filter
 ///   deliberately returns `EPERM` instead of killing the process, so nothing

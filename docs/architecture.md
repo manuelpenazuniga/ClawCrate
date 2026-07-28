@@ -127,15 +127,16 @@ is a property of the operating systems rather than of the implementation:
 
 | Denial | Linux | macOS |
 | --- | --- | --- |
-| Outbound connection refused by the egress proxy (`network: filtered`) | Recorded | Recorded |
-| Filesystem read/write refused by the sandbox | **Not recorded** | Recorded, opt-in |
+| Outbound connection refused by the egress proxy (`network: filtered`) | Recorded, complete | Recorded, complete |
+| Filesystem read/write refused by the sandbox | **Not recorded** | Recorded, opt-in, **best-effort** |
 | Syscall refused by the sandbox | **Not recorded** | n/a |
 
 The egress proxy is ClawCrate's own code, so a refusal is recorded exactly, on
 both platforms, at no extra cost. It carries the refused `host:port` and whether
 the host missed the allowlist or the TLS SNI disagreed with the CONNECT target.
+This is the only denial record that is complete.
 
-macOS denials are recovered from the unified log, where the kernel writes one
+macOS denials are recovered from the unified log, where the kernel writes a
 message per sandbox denial. Querying it costs roughly a second per run, so
 capture is opt-in via `CLAWCRATE_SEATBELT_VIOLATIONS=1`, alongside the other
 enrichment switches (`CLAWCRATE_AUDIT_HASHCHAIN`, `CLAWCRATE_FSDIFF_FULLHASH`).
@@ -143,6 +144,19 @@ The log is system-wide, so denials are attributed to a run only on an exact PID
 match; `sandbox-exec` execs the target command in place, so the PID ClawCrate
 spawned is the one the kernel reports. Denials by processes the sandboxed
 command itself spawned carry different PIDs and are not attributed.
+
+**The macOS record is incomplete, and must not be read as an exhaustive list of
+what the sandbox blocked.** The kernel does not report every denial: it appears
+to apply a per-process reporting budget, so the first denials a process hits are
+logged and later ones are frequently dropped. Measured against a sandboxed MCP
+server reading a planted secret outside its workspace, the denial of the Node
+binary at startup was reported in 5 of 5 runs while the later secret read was
+reported in 5 of 8. The read was refused every time — enforcement is not in
+question, only the reporting of it. Nothing in ClawCrate can close this gap;
+querying later does not help, because the message is never written at all.
+
+The practical consequence: a `PermissionBlocked` entry is evidence that a denial
+happened, but its absence is not evidence that none did.
 
 Linux records neither filesystem nor syscall denials, and this is deliberate.
 Landlock surfaces a refusal to the child as `EACCES` and nowhere else; its
