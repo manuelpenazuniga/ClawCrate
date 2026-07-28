@@ -37,12 +37,13 @@ fn demo_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/mcp-filesystem-demo")
 }
 
-/// The exact command the demo launcher wraps: the filesystem server with a
-/// relative root argument.
-const WRAPPED_COMMAND: [&str; 4] = [
-    "npx",
-    "--no-install",
-    "@modelcontextprotocol/server-filesystem",
+/// The exact command the demo launcher wraps: the filesystem server launched
+/// from the copy installed inside the workspace, with a relative root argument.
+/// `npx` cannot be used, because it reads its own launcher and package cache
+/// from the Node installation, which the sandbox does not grant.
+const WRAPPED_COMMAND: [&str; 3] = [
+    "node",
+    "node_modules/@modelcontextprotocol/server-filesystem/dist/index.js",
     ".",
 ];
 
@@ -114,8 +115,19 @@ fn demo_launcher_script_matches_wrap_invocation() {
         "launcher must use the mcp-readonly profile"
     );
     assert!(
-        contents.contains("npx --no-install @modelcontextprotocol/server-filesystem"),
-        "launcher must run the filesystem server with --no-install (network: none profile)"
+        contents.contains("node \"$SERVER_ENTRYPOINT\""),
+        "launcher must run the server from the copy installed inside the workspace"
+    );
+    // Only executable lines matter here: the launcher's comments legitimately
+    // explain why `npx` is unusable.
+    let invokes_npx = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .any(|line| line.contains("npx"));
+    assert!(
+        !invokes_npx,
+        "launcher must not invoke npx: it reads files outside the sandbox's read set"
     );
     assert!(
         contents.contains("cd "),

@@ -127,8 +127,15 @@ cd "$TARGET_DIR"
 exec clawcrate mcp wrap \
   --profile mcp-readonly \
   -- \
-  npx --no-install @modelcontextprotocol/server-filesystem "$@"
+  node node_modules/@modelcontextprotocol/server-filesystem/dist/index.js "$@"
 ```
+
+> **Why not `npx`?** The sandbox grants read access to the workspace only, and
+> `npx` must read its own launcher and package cache from the Node installation,
+> which lies outside that set — so it cannot start. Installing the server into
+> the workspace keeps everything it reads inside the sandbox: it is both the
+> pattern that works and the narrower grant. Verified end to end on macOS, where
+> the wrapped server lists and reads the workspace while `.env` stays invisible.
 
 Make it executable:
 
@@ -191,29 +198,23 @@ directory.
 
 ## First-run package installation
 
-The MCP profiles block network access. That is the intended steady-state
-behavior, but it means `npx` cannot download a package from npm while the server
-is running inside ClawCrate. The launcher examples therefore use
-`npx --no-install`, which runs only an already available package.
+The MCP profiles block network access and grant read access to the workspace
+only. The server must therefore be installed **into the workspace** before it is
+wrapped, and launched from that copy.
 
-Before enabling the wrapped config, install the server outside ClawCrate so
-`npx --no-install` can resolve it from a real local or global install, or point
-Continue at a local server executable.
-
-Global install:
-
-```bash
-npm install -g @modelcontextprotocol/server-filesystem
-```
-
-Project-local install:
+The MCP profiles block network access and grant read access to the workspace
+only. Install the server **into the workspace** before wrapping it, and launch it
+from that copy:
 
 ```bash
 cd ~/project
-npm install --save-dev @modelcontextprotocol/server-filesystem
+npm install @modelcontextprotocol/server-filesystem
 ```
 
-Then restart or reload Continue so it starts the wrapped MCP server.
+That places the entrypoint at
+`node_modules/@modelcontextprotocol/server-filesystem/dist/index.js`, which is
+what the launcher above runs. Reinstall after upgrading the package.
+
 
 ## What ClawCrate enforces
 
