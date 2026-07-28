@@ -31,5 +31,6 @@ pub mod linux;
 pub mod linux_probe;
 #[cfg(target_os = "macos")]
 pub mod macos_probe;
+pub mod macos_violations;
 pub(crate) mod path_normalize;
 pub mod rlimits;

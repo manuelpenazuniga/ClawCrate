@@ -1,6 +1,7 @@
 //! support module (extracted from main.rs; see #277).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::output::*;
 use anyhow::{anyhow, Result};
@@ -134,6 +135,99 @@ pub(crate) fn maybe_start_filtered_egress_proxy(
     .map_err(|source| anyhow!("failed to start filtered egress proxy: {source}"))?;
     upsert_env_vars(env, &proxy.proxy_env_vars());
     Ok(Some(proxy))
+}
+
+/// Namespaced pseudo-resource marking a gap in the denial record.
+///
+/// A truncated audit trail that looks complete is worse than one that admits
+/// the gap, so overflow is written into `audit.ndjson` rather than only warned
+/// about on stderr. The `clawcrate://` scheme cannot collide with a real host or
+/// path, so consumers counting genuinely blocked resources can filter it out.
+pub(crate) const DENIAL_OVERFLOW_RESOURCE: &str = "clawcrate://denial-record-overflow";
+
+/// Writes a `PermissionBlocked` event for everything the run observed being
+/// denied.
+///
+/// Call after the sandboxed process has exited, so no proxy handler is still
+/// recording and the kernel has finished logging.
+///
+/// Coverage differs by platform, and deliberately does not pretend otherwise:
+///
+/// * The egress proxy reports refused connections on both platforms, exactly —
+///   ClawCrate makes that decision itself.
+/// * macOS reports filesystem and other Seatbelt denials when
+///   `CLAWCRATE_SEATBELT_VIOLATIONS=1` is set.
+/// * Linux reports neither filesystem nor syscall denials. Landlock surfaces
+///   them to the child as `EACCES` and nowhere else, and the seccomp filter
+///   deliberately returns `EPERM` instead of killing the process, so nothing
+///   reaches the parent. Recovering them would mean weakening one of the two.
+pub(crate) fn record_observed_denials(
+    writer: &ArtifactWriter,
+    egress_proxy: Option<&EgressProxyHandle>,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] pid: u32,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] elapsed: Duration,
+) -> Result<()> {
+    if let Some(proxy) = egress_proxy {
+        let (denials, dropped) = proxy.drain_denials();
+        for denial in denials {
+            append_audit_event(
+                writer,
+                AuditEventKind::PermissionBlocked {
+                    resource: denial.resource(),
+                    reason: denial.reason_text(),
+                },
+            )?;
+        }
+        if dropped > 0 {
+            append_audit_event(
+                writer,
+                AuditEventKind::PermissionBlocked {
+                    resource: DENIAL_OVERFLOW_RESOURCE.to_string(),
+                    reason: format!(
+                        "{dropped} further blocked connections were not recorded (buffer limit reached)"
+                    ),
+                },
+            )?;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    if clawcrate_sandbox::macos_violations::violation_capture_enabled() {
+        let report = clawcrate_sandbox::macos_violations::collect_violations(pid, elapsed);
+        for violation in report.violations {
+            append_audit_event(
+                writer,
+                AuditEventKind::PermissionBlocked {
+                    resource: violation.resource(),
+                    reason: violation.reason_text(),
+                },
+            )?;
+        }
+        if report.dropped > 0 || report.window_truncated {
+            let mut gaps = Vec::new();
+            if report.dropped > 0 {
+                gaps.push(format!(
+                    "{} further denials were not recorded (buffer limit reached)",
+                    report.dropped
+                ));
+            }
+            if report.window_truncated {
+                gaps.push(
+                    "the run outlasted the queried log window, so earlier denials are missing"
+                        .to_string(),
+                );
+            }
+            append_audit_event(
+                writer,
+                AuditEventKind::PermissionBlocked {
+                    resource: DENIAL_OVERFLOW_RESOURCE.to_string(),
+                    reason: gaps.join("; "),
+                },
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn upsert_env_vars(env: &mut Vec<(String, String)>, values: &[(String, String)]) {

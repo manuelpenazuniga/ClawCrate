@@ -119,6 +119,44 @@ Files:
 
 The runtime treats the artifact directory as the source of truth for post-run inspection.
 
+## Recorded Denials
+
+`audit.ndjson` carries a `PermissionBlocked` event for each denial the runtime
+can actually observe. What that covers differs by platform, and the difference
+is a property of the operating systems rather than of the implementation:
+
+| Denial | Linux | macOS |
+| --- | --- | --- |
+| Outbound connection refused by the egress proxy (`network: filtered`) | Recorded | Recorded |
+| Filesystem read/write refused by the sandbox | **Not recorded** | Recorded, opt-in |
+| Syscall refused by the sandbox | **Not recorded** | n/a |
+
+The egress proxy is ClawCrate's own code, so a refusal is recorded exactly, on
+both platforms, at no extra cost. It carries the refused `host:port` and whether
+the host missed the allowlist or the TLS SNI disagreed with the CONNECT target.
+
+macOS denials are recovered from the unified log, where the kernel writes one
+message per sandbox denial. Querying it costs roughly a second per run, so
+capture is opt-in via `CLAWCRATE_SEATBELT_VIOLATIONS=1`, alongside the other
+enrichment switches (`CLAWCRATE_AUDIT_HASHCHAIN`, `CLAWCRATE_FSDIFF_FULLHASH`).
+The log is system-wide, so denials are attributed to a run only on an exact PID
+match; `sandbox-exec` execs the target command in place, so the PID ClawCrate
+spawned is the one the kernel reports. Denials by processes the sandboxed
+command itself spawned carry different PIDs and are not attributed.
+
+Linux records neither filesystem nor syscall denials, and this is deliberate.
+Landlock surfaces a refusal to the child as `EACCES` and nowhere else; its
+kernel audit records need `CAP_AUDIT_READ` and a 6.15+ kernel. The seccomp
+filter returns `EPERM` rather than killing the process, which keeps a missing
+syscall diagnosable but means nothing reaches the parent. Recording these would
+require giving up one of those two properties, which is not a trade ClawCrate
+makes to improve its own reporting.
+
+Both denial records are bounded. Past the limit, records are counted rather than
+stored, and the count is written to `audit.ndjson` as a
+`clawcrate://denial-record-overflow` entry — a truncated trail that reads as
+complete would be worse than one that states the gap.
+
 ## Current Architectural Notes
 
 - Replica mode is first-class and default for `install`.
