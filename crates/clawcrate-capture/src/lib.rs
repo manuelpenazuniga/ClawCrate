@@ -112,7 +112,40 @@ pub struct CapturedChildOutput {
 pub struct FileFingerprint {
     pub size_bytes: u64,
     pub modified_unix_nanos: u128,
-    pub sha256: String,
+    /// Content hash. `None` in the default metadata-first mode, where changes
+    /// are detected from size and mtime; `Some` in audit-grade mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+/// How a filesystem snapshot detects change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotMode {
+    /// Record size and mtime only. Created and deleted files are detected by
+    /// path presence, modified files by a size or mtime change. This is the
+    /// default because hashing every file in a large writable tree (a
+    /// `node_modules/` or `target/`) costs a full read of that tree twice per
+    /// run.
+    ///
+    /// The trade-off is explicit: a modification that preserves both size and
+    /// mtime is not detected. Audit-grade mode is the guarantee against that.
+    MetadataFirst,
+    /// Hash every file's contents. Slower, and the tamper-evident guarantee
+    /// used for compliance runs.
+    FullHash,
+}
+
+/// Environment variable that selects audit-grade hashing for the whole run.
+pub const FSDIFF_FULLHASH_ENV: &str = "CLAWCRATE_FSDIFF_FULLHASH";
+
+impl SnapshotMode {
+    /// Read the mode from the environment, defaulting to metadata-first.
+    pub fn from_env() -> Self {
+        match std::env::var(FSDIFF_FULLHASH_ENV) {
+            Ok(value) if matches!(value.trim(), "1" | "true" | "yes") => SnapshotMode::FullHash,
+            _ => SnapshotMode::MetadataFirst,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -132,6 +165,12 @@ pub struct FsChange {
     pub path: PathBuf,
     pub kind: FsChangeKind,
     pub size_bytes: Option<u64>,
+    /// Content hash of the changed file, computed on demand. For created and
+    /// modified entries this is the post-execution hash; for deleted entries it
+    /// is the pre-execution hash when one was recorded. Absent when the file
+    /// could not be read (it may have been removed again after the snapshot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -338,7 +377,16 @@ fn join_capture_thread(
     }
 }
 
+/// Snapshot the given roots using the mode selected by the environment.
 pub fn snapshot_paths(paths: &[PathBuf]) -> Result<FileSnapshot, CaptureError> {
+    snapshot_paths_with_mode(paths, SnapshotMode::from_env())
+}
+
+/// Snapshot the given roots with an explicit mode.
+pub fn snapshot_paths_with_mode(
+    paths: &[PathBuf],
+    mode: SnapshotMode,
+) -> Result<FileSnapshot, CaptureError> {
     let mut entries = BTreeMap::new();
 
     for root in paths {
@@ -347,7 +395,7 @@ pub fn snapshot_paths(paths: &[PathBuf]) -> Result<FileSnapshot, CaptureError> {
         }
 
         if root.is_file() {
-            let fingerprint = fingerprint_path(root)?;
+            let fingerprint = fingerprint_path(root, mode)?;
             entries.insert(root.clone(), fingerprint);
             continue;
         }
@@ -363,7 +411,7 @@ pub fn snapshot_paths(paths: &[PathBuf]) -> Result<FileSnapshot, CaptureError> {
             }
 
             let path = walk_entry.path().to_path_buf();
-            let fingerprint = fingerprint_path(&path)?;
+            let fingerprint = fingerprint_path(&path, mode)?;
             entries.insert(path, fingerprint);
         }
     }
@@ -371,6 +419,11 @@ pub fn snapshot_paths(paths: &[PathBuf]) -> Result<FileSnapshot, CaptureError> {
     Ok(FileSnapshot { entries })
 }
 
+/// Compare two snapshots and record the resulting changes.
+///
+/// Content hashes are computed here, on demand, only for the files that changed
+/// — never for the whole tree. In audit-grade mode the snapshot already carries
+/// the hash and it is reused rather than recomputed.
 pub fn diff_snapshots(before: &FileSnapshot, after: &FileSnapshot) -> Vec<FsChange> {
     let mut changes = Vec::new();
 
@@ -380,12 +433,16 @@ pub fn diff_snapshots(before: &FileSnapshot, after: &FileSnapshot) -> Vec<FsChan
                 path: path.clone(),
                 kind: FsChangeKind::Deleted,
                 size_bytes: Some(before_fingerprint.size_bytes),
+                // The file is gone, so the only hash available is whatever the
+                // pre-execution snapshot recorded.
+                sha256: before_fingerprint.sha256.clone(),
             }),
             Some(after_fingerprint) if after_fingerprint != before_fingerprint => {
                 changes.push(FsChange {
                     path: path.clone(),
                     kind: FsChangeKind::Modified,
                     size_bytes: Some(after_fingerprint.size_bytes),
+                    sha256: changed_file_hash(path, after_fingerprint),
                 });
             }
             Some(_) => {}
@@ -398,6 +455,7 @@ pub fn diff_snapshots(before: &FileSnapshot, after: &FileSnapshot) -> Vec<FsChan
                 path: path.clone(),
                 kind: FsChangeKind::Created,
                 size_bytes: Some(after_fingerprint.size_bytes),
+                sha256: changed_file_hash(path, after_fingerprint),
             });
         }
     }
@@ -406,7 +464,18 @@ pub fn diff_snapshots(before: &FileSnapshot, after: &FileSnapshot) -> Vec<FsChan
     changes
 }
 
-fn fingerprint_path(path: &Path) -> Result<FileFingerprint, CaptureError> {
+/// Hash for a file that the diff flagged as changed: reuse the snapshot's hash
+/// when audit-grade mode already computed it, otherwise read the file now.
+/// Best-effort — a file that vanished between the snapshot and this read simply
+/// has no recorded hash.
+fn changed_file_hash(path: &Path, fingerprint: &FileFingerprint) -> Option<String> {
+    match &fingerprint.sha256 {
+        Some(hash) => Some(hash.clone()),
+        None => hash_sha256(path).ok(),
+    }
+}
+
+fn fingerprint_path(path: &Path, mode: SnapshotMode) -> Result<FileFingerprint, CaptureError> {
     let metadata = fs::metadata(path).map_err(|source| CaptureError::SnapshotIo {
         path: path.to_path_buf(),
         source,
@@ -417,7 +486,10 @@ fn fingerprint_path(path: &Path) -> Result<FileFingerprint, CaptureError> {
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    let sha256 = hash_sha256(path)?;
+    let sha256 = match mode {
+        SnapshotMode::FullHash => Some(hash_sha256(path)?),
+        SnapshotMode::MetadataFirst => None,
+    };
 
     Ok(FileFingerprint {
         size_bytes: metadata.len(),
@@ -461,8 +533,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        capture_child_output, capture_streams, diff_snapshots, snapshot_paths, CaptureConfig,
-        FsChangeKind,
+        capture_child_output, capture_streams, diff_snapshots, snapshot_paths,
+        snapshot_paths_with_mode, CaptureConfig, FsChangeKind, SnapshotMode,
     };
 
     fn unique_tmp_dir(prefix: &str) -> PathBuf {
@@ -674,12 +746,108 @@ mod tests {
         fs::write(tmp.join("workspace").join("root.txt"), "root").expect("write root file");
         fs::write(nested.join("lib.rs"), "fn main() {}").expect("write nested file");
 
-        let snapshot = snapshot_paths(&[tmp.join("workspace")]).expect("snapshot paths");
+        let snapshot = snapshot_paths_with_mode(&[tmp.join("workspace")], SnapshotMode::FullHash)
+            .expect("snapshot paths");
         assert_eq!(snapshot.entries.len(), 2);
         for fingerprint in snapshot.entries.values() {
-            assert_eq!(fingerprint.sha256.len(), 64);
+            assert_eq!(
+                fingerprint.sha256.as_deref().map(str::len),
+                Some(64),
+                "audit-grade mode records a content hash per file"
+            );
             assert!(fingerprint.size_bytes > 0);
         }
+
+        // The default mode records metadata only: no file is read.
+        let metadata_snapshot =
+            snapshot_paths_with_mode(&[tmp.join("workspace")], SnapshotMode::MetadataFirst)
+                .expect("snapshot paths");
+        assert_eq!(metadata_snapshot.entries.len(), 2);
+        for fingerprint in metadata_snapshot.entries.values() {
+            assert!(
+                fingerprint.sha256.is_none(),
+                "metadata-first mode must not hash file contents"
+            );
+            assert!(fingerprint.size_bytes > 0);
+        }
+    }
+
+    /// The documented limit of the default mode, pinned as behavior: a content
+    /// swap that preserves both size and mtime is invisible to metadata-first
+    /// detection, and audit-grade mode is what catches it.
+    #[test]
+    fn same_size_same_mtime_modification_is_caught_only_in_audit_grade_mode() {
+        use std::fs::File;
+
+        let tmp = unique_tmp_dir("clawcrate_snapshot_same_size");
+        let root = tmp.join("workspace");
+        fs::create_dir_all(&root).expect("create workspace");
+        let target = root.join("data.bin");
+        fs::write(&target, b"aaaa").expect("write original");
+
+        let original_mtime = fs::metadata(&target)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+
+        let metadata_before =
+            snapshot_paths_with_mode(std::slice::from_ref(&root), SnapshotMode::MetadataFirst)
+                .expect("metadata snapshot");
+        let hash_before =
+            snapshot_paths_with_mode(std::slice::from_ref(&root), SnapshotMode::FullHash)
+                .expect("hash snapshot");
+
+        // Same length, different content, and the mtime restored to its prior
+        // value — the exact shape metadata comparison cannot see.
+        fs::write(&target, b"bbbb").expect("overwrite with same size");
+        File::open(&target)
+            .expect("open for mtime reset")
+            .set_modified(original_mtime)
+            .expect("restore mtime");
+
+        let metadata_after =
+            snapshot_paths_with_mode(std::slice::from_ref(&root), SnapshotMode::MetadataFirst)
+                .expect("metadata snapshot");
+        let hash_after =
+            snapshot_paths_with_mode(&[root], SnapshotMode::FullHash).expect("hash snapshot");
+
+        assert!(
+            diff_snapshots(&metadata_before, &metadata_after).is_empty(),
+            "metadata-first cannot detect a same-size, same-mtime rewrite"
+        );
+
+        let audit_changes = diff_snapshots(&hash_before, &hash_after);
+        assert_eq!(audit_changes.len(), 1);
+        assert_eq!(audit_changes[0].kind, FsChangeKind::Modified);
+        assert!(
+            audit_changes[0].sha256.is_some(),
+            "audit-grade mode records the post-execution hash"
+        );
+    }
+
+    #[test]
+    fn diff_records_hashes_on_demand_only_for_changed_files() {
+        let tmp = unique_tmp_dir("clawcrate_snapshot_ondemand");
+        let root = tmp.join("workspace");
+        fs::create_dir_all(&root).expect("create workspace");
+        fs::write(root.join("untouched.txt"), "same").expect("write untouched");
+
+        let before =
+            snapshot_paths_with_mode(std::slice::from_ref(&root), SnapshotMode::MetadataFirst)
+                .expect("snapshot before");
+        fs::write(root.join("created.txt"), "new contents").expect("write created");
+        let after =
+            snapshot_paths_with_mode(std::slice::from_ref(&root), SnapshotMode::MetadataFirst)
+                .expect("snapshot after");
+
+        let changes = diff_snapshots(&before, &after);
+        assert_eq!(changes.len(), 1, "only the created file should be reported");
+        assert_eq!(changes[0].kind, FsChangeKind::Created);
+
+        // The hash is computed on demand for the changed file even though the
+        // snapshots themselves recorded none.
+        let hash = changes[0].sha256.as_deref().expect("hash for changed file");
+        assert_eq!(hash.len(), 64);
     }
 
     #[test]

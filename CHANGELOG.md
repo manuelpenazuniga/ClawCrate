@@ -37,6 +37,15 @@ with alpha pre-release tags.
   defaults to Replica Mode) when sync-back was approved interactively.
 
 ### Changed
+- `fs-diff` snapshots are **metadata-first** by default: change detection uses
+  size and mtime instead of hashing every file in the writable set twice per
+  run, and a content hash is computed on demand only for the files that actually
+  changed (recorded in `fs-diff.json` as a new optional `sha256` field). On a
+  293 MB / 3,000-file tree this took the snapshot-and-diff phase from 2,528 ms
+  to 15 ms. The trade-off is explicit: metadata comparison cannot see a
+  modification that preserves both size and mtime. Set
+  `CLAWCRATE_FSDIFF_FULLHASH=1` to hash everything, which is the documented
+  compliance path and preserves the previous behavior.
 - Replica materialization prefers a copy-on-write clone before falling back to a
   regular copy. On Linux this issues `FICLONE`, which reflinks on btrfs and XFS
   and falls back cleanly on filesystems without reflink support; permissions are

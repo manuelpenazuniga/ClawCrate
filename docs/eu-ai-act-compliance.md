@@ -44,7 +44,7 @@ clawcrate run --profile <profile> -- <command>...
 | Automatic event recording | Each run writes `audit.ndjson` under `~/.clawcrate/runs/<run-id>/`. Events include sandbox application, environment scrubbing, process start/exit, approval decisions, replica events, and blocked permissions. | Covered for ClawCrate-managed command execution |
 | Timestamps | Each `AuditEvent` includes an RFC3339 timestamp. `plan.json` also includes `created_at`. | Covered |
 | Actor traceability | `plan.json` includes an `actor` field (`Human` or `Agent { name }`). | Covered when the caller supplies/uses the actor model correctly |
-| Reconstruction of command context | `plan.json` records command, profile, filesystem policy, network policy, workspace mode, actor, and creation time. `result.json`, `stdout.log`, `stderr.log`, and `fs-diff.json` provide execution outcome and file-change evidence. | Covered for shell-command context, not full model reasoning |
+| Reconstruction of command context | `plan.json` records command, profile, filesystem policy, network policy, workspace mode, actor, and creation time. `result.json`, `stdout.log`, `stderr.log`, and `fs-diff.json` provide execution outcome and file-change evidence. `fs-diff.json` detects changes from size and mtime by default and records a content hash for each changed file; set `CLAWCRATE_FSDIFF_FULLHASH=1` to hash the whole writable set, which also catches a modification that preserves both size and mtime. | Covered for shell-command context, not full model reasoning |
 | Tamper evidence | `CLAWCRATE_AUDIT_HASHCHAIN=1` adds SHA-256 hash-chain fields to `audit.ndjson`. `CLAWCRATE_AUDIT_SIGN=<ed25519-key>` can append Ed25519 `BlockSignature` entries. `clawcrate verify <run-id>` verifies hash chains, and `--pubkey` verifies block signatures. | Covered when enabled and keys are managed securely |
 | Monitoring operation | `clawcrate audit export <run-id> --format cef\|syslog\|elastic` exports audit events to SIEM-compatible formats. | Covered for ClawCrate events |
 
@@ -164,16 +164,22 @@ architecture:
 3. Prefer Replica Mode for install/build workflows that should not access
    secrets from the source workspace.
 4. Enable `CLAWCRATE_AUDIT_HASHCHAIN=1` for regulated runs.
-5. Enable `CLAWCRATE_AUDIT_SIGN` with keys stored outside the writable
+5. Enable `CLAWCRATE_FSDIFF_FULLHASH=1` for regulated runs. By default,
+   `fs-diff.json` detects changes from file size and modification time, which is
+   fast enough to run on every execution but cannot see a modification that
+   preserves both. This variable makes ClawCrate hash the contents of every file
+   in the writable set before and after execution, which is the tamper-evident
+   guarantee behind the file-change evidence.
+6. Enable `CLAWCRATE_AUDIT_SIGN` with keys stored outside the writable
    workspace.
-6. Store public verification keys separately from run artifacts.
-7. Export audit logs to a retention-controlled system using
+7. Store public verification keys separately from run artifacts.
+8. Export audit logs to a retention-controlled system using
    `clawcrate audit export`.
-8. Link ClawCrate run IDs to application-level records such as request IDs,
+9. Link ClawCrate run IDs to application-level records such as request IDs,
    model versions, reviewer IDs, approval tickets, and incident records.
-9. Periodically run `clawcrate verify <run-id> --pubkey <key>` over retained
+10. Periodically run `clawcrate verify <run-id> --pubkey <key>` over retained
    samples or during archive ingestion.
-10. Document residual risks, especially local host compromise and incomplete
+11. Document residual risks, especially local host compromise and incomplete
     visibility outside ClawCrate-managed command execution.
 
 ## Evidence Boundary
