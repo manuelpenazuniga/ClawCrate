@@ -26,10 +26,35 @@ pub(crate) fn expand_home_path(path: &Path, home: Option<&Path>) -> PathBuf {
 
 pub(crate) fn resolve_path_with_home(cwd: &Path, path: &Path, home: Option<&Path>) -> PathBuf {
     let expanded = expand_home_path(path, home);
-    if expanded.is_absolute() {
+    let resolved = if expanded.is_absolute() {
         expanded
     } else {
         cwd.join(expanded)
+    };
+    lexically_clean(resolved)
+}
+
+/// Drop `.` components from a resolved path.
+///
+/// A profile that declares `fs_read: ["."]` resolves to `<cwd>/.`, because
+/// joining does not normalize. macOS Seatbelt matches `subpath` textually, so
+/// `(subpath "<cwd>/.")` does not match `<cwd>/file.txt` and the sandboxed
+/// process cannot read its own workspace.
+///
+/// Rebuilding from `Path::components()` removes non-leading `.` components.
+/// `..` is deliberately preserved rather than resolved: popping it lexically is
+/// wrong when a component is a symlink, and could widen a grant to a directory
+/// the profile never named. Leaving it in place fails closed instead.
+fn lexically_clean(path: PathBuf) -> PathBuf {
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        cleaned.push(component.as_os_str());
+    }
+
+    if cleaned.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        cleaned
     }
 }
 

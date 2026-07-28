@@ -18,6 +18,16 @@ with alpha pre-release tags.
   existing macOS fixture.
 
 ### Fixed
+- **macOS: sandboxed processes can read their own workspace again.** Profiles
+  declare `fs_read: ["."]`, which resolved to `<cwd>/.` because joining does not
+  normalize, and Seatbelt matches `subpath` textually — so the rule matched
+  nothing and every read inside the workspace was denied. This affected all
+  built-in profiles. Resolved paths are now normalized lexically; `..` is
+  deliberately preserved rather than collapsed, since resolving it lexically is
+  wrong when a component is a symlink. A new macOS fixture launches a real
+  process, reads a workspace file, and asserts an out-of-workspace secret stays
+  denied — coverage that did not exist, because the previous macOS fixture only
+  inspected the generated profile string.
 - The local API bounds the request body it reads (10 MiB). Previously
   `parse_api_command_payload` used an unbounded `read_to_string`, so a client
   could exhaust the server's memory with an arbitrarily large body. An oversized
