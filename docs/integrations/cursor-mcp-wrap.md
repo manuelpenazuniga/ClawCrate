@@ -284,6 +284,11 @@ Common failure modes:
   `command -v clawcrate` inside the launcher.
 - Server package download fails: install/cache the server before wrapping, or
   use a local executable.
+- A launcher from an earlier version of this recipe used `npx --no-install` and
+  now fails to start, often with a module-resolution error: `npx` is a script
+  the sandbox cannot read, because the profile grants the workspace only. Switch
+  it to the workspace-local `node node_modules/.../dist/index.js` form shown
+  above, and install the server into the directory the launcher `cd`s into.
 - Files are not visible: make sure the launcher `cd` target is the directory
   you intend to expose, and use relative paths in the MCP server args.
 - Writes fail under `mcp-readonly`: switch to `mcp-server` only if write access
