@@ -1,14 +1,14 @@
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs;
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::symlink;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
@@ -110,7 +110,7 @@ impl LinuxEnforcer for RejectRlimitEnforcer {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unique_tmp_path(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -119,13 +119,13 @@ fn unique_tmp_path(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}_{nanos}_{}", std::process::id()))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 struct TempPathGuard {
     path: PathBuf,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl TempPathGuard {
     fn new(prefix: &str) -> Self {
         Self {
@@ -138,7 +138,7 @@ impl TempPathGuard {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for TempPathGuard {
     fn drop(&mut self) {
         match fs::symlink_metadata(&self.path) {
@@ -625,6 +625,93 @@ fn fixture_linux_rlimit_file_size_denies_large_file_writes() {
     assert!(
         written_size <= 1024,
         "file should not exceed RLIMIT_FSIZE; got {written_size} bytes"
+    );
+}
+
+/// The macOS counterpart of the Linux read-isolation landmark, and the coverage
+/// that was missing: it launches a real process instead of only inspecting the
+/// generated profile. A sandboxed command must be able to read its own
+/// workspace while an out-of-workspace secret stays denied.
+///
+/// Asserting the successful read matters as much as the denial. Seatbelt matches
+/// `subpath` textually, so a profile path that resolves to `<cwd>/.` grants
+/// nothing and the sandbox silently becomes unusable — a failure no
+/// SBPL-string assertion can see.
+#[cfg(target_os = "macos")]
+#[test]
+fn fixture_macos_seatbelt_reads_workspace_and_denies_outside_secret() {
+    let fixtures = fixture_paths();
+    let workspace = TempPathGuard::new("clawcrate_fixture_seatbelt_read_workspace");
+    fs::create_dir_all(workspace.path()).expect("create temporary workspace");
+    fs::write(workspace.path().join("public.txt"), "workspace-visible\n")
+        .expect("write workspace file");
+
+    // Use the physical path, as a real run does: `current_dir()` resolves
+    // symlinks, and on macOS the temp root is reached through `/var` ->
+    // `/private/var`. Seatbelt matches `subpath` against the resolved path, so a
+    // grant written with the symlinked prefix would match nothing.
+    let workspace_path = fs::canonicalize(workspace.path()).expect("canonicalize workspace");
+
+    let mut plan = fixture_plan(
+        &fixtures,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "cat public.txt; if cat {} >/dev/null 2>&1; then printf 'leaked'; \
+                 else printf 'denied'; fi",
+                fixtures.home_ssh_key.display()
+            ),
+        ],
+        NetLevel::None,
+    );
+    plan.cwd = workspace_path.clone();
+    // The shape every built-in profile uses: a relative read root.
+    plan.profile.fs_read = vec![PathBuf::from(".")];
+    plan.profile.fs_write = vec![];
+
+    let sandbox = DarwinSandbox::new();
+    let prepared = sandbox.prepare_with_env(
+        &plan,
+        vec![
+            (
+                "HOME".to_string(),
+                fixtures.home_root.to_string_lossy().to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ],
+    );
+
+    // The resolved read root must be a clean directory path: a trailing `/.`
+    // makes the `subpath` rule match nothing.
+    assert!(
+        !prepared
+            .sbpl_profile
+            .contains(&format!("{}/.\"", workspace_path.display())),
+        "read root must not be emitted with a trailing `/.`\n{}",
+        prepared.sbpl_profile
+    );
+
+    let output = sandbox
+        .launch(&prepared)
+        .expect("launch fixture command")
+        .wait_with_output()
+        .expect("wait for fixture command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.contains("workspace-visible"),
+        "the sandboxed process must be able to read its own workspace\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("denied"),
+        "the out-of-workspace secret must stay denied\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("leaked"),
+        "sandboxed process read an out-of-workspace secret\nstdout: {stdout}"
     );
 }
 

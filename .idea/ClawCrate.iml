@@ -1,7 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <module type="EMPTY_MODULE" version="4">
   <component name="NewModuleRootManager">
-    <content url="file://$MODULE_DIR$" />
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/crates/clawcrate-audit/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/clawcrate-audit/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/clawcrate-capture/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/clawcrate-cli/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/clawcrate-cli/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/clawcrate-profiles/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/clawcrate-sandbox/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/clawcrate-sandbox/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/clawcrate-types/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/clawcrate-types/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
