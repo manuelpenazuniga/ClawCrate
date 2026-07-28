@@ -37,12 +37,13 @@ fn demo_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/mcp-filesystem-demo")
 }
 
-/// The exact command the demo launcher wraps: the filesystem server with a
-/// relative root argument.
-const WRAPPED_COMMAND: [&str; 4] = [
-    "npx",
-    "--no-install",
-    "@modelcontextprotocol/server-filesystem",
+/// The exact command the demo launcher wraps: the filesystem server launched
+/// from the copy installed inside the workspace, with a relative root argument.
+/// `npx` cannot be used, because it reads its own launcher and package cache
+/// from the Node installation, which the sandbox does not grant.
+const WRAPPED_COMMAND: [&str; 3] = [
+    "node",
+    "node_modules/@modelcontextprotocol/server-filesystem/dist/index.js",
     ".",
 ];
 
@@ -114,8 +115,19 @@ fn demo_launcher_script_matches_wrap_invocation() {
         "launcher must use the mcp-readonly profile"
     );
     assert!(
-        contents.contains("npx --no-install @modelcontextprotocol/server-filesystem"),
-        "launcher must run the filesystem server with --no-install (network: none profile)"
+        contents.contains("node \"$SERVER_ENTRYPOINT\""),
+        "launcher must run the server from the copy installed inside the workspace"
+    );
+    // Only executable lines matter here: the launcher's comments legitimately
+    // explain why `npx` is unusable.
+    let invokes_npx = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .any(|line| line.contains("npx"));
+    assert!(
+        !invokes_npx,
+        "launcher must not invoke npx: it reads files outside the sandbox's read set"
     );
     assert!(
         contents.contains("cd "),
@@ -137,4 +149,31 @@ fn demo_workspace_ships_fixture_and_planted_secrets() {
     );
     // Out-of-root secret for the blocked-read story.
     assert!(demo.join("secret-vault/api-key.txt").is_file());
+}
+
+/// The launcher must always hand the server a root argument. It consumes the
+/// first argument as the workspace to enter, so without a default the server
+/// would be started with no path and refuse to run — the shape a GUI MCP client
+/// produces when it invokes the launcher with no arguments at all.
+#[test]
+fn demo_launcher_always_passes_a_server_root() {
+    let contents = fs::read_to_string(demo_dir().join("launcher.sh")).expect("read launcher");
+
+    assert!(
+        contents.contains("set -- ."),
+        "launcher must default the server root to `.` when no extra paths are given"
+    );
+
+    // The default must be applied after the workspace argument is shifted off,
+    // otherwise a one-argument invocation still reaches the server with none.
+    let shift_at = contents
+        .find("shift")
+        .expect("launcher shifts the workspace argument");
+    let default_at = contents
+        .find("set -- .")
+        .expect("launcher sets a default root");
+    assert!(
+        shift_at < default_at,
+        "the default root must be applied after the workspace argument is shifted off"
+    );
 }

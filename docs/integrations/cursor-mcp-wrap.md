@@ -61,10 +61,14 @@ clawcrate mcp uninstall --client cursor --server-name filesystem
 Defaults to `~/.cursor/mcp.json`; pass `--config .cursor/mcp.json` to target a
 project-local config. Use `--json` for machine-readable output.
 
-> The `install` writer sets `command`/`args` directly. If you need the
-> workspace-directory launcher behavior shown below (Replica materialized from a
-> specific directory via `${workspaceFolder}`), edit the entry to point at the
-> launcher script instead.
+> **For filesystem-style servers, prefer the launcher below.** `mcp install`
+> rewrites `command`/`args` in place and does not set a working directory, so the
+> wrapped server inherits whatever directory the client happens to run in — which
+> is what `mcp-readonly` then materializes as the Replica. It also cannot wrap
+> `npx`, which fails to start inside the sandbox (see below). Use `mcp install`
+> for servers that do not need a specific workspace, and the launcher script for
+> the ones that do.
+
 
 ## Before: direct MCP server launch
 
@@ -117,8 +121,18 @@ cd "$TARGET_DIR"
 exec clawcrate mcp wrap \
   --profile mcp-readonly \
   -- \
-  npx --no-install @modelcontextprotocol/server-filesystem "$@"
+  node node_modules/@modelcontextprotocol/server-filesystem/dist/index.js "$@"
 ```
+
+> **Why not `npx`?** The sandbox grants read access to the workspace only, and
+> `npx` must read its own launcher and package cache from the Node installation,
+> which lies outside that set — so it cannot start. Installing the server into
+> the workspace keeps everything it reads inside the sandbox, so the profile
+> does not have to grant the Node installation as well. Verified end to end on
+> macOS, where the wrapped server lists and reads the workspace while `.env`
+> stays invisible. On Linux a distro-packaged `npx` may work, since the system
+> read set already covers `/usr/bin` and `/usr/lib`; the workspace-local
+> launcher was chosen because it behaves the same on both platforms.
 
 Make it executable:
 
@@ -187,22 +201,30 @@ directory.
 
 ## First-run package installation
 
-The MCP profiles block network access. That is the intended steady-state
-behavior, but it means `npx` cannot download a package from npm while the server
-is running inside ClawCrate. The launcher examples therefore use
-`npx --no-install`, which runs only an already available package.
+The MCP profiles block network access and grant read access to the workspace
+only. The server must therefore be installed **into the workspace** before it is
+wrapped, and launched from that copy.
 
-Before enabling the wrapped config, either install/cache the server outside
-ClawCrate from the same launcher directory or point Cursor at a local server
-executable:
+The MCP profiles block network access and grant read access to the workspace
+only. Install the server **into the workspace** before wrapping it, and launch it
+from that copy:
 
 ```bash
 cd ~/project
-npx -y @modelcontextprotocol/server-filesystem .
+npm install @modelcontextprotocol/server-filesystem
 ```
 
-Stop that command after it starts successfully, then reload the MCP server from
-Cursor's MCP settings.
+That places the entrypoint at
+`node_modules/@modelcontextprotocol/server-filesystem/dist/index.js`, which is
+what the launcher above runs. Reinstall after upgrading the package.
+
+> **The install itself is not sandboxed.** `npm install` runs as you, on the
+> host, and a package's lifecycle scripts run with your privileges — the very
+> risk ClawCrate exists to contain. Install from a trusted registry, and if you
+> want that step contained too, run it under ClawCrate first:
+> `clawcrate run --profile install -- npm install <pkg>` (Replica Mode, so
+> review the diff and sync back deliberately).
+
 
 ## What ClawCrate enforces
 
@@ -262,6 +284,11 @@ Common failure modes:
   `command -v clawcrate` inside the launcher.
 - Server package download fails: install/cache the server before wrapping, or
   use a local executable.
+- A launcher from an earlier version of this recipe used `npx --no-install` and
+  now fails to start, often with a module-resolution error: `npx` is a script
+  the sandbox cannot read, because the profile grants the workspace only. Switch
+  it to the workspace-local `node node_modules/.../dist/index.js` form shown
+  above, and install the server into the directory the launcher `cd`s into.
 - Files are not visible: make sure the launcher `cd` target is the directory
   you intend to expose, and use relative paths in the MCP server args.
 - Writes fail under `mcp-readonly`: switch to `mcp-server` only if write access

@@ -29,40 +29,60 @@ because it is neither copied into the Replica nor in the read allowlist.
 | Requirement | Notes |
 |-------------|-------|
 | `clawcrate` | Install a [release](https://github.com/manuelpenazuniga/ClawCrate/releases) or build locally: `cargo build -p clawcrate-cli`. |
-| Node.js + npm | Only needed to run the server *live* (step "Run it live"). Not needed for `demo.sh`. |
+| Node.js + npm | Only needed for the live run (`demo.sh --live` or a real MCP client). Not needed for the default policy preview. |
 
 Run `clawcrate doctor` to confirm your platform supports sandboxing.
 
 ## Quickstart — policy preview (no network, no npm, no API key)
 
 ```bash
-export ANTHROPIC_API_KEY=   # not needed
-bash demo.sh
+bash demo.sh          # policy preview: no Node.js, no network, no install
+bash demo.sh --live   # start the real server in the sandbox and drive it
 ```
 
-`demo.sh` uses `clawcrate plan` — a dry run that resolves the exact sandbox
-policy **without launching the server**. It prints the profile, the Replica
-workspace mode, the (empty) write set, the `network: none` level, and the
+Without `--live`, `demo.sh` uses `clawcrate plan` — a dry run that resolves the
+exact sandbox policy **without launching the server**. It prints the profile, the
+Replica workspace mode, the (empty) write set, the `network: none` level, and the
 env-scrub count, then explains how each maps to the five guarantees above. It is
 safe to run anywhere and repeatedly.
 
+With `--live`, it installs the server into the workspace, starts it through
+`clawcrate mcp wrap`, and drives it over JSON-RPC. Expected output:
+
+```text
+  list_directory .   -> [FILE] README.md | [DIR] docs | [DIR] src | ...
+  read README.md     -> '# Sample project ...'
+  read .env          -> not visible
+```
+
+`.env` is absent from the listing and unreadable: Replica Mode excluded it before
+the server started, so the secret never entered the sandbox.
+
 ## Run it live (inside a real MCP client)
 
-The `mcp-readonly` profile is `network: none`, so the package must be
-installed/cached **before** entering the sandbox, and the launcher uses
-`npx --no-install` at runtime:
+The `mcp-readonly` profile is `network: none` and grants read access to the
+workspace only, so the server is installed **into the workspace** and launched
+from that copy:
 
 ```bash
-# 1. Install the server outside ClawCrate (this step is allowed to use the network).
-npm install -g @modelcontextprotocol/server-filesystem
+# 1. Install the server into the workspace (this step is outside the sandbox,
+#    so it may use the network).
+cd examples/mcp-filesystem-demo/workspace
+npm install @modelcontextprotocol/server-filesystem
 
 # 2. Point your MCP client's server `command` at this demo's launcher.
 #    With no arguments it exposes ./workspace; the server root stays relative (".").
 examples/mcp-filesystem-demo/launcher.sh
 ```
 
+**Why not `npx`?** `npx` must read its own launcher and package cache from the
+Node installation, which is outside the workspace the sandbox grants — so it
+cannot start. Installing into the workspace keeps everything the server reads
+inside the sandbox, which is both the pattern that works and the narrower
+grant.
+
 [`launcher.sh`](launcher.sh) is the canonical wrap launcher — it `cd`s into the
-workspace and execs `clawcrate mcp wrap --profile mcp-readonly -- npx --no-install @modelcontextprotocol/server-filesystem .`.
+workspace and execs `clawcrate mcp wrap --profile mcp-readonly -- node node_modules/@modelcontextprotocol/server-filesystem/dist/index.js .`.
 Configure it in your MCP client using the matching recipe:
 
 - [Cursor MCP wrap recipe](../../docs/integrations/cursor-mcp-wrap.md)
