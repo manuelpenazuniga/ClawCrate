@@ -250,6 +250,7 @@ pub(crate) fn launch_and_relay_mcp(
         .take()
         .ok_or(CaptureError::MissingStderrPipe)
         .map_err(|source| anyhow!("failed to relay MCP stderr pipe: {source}"))?;
+    let launched_at = Instant::now();
     let monitored = run_mcp_relay_child(
         child.child_mut(),
         stdout,
@@ -258,6 +259,7 @@ pub(crate) fn launch_and_relay_mcp(
         plan.profile.resources.max_cpu_seconds,
         Some(pid as i32),
     )?;
+    record_observed_denials(writer, egress_proxy.as_ref(), pid, launched_at.elapsed())?;
     drop(egress_proxy);
 
     Ok(McpRelayExecutionOutcome {
@@ -325,6 +327,7 @@ pub(crate) fn launch_and_relay_mcp(
         .take()
         .ok_or(CaptureError::MissingStderrPipe)
         .map_err(|source| anyhow!("failed to relay MCP stderr pipe: {source}"))?;
+    let launched_at = Instant::now();
     let monitored = run_mcp_relay_child(
         child.child_mut(),
         stdout,
@@ -333,6 +336,7 @@ pub(crate) fn launch_and_relay_mcp(
         plan.profile.resources.max_cpu_seconds,
         Some(pid as i32),
     )?;
+    record_observed_denials(writer, egress_proxy.as_ref(), pid, launched_at.elapsed())?;
     drop(egress_proxy);
 
     Ok(McpRelayExecutionOutcome {

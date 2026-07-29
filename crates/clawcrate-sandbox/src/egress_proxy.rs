@@ -2,7 +2,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::str;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -14,6 +14,96 @@ const MAX_REQUEST_LINE_BYTES: usize = 4096;
 const MAX_HEADER_LINE_BYTES: usize = 8192;
 const MAX_HEADER_COUNT: usize = 64;
 const MAX_HEADER_BYTES_TOTAL: usize = 64 * 1024;
+/// Upper bound on retained denial records. A process that hammers a blocked
+/// domain in a loop would otherwise grow this buffer without limit while the
+/// run is still going; past this point records are counted, not stored.
+const MAX_RECORDED_DENIALS: usize = 256;
+
+/// Why the proxy refused a CONNECT. Both variants are decisions the proxy makes
+/// itself, so a recorded denial is exact — not inferred from an error the child
+/// happened to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressDenialReason {
+    /// The requested host is not in the profile's allowlist.
+    DomainNotAllowed,
+    /// The TLS SNI disagreed with the CONNECT target, or named a host that is
+    /// not allowed. Catches a client that asks for an allowed host and then
+    /// negotiates a different one.
+    SniRejected { sni: String },
+}
+
+impl EgressDenialReason {
+    fn describe(&self) -> String {
+        match self {
+            Self::DomainNotAllowed => "network domain not in the profile allowlist".to_string(),
+            Self::SniRejected { sni } => {
+                format!("TLS SNI {sni} rejected for the requested CONNECT target")
+            }
+        }
+    }
+}
+
+/// A single refused outbound connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressDenial {
+    pub host: String,
+    pub port: u16,
+    pub reason: EgressDenialReason,
+}
+
+impl EgressDenial {
+    /// The blocked endpoint, in the form used as the audit event's `resource`.
+    pub fn resource(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Human-readable explanation, used as the audit event's `reason`.
+    pub fn reason_text(&self) -> String {
+        self.reason.describe()
+    }
+}
+
+#[derive(Debug, Default)]
+struct DenialBuffer {
+    denials: Vec<EgressDenial>,
+    dropped: usize,
+}
+
+/// Shared, bounded record of refused connections. Handler threads write to it
+/// concurrently; the CLI drains it once the child has exited.
+#[derive(Debug, Clone, Default)]
+pub struct EgressDenialLog {
+    inner: Arc<Mutex<DenialBuffer>>,
+}
+
+impl EgressDenialLog {
+    fn record(&self, denial: EgressDenial) {
+        // A poisoned lock means a handler thread panicked mid-record. Losing
+        // denial records is bad, but taking down the proxy — and with it the
+        // run — is worse, so recover the buffer and carry on.
+        let mut buffer = match self.inner.lock() {
+            Ok(buffer) => buffer,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if buffer.denials.len() >= MAX_RECORDED_DENIALS {
+            buffer.dropped = buffer.dropped.saturating_add(1);
+            return;
+        }
+        buffer.denials.push(denial);
+    }
+
+    /// Removes and returns every recorded denial, along with the number of
+    /// records dropped after the buffer filled up.
+    pub fn drain(&self) -> (Vec<EgressDenial>, usize) {
+        let mut buffer = match self.inner.lock() {
+            Ok(buffer) => buffer,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dropped = buffer.dropped;
+        buffer.dropped = 0;
+        (std::mem::take(&mut buffer.denials), dropped)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EgressProxyConfig {
@@ -37,11 +127,19 @@ pub struct EgressProxyHandle {
     addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    denials: EgressDenialLog,
 }
 
 impl EgressProxyHandle {
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Removes and returns the connections this proxy refused, plus the number
+    /// of records dropped once the buffer was full. Call after the sandboxed
+    /// process has exited so no handler is still writing.
+    pub fn drain_denials(&self) -> (Vec<EgressDenial>, usize) {
+        self.denials.drain()
     }
 
     pub fn proxy_env_vars(&self) -> Vec<(String, String)> {
@@ -112,6 +210,8 @@ pub fn start_egress_proxy(
     let active_handlers = Arc::new(AtomicUsize::new(0));
     let enforce_sni = config.enforce_sni;
     let max_active_handlers = config.max_active_handlers.max(1);
+    let denials = EgressDenialLog::default();
+    let denials_thread = denials.clone();
 
     let join = thread::spawn(move || loop {
         if shutdown_thread.load(Ordering::SeqCst) {
@@ -128,9 +228,15 @@ pub fn start_egress_proxy(
 
                 let allowed = allowed_domains.clone();
                 let active_handlers_for_thread = active_handlers.clone();
+                let denials_for_thread = denials_thread.clone();
                 thread::spawn(move || {
                     let _slot_guard = ActiveHandlerSlotGuard::new(active_handlers_for_thread);
-                    let _ = handle_client_connection(stream, &allowed, enforce_sni);
+                    let _ = handle_client_connection(
+                        stream,
+                        &allowed,
+                        enforce_sni,
+                        &denials_for_thread,
+                    );
                 });
             }
             Err(error)
@@ -152,6 +258,7 @@ pub fn start_egress_proxy(
         addr,
         shutdown,
         join: Some(join),
+        denials,
     })
 }
 
@@ -226,6 +333,7 @@ fn handle_client_connection(
     client: TcpStream,
     allowed_domains: &[String],
     enforce_sni: bool,
+    denials: &EgressDenialLog,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(client);
     reader.get_mut().set_nodelay(true)?;
@@ -292,6 +400,11 @@ fn handle_client_connection(
     }
 
     if !is_host_allowed(&target_host, allowed_domains) {
+        denials.record(EgressDenial {
+            host: target_host.clone(),
+            port: target_port,
+            reason: EgressDenialReason::DomainNotAllowed,
+        });
         write_http_response(reader.get_mut(), 403, "Forbidden")?;
         return Ok(());
     }
@@ -319,6 +432,11 @@ fn handle_client_connection(
             return Ok(());
         };
         if !hostnames_match(&target_host, &sni) || !is_host_allowed(&sni, allowed_domains) {
+            denials.record(EgressDenial {
+                host: target_host.clone(),
+                port: target_port,
+                reason: EgressDenialReason::SniRejected { sni },
+            });
             let _ = reader.get_mut().shutdown(Shutdown::Both);
             let _ = upstream.shutdown(Shutdown::Both);
             return Ok(());
@@ -556,8 +674,9 @@ fn parse_server_name_extension(ext: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         extract_sni_from_client_hello, is_host_allowed, parse_connect_target, start_egress_proxy,
-        try_acquire_handler_slot, EgressProxyConfig, MAX_ACTIVE_PROXY_HANDLERS, MAX_HEADER_COUNT,
-        MAX_HEADER_LINE_BYTES,
+        try_acquire_handler_slot, EgressDenial, EgressDenialLog, EgressDenialReason,
+        EgressProxyConfig, MAX_ACTIVE_PROXY_HANDLERS, MAX_HEADER_COUNT, MAX_HEADER_LINE_BYTES,
+        MAX_RECORDED_DENIALS,
     };
     use std::io::{ErrorKind, Read, Write};
     use std::net::{Shutdown, TcpListener};
@@ -619,7 +738,96 @@ mod tests {
             response.contains("403 Forbidden"),
             "unexpected CONNECT deny response: {response}"
         );
+
+        // Refusing the connection is only half the job: the run's audit trail
+        // has to be able to say it happened.
+        let (denials, dropped) = proxy.drain_denials();
+        assert_eq!(dropped, 0, "nothing should have been dropped");
+        assert_eq!(
+            denials,
+            vec![EgressDenial {
+                host: "denied.test".to_string(),
+                port: 443,
+                reason: EgressDenialReason::DomainNotAllowed,
+            }]
+        );
+        assert_eq!(denials[0].resource(), "denied.test:443");
+
+        // Draining takes the records, so a second call reports nothing rather
+        // than replaying the same denial into the audit trail twice.
+        let (after_drain, _) = proxy.drain_denials();
+        assert!(after_drain.is_empty(), "drain must not replay records");
+
         proxy.shutdown();
+    }
+
+    #[test]
+    fn allowed_connections_record_no_denial() {
+        // Guards against the inverse failure: a denial log that fires on
+        // traffic the profile permits would fabricate audit evidence.
+        let _guard = proxy_network_test_lock();
+        let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
+        let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
+        let upstream_thread = thread::spawn(move || {
+            if let Ok((stream, _)) = upstream_listener.accept() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        });
+
+        let proxy = start_egress_proxy(EgressProxyConfig {
+            allowed_domains: vec!["localhost".to_string()],
+            enforce_sni: false,
+            max_active_handlers: MAX_ACTIVE_PROXY_HANDLERS,
+        })
+        .expect("start proxy");
+
+        let mut stream =
+            std::net::TcpStream::connect(proxy.addr()).expect("connect to local egress proxy");
+        write!(
+            stream,
+            "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+            upstream_addr.port(),
+            upstream_addr.port()
+        )
+        .expect("write connect request");
+        let response = read_http_response_header_with_timeout(&mut stream, Duration::from_secs(3));
+        assert!(
+            response.contains("200"),
+            "expected the allowed CONNECT to succeed: {response}"
+        );
+
+        let (denials, dropped) = proxy.drain_denials();
+        assert!(
+            denials.is_empty(),
+            "an allowed connection must not be recorded as blocked: {denials:?}"
+        );
+        assert_eq!(dropped, 0);
+
+        proxy.shutdown();
+        let _ = upstream_thread.join();
+    }
+
+    #[test]
+    fn denial_log_is_bounded_and_counts_what_it_drops() {
+        let log = EgressDenialLog::default();
+        let overflow = 5usize;
+        for index in 0..(MAX_RECORDED_DENIALS + overflow) {
+            log.record(EgressDenial {
+                host: format!("host{index}.test"),
+                port: 443,
+                reason: EgressDenialReason::DomainNotAllowed,
+            });
+        }
+
+        let (denials, dropped) = log.drain();
+        assert_eq!(denials.len(), MAX_RECORDED_DENIALS);
+        assert_eq!(
+            dropped, overflow,
+            "dropped records must be counted, not lost"
+        );
+        // The retained window is the first denials seen, so the record of what
+        // the process started doing survives the flood.
+        assert_eq!(denials[0].host, "host0.test");
     }
 
     #[test]

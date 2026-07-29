@@ -2137,3 +2137,84 @@ fn monitored_child_cleans_up_inherited_pipe_descendants() {
         "done"
     );
 }
+
+/// End-to-end over the wiring that turns a proxy refusal into audit evidence:
+/// a real proxy, a real refused CONNECT, and the event that must land in
+/// `audit.ndjson`. Without this the denial is only visible to the child as a
+/// 403 and leaves no trace in the artifact that is supposed to be the record.
+#[test]
+fn refused_connections_are_recorded_as_permission_blocked() {
+    use clawcrate_sandbox::egress_proxy::{start_egress_proxy, EgressProxyConfig};
+    use std::io::Write as _;
+    use std::net::TcpStream;
+
+    let proxy = start_egress_proxy(EgressProxyConfig::from_allowed_domains(vec![
+        "allowed.test".to_string(),
+    ]))
+    .expect("start egress proxy");
+
+    let mut stream = TcpStream::connect(proxy.addr()).expect("connect to proxy");
+    write!(
+        stream,
+        "CONNECT exfil.test:443 HTTP/1.1\r\nHost: exfil.test:443\r\n\r\n"
+    )
+    .expect("write CONNECT");
+    // Let the handler finish refusing before draining.
+    let mut response = Vec::new();
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = io::Read::read_to_end(&mut stream, &mut response);
+
+    let artifacts_dir = unique_tmp_dir("clawcrate_cli_denial_audit");
+    let writer = ArtifactWriter::from_artifacts_dir(artifacts_dir.join("run"))
+        .expect("create artifact writer");
+    record_observed_denials(
+        &writer,
+        Some(&proxy),
+        std::process::id(),
+        Duration::from_secs(1),
+    )
+    .expect("record denials");
+    proxy.shutdown();
+
+    let blocked: Vec<(String, String)> = fs::read_to_string(writer.audit_ndjson_path())
+        .expect("read audit")
+        .lines()
+        .map(|line| serde_json::from_str::<AuditEvent>(line).expect("parse audit event"))
+        .filter_map(|event| match event.event {
+            AuditEventKind::PermissionBlocked { resource, reason } => Some((resource, reason)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        blocked.len(),
+        1,
+        "expected exactly one blocked connection, got {blocked:?}"
+    );
+    assert_eq!(blocked[0].0, "exfil.test:443");
+    assert!(
+        blocked[0].1.contains("allowlist"),
+        "reason should say why it was blocked: {}",
+        blocked[0].1
+    );
+}
+
+/// The inverse: a run that was never denied anything must produce no evidence
+/// of a denial. An audit trail that invents blocks is as useless as one that
+/// misses them.
+#[test]
+fn a_run_without_denials_records_no_permission_blocked() {
+    let artifacts_dir = unique_tmp_dir("clawcrate_cli_no_denial_audit");
+    let writer = ArtifactWriter::from_artifacts_dir(artifacts_dir.join("run"))
+        .expect("create artifact writer");
+
+    record_observed_denials(&writer, None, std::process::id(), Duration::from_secs(1))
+        .expect("record denials");
+
+    let audit_path = writer.audit_ndjson_path();
+    let contents = fs::read_to_string(&audit_path).unwrap_or_default();
+    assert!(
+        !contents.contains("PermissionBlocked"),
+        "no denial occurred, so nothing may be recorded: {contents}"
+    );
+}
