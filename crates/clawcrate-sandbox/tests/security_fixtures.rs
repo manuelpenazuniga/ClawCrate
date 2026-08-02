@@ -633,6 +633,11 @@ impl LinuxEnforcer for SeccompOnlyEnforcer {
 fn fixture_linux_seccomp_records_the_syscall_it_denied() {
     // The point of the exercise: the child must be refused exactly as before,
     // AND the refusal must be recoverable, or `audit.ndjson` cannot report it.
+    // Driven through the interpreter rather than a shell: the shell would have
+    // to fork to reach an external `chroot`, and RLIMIT_NPROC is per-UID, so on
+    // a busy CI runner the fork fails and the syscall is never attempted.
+    let python3 = require_python3_for_linux_fixtures();
+
     let workspace = TempPathGuard::new("clawcrate_fixture_notify_workspace");
     fs::create_dir_all(workspace.path()).expect("create temporary workspace");
     let fixtures = fixture_paths();
@@ -640,11 +645,12 @@ fn fixture_linux_seccomp_records_the_syscall_it_denied() {
     let mut plan = fixture_plan(
         &fixtures,
         vec![
-            "/bin/sh".to_string(),
+            python3.to_string(),
             "-c".to_string(),
-            // `chroot(2)` is not in the allowlist under any profile, and the
-            // shell reports the errno without needing an interpreter present.
-            "chroot / 2>&1; echo done".to_string(),
+            // `chroot(2)` is in no profile's allowlist. seccomp intercepts
+            // before the kernel's own permission check, so the attempt is
+            // recorded whether or not the caller could ever have succeeded.
+            "import os\ntry:\n    os.chroot('/')\nexcept OSError as error:\n    print('denied', error.errno)\nprint('done')".to_string(),
         ],
         NetLevel::None,
     );
@@ -677,7 +683,7 @@ fn fixture_linux_seccomp_records_the_syscall_it_denied() {
     assert_eq!(dropped, 0, "nothing should have been dropped");
     assert!(
         !denials.is_empty(),
-        "a sandboxed shell attempting chroot must leave a record; stdout={:?} stderr={:?}",
+        "a sandboxed process attempting chroot must leave a record; stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -692,7 +698,9 @@ fn fixture_linux_seccomp_records_the_syscall_it_denied() {
     // product.
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("done"),
-        "the shell should survive a denied syscall"
+        "the process should survive a denied syscall; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

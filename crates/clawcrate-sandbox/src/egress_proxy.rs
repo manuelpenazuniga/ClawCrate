@@ -762,52 +762,6 @@ mod tests {
     }
 
     #[test]
-    fn allowed_connections_record_no_denial() {
-        // Guards against the inverse failure: a denial log that fires on
-        // traffic the profile permits would fabricate audit evidence.
-        let _guard = proxy_network_test_lock();
-        let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
-        let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
-        let upstream_thread = thread::spawn(move || {
-            if let Ok((stream, _)) = upstream_listener.accept() {
-                let _ = stream.shutdown(Shutdown::Both);
-            }
-        });
-
-        let proxy = start_egress_proxy(EgressProxyConfig {
-            allowed_domains: vec!["localhost".to_string()],
-            enforce_sni: false,
-            max_active_handlers: MAX_ACTIVE_PROXY_HANDLERS,
-        })
-        .expect("start proxy");
-
-        let mut stream =
-            std::net::TcpStream::connect(proxy.addr()).expect("connect to local egress proxy");
-        write!(
-            stream,
-            "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
-            upstream_addr.port(),
-            upstream_addr.port()
-        )
-        .expect("write connect request");
-        let response = read_http_response_header_with_timeout(&mut stream, Duration::from_secs(3));
-        assert!(
-            response.contains("200"),
-            "expected the allowed CONNECT to succeed: {response}"
-        );
-
-        let (denials, dropped) = proxy.drain_denials();
-        assert!(
-            denials.is_empty(),
-            "an allowed connection must not be recorded as blocked: {denials:?}"
-        );
-        assert_eq!(dropped, 0);
-
-        proxy.shutdown();
-        let _ = upstream_thread.join();
-    }
-
-    #[test]
     fn denial_log_is_bounded_and_counts_what_it_drops() {
         let log = EgressDenialLog::default();
         let overflow = 5usize;
@@ -878,6 +832,19 @@ mod tests {
             response.contains("200 Connection Established"),
             "unexpected CONNECT response: {response}"
         );
+
+        // The inverse of the denial test: a proxy that recorded permitted
+        // traffic would fabricate audit evidence, which is worse than recording
+        // none at all. Asserted here, on the case that already drives an allowed
+        // CONNECT against a correctly behaved upstream, rather than in a second
+        // test with its own stub to race against.
+        let (denials, dropped) = proxy.drain_denials();
+        assert!(
+            denials.is_empty(),
+            "an allowed connection must not be recorded as blocked: {denials:?}"
+        );
+        assert_eq!(dropped, 0);
+
         let _ = stream.shutdown(std::net::Shutdown::Write);
         upstream_thread.join().expect("join upstream thread");
         proxy.shutdown();
