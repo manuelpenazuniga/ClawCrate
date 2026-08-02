@@ -6,10 +6,19 @@ usage() {
 Usage:
   bash scripts/release.sh package --target <target-triple> --binary <binary-path> [--dist-dir <dir>]
   bash scripts/release.sh checksums [--dist-dir <dir>]
+  bash scripts/release.sh attach-local --tag <tag> --target <target-triple> [--dist-dir <dir>]
 
 Commands:
-  package    Create clawcrate-<target>.tar.gz from a built binary.
-  checksums  Generate SHA256SUMS for all clawcrate-*.tar.gz files in the dist dir.
+  package       Create clawcrate-<target>.tar.gz from a built binary.
+  checksums     Generate SHA256SUMS for all clawcrate-*.tar.gz files in the dist dir.
+  attach-local  Build a target here, then upload it to an existing release and
+                merge its line into the published SHA256SUMS.
+
+`attach-local` exists because the installer requires a checksum entry and
+refuses to install without one. Uploading an asset without updating SHA256SUMS
+therefore does not produce an unverified install; it produces no install at all
+for that platform. Doing both in one command is what keeps the manual step from
+being left half-done.
 EOF
 }
 
@@ -135,6 +144,77 @@ checksums_cmd() {
   echo "generated: $dist_dir/SHA256SUMS"
 }
 
+attach_local_cmd() {
+  local tag="" target="" dist_dir="dist"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tag)
+        tag="${2:-}"
+        shift 2
+        ;;
+      --target)
+        target="${2:-}"
+        shift 2
+        ;;
+      --dist-dir)
+        dist_dir="${2:-}"
+        shift 2
+        ;;
+      *)
+        echo "error: unknown argument for attach-local: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -z "$tag" || -z "$target" ]]; then
+    echo "error: attach-local requires --tag and --target" >&2
+    usage >&2
+    exit 1
+  fi
+  need_cmd cargo
+  need_cmd gh
+
+  local archive="clawcrate-${target}.tar.gz"
+
+  echo "==> Building $target"
+  cargo build --locked --release -p clawcrate-cli --target "$target"
+
+  echo "==> Packaging $archive"
+  package_cmd --target "$target" \
+    --binary "target/${target}/release/clawcrate" \
+    --dist-dir "$dist_dir"
+
+  local checksum
+  checksum="$(sha256_file "$dist_dir/$archive")"
+  echo "==> sha256($archive) = $checksum"
+
+  # Merge rather than regenerate: the published file covers the artifacts the
+  # hosted runners built, which are not present here. Regenerating from this
+  # machine's dist directory would silently drop every other platform's line
+  # and break their installs instead of fixing this one.
+  local published="$dist_dir/SHA256SUMS.published"
+  echo "==> Fetching published SHA256SUMS for $tag"
+  gh release download "$tag" --pattern SHA256SUMS --output "$published" --clobber
+
+  # Same-name lines are replaced, so re-running after a rebuild corrects the
+  # entry instead of leaving two contradictory ones.
+  local merged="$dist_dir/SHA256SUMS"
+  grep -v "  ${archive}\$" "$published" > "$merged" || true
+  printf '%s  %s\n' "$checksum" "$archive" >> "$merged"
+  LC_ALL=C sort -k2 -o "$merged" "$merged"
+  rm -f "$published"
+
+  echo "==> Uploading $archive and the merged SHA256SUMS"
+  gh release upload "$tag" "$dist_dir/$archive" "$merged" --clobber
+
+  echo ""
+  echo "Attached $archive to $tag and merged its checksum."
+  echo "Verify from a clean machine before announcing:"
+  echo "  curl -fsSL https://github.com/manuelpenazuniga/ClawCrate/releases/download/$tag/install.sh | bash"
+}
+
 main() {
   if [[ $# -lt 1 ]]; then
     usage
@@ -154,6 +234,9 @@ main() {
       ;;
     checksums)
       checksums_cmd "$@"
+      ;;
+    attach-local)
+      attach_local_cmd "$@"
       ;;
     -h|--help)
       usage
