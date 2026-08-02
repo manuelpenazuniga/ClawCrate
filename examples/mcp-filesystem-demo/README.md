@@ -45,7 +45,10 @@ reorders output.
 `workspace/.env` is **never in the sandbox**. Replica Mode filters it out before
 the server starts, so there is nothing to read. This is deterministic: it
 depends on what ClawCrate copied, not on catching an access in the act. The
-`ReplicaCreated` event in `audit.ndjson` lists exactly what was withheld.
+`ReplicaCreated` event in `audit.ndjson` records the exclusion rules that were
+applied — the policy, not an inventory of files actually skipped. The evidence
+that the policy took effect is the server's own `list_directory` reply, where
+`.env` is absent.
 
 `secret-vault/` is **blocked by the kernel**. The live run hands that directory
 to the server as one of its own allowed roots, so the server's policy permits

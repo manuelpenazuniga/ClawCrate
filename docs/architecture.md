@@ -127,14 +127,29 @@ is a property of the operating systems rather than of the implementation:
 
 | Denial | Linux | macOS |
 | --- | --- | --- |
-| Outbound connection refused by the egress proxy (`network: filtered`) | Recorded, complete | Recorded, complete |
+| Outbound connection refused by the egress proxy (`network: filtered`) | Recorded | Recorded |
+| Syscall refused by the sandbox | Recorded | n/a |
 | Filesystem read/write refused by the sandbox | **Not recorded** | Recorded, opt-in, **best-effort** |
-| Syscall refused by the sandbox | **Not recorded** | n/a |
+
+No row is *complete*, and the word is avoided deliberately. Every record here
+collapses repeated attempts into one entry and holds at most 256 distinct ones,
+past which it counts what it dropped and writes that count to the trail. Syscall
+capture additionally depends on the notification listener being established: if
+it cannot be, the filter falls back to returning `EPERM` from the kernel, which
+denies exactly as before and records nothing. What the first two rows do
+guarantee is that an entry is **exact** — the resource and reason describe a
+refusal ClawCrate itself issued, not one inferred from an error.
 
 The egress proxy is ClawCrate's own code, so a refusal is recorded exactly, on
 both platforms, at no extra cost. It carries the refused `host:port` and whether
 the host missed the allowlist or the TLS SNI disagreed with the CONNECT target.
-This is the only denial record that is complete.
+
+Linux syscall denials are exact for the same reason. The seccomp filter notifies
+ClawCrate instead of returning `EPERM` from the kernel, so a supervisor thread
+records the attempt and then returns that same `EPERM` itself. The child cannot
+tell the two modes apart. The decision reads the syscall number — an immutable
+scalar in the notification — so it carries none of the TOCTOU hazard that makes
+user notification unsuitable for path-based policy.
 
 macOS denials are recovered from the unified log, where the kernel writes a
 message per sandbox denial. Querying it costs roughly a second per run, so
@@ -158,13 +173,12 @@ querying later does not help, because the message is never written at all.
 The practical consequence: a `PermissionBlocked` entry is evidence that a denial
 happened, but its absence is not evidence that none did.
 
-Linux records neither filesystem nor syscall denials, and this is deliberate.
+Linux filesystem denials are still not recorded, and this is deliberate.
 Landlock surfaces a refusal to the child as `EACCES` and nowhere else; its
-kernel audit records need `CAP_AUDIT_READ` and a 6.15+ kernel. The seccomp
-filter returns `EPERM` rather than killing the process, which keeps a missing
-syscall diagnosable but means nothing reaches the parent. Recording these would
-require giving up one of those two properties, which is not a trade ClawCrate
-makes to improve its own reporting.
+kernel audit records need `CAP_AUDIT_READ` and a 6.15+ kernel, which an
+unprivileged tool cannot require. Recording them would mean giving up a property
+the sandbox has on purpose, which is not a trade ClawCrate makes to improve its
+own reporting.
 
 Both denial records are bounded. Past the limit, records are counted rather than
 stored, and the count is written to `audit.ndjson` as a

@@ -157,7 +157,8 @@ LIVE_OUTPUT=$({
   # Keep stdin open while the server starts and answers. Node startup plus
   # Replica materialization can take a while on a cold or loaded machine.
   sleep "${CLAWCRATE_DEMO_WAIT_SECONDS:-8}"
-} | (cd "$WORKSPACE" && "$CLAWCRATE_BIN" mcp wrap --profile mcp-readonly -- \
+} | (cd "$WORKSPACE" && CLAWCRATE_AUDIT_HASHCHAIN=1 \
+      "$CLAWCRATE_BIN" mcp wrap --profile mcp-readonly -- \
       node "$SERVER_ENTRYPOINT" . "$VAULT") 2>"$SERVER_STDERR" | python3 -c '
 import sys, json
 
@@ -316,7 +317,7 @@ except OSError as error:
     print(f"  could not read the audit trail: {error}")
     raise SystemExit(0)
 
-print(f"  excluded from the Replica -> {', '.join(excluded) if excluded else '(none)'}")
+print(f"  Replica exclusion rules  -> {', '.join(excluded) if excluded else '(none)'}")
 if blocked:
     for resource, reason in blocked:
         print(f"  PermissionBlocked        -> {resource}  ({reason})")
