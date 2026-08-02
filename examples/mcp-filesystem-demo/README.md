@@ -62,15 +62,23 @@ the operating system is willing to *report* differs:
 
 | Denial | Linux | macOS |
 | --- | --- | --- |
-| Outbound connection refused by the egress proxy | recorded, complete | recorded, complete |
-| Syscall refused by the sandbox | recorded, complete | n/a |
+| Outbound connection refused by the egress proxy | recorded | recorded |
+| Syscall refused by the sandbox | recorded | n/a |
 | File read refused by the sandbox | **not recorded** | recorded, best-effort |
 
-The two complete rows are decisions ClawCrate makes itself, so it records them
-before returning the refusal. File denials are the kernel's own: Landlock tells
-the child `EACCES` and nobody else, and macOS drops some of its sandbox reports.
-Set `CLAWCRATE_SEATBELT_VIOLATIONS=1` to collect the macOS ones. See
-[`docs/architecture.md`](../../docs/architecture.md#recorded-denials).
+The first two rows are decisions ClawCrate makes itself, so it records them
+before returning the refusal — but "recorded" is not "every occurrence". Both
+records collapse repeats, so a syscall denied a thousand times in a loop appears
+once; both are capped at 256 distinct entries, past which the run reports how
+many it dropped rather than growing without limit; and if the syscall
+notification cannot be set up at all, the run falls back to plain kernel `EPERM`
+and records nothing. The count of dropped entries is itself written to the
+trail, so a truncated record says so instead of reading as complete.
+
+File denials are the kernel's own, and neither platform reports them reliably:
+Landlock tells the child `EACCES` and nobody else, and macOS drops some of its
+sandbox reports. Set `CLAWCRATE_SEATBELT_VIOLATIONS=1` to collect the macOS
+ones. See [`docs/architecture.md`](../../docs/architecture.md#recorded-denials).
 
 ## Prerequisites
 

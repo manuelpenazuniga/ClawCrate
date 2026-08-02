@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import pty
+import re
 import select
 import shlex
 import sys
@@ -104,10 +105,20 @@ def redact(data: str, home: str, repo: str) -> str:
     output is added, removed or reordered, and the paths it replaces are exactly
     the two the recorder already knows.
     """
-    if repo:
-        data = data.replace(repo, "/path/to/ClawCrate")
-    if home:
-        data = data.replace(home, "~")
+    # A degenerate root (`HOME=/`, which `rstrip` turns into the empty string)
+    # would make `str.replace` match between every character and shred the
+    # recording. Refusing to substitute leaves real paths in a cast that would
+    # then fail its own no-leak test, which is the safe way round.
+    for needle, replacement in ((repo, "/path/to/ClawCrate"), (home, "~")):
+        if len(needle) <= 1:
+            continue
+        # Replace only whole path segments, so a home of `/home/ana` does not
+        # rewrite `/home/anabel` into `~bel`.
+        data = re.sub(
+            re.escape(needle) + r"(?=$|[^A-Za-z0-9._-])",
+            replacement.replace("\\", "\\\\"),
+            data,
+        )
     return data
 
 

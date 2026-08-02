@@ -139,22 +139,33 @@ echo ""
 echo "Driving the sandboxed server over JSON-RPC..."
 echo ""
 
-{
+# Kept rather than discarded: the failure lines tell the reader to consult
+# stderr, so throwing it away would leave them with nothing to consult.
+SERVER_STDERR=$(mktemp -t clawcrate-demo-stderr)
+trap 'rm -f "$SERVER_STDERR"' EXIT
+
+LIVE_OUTPUT=$({
   printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"clawcrate-demo","version":"0"}}}'
   printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
   printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_directory","arguments":{"path":"."}}}'
   printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_text_file","arguments":{"path":"README.md"}}}'
   printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_text_file","arguments":{"path":".env"}}}'
-  printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"read_text_file\",\"arguments\":{\"path\":\"$VAULT/api-key.txt\"}}}"
+  # Encoded rather than interpolated: a checkout path containing a quote or a
+  # backslash would otherwise emit invalid JSON, and the request would be
+  # silently dropped instead of answered.
+  python3 -c 'import json, sys; print(json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "read_text_file", "arguments": {"path": sys.argv[1]}}}))' "$VAULT/api-key.txt"
   # Keep stdin open while the server starts and answers. Node startup plus
   # Replica materialization can take a while on a cold or loaded machine.
   sleep "${CLAWCRATE_DEMO_WAIT_SECONDS:-8}"
 } | (cd "$WORKSPACE" && "$CLAWCRATE_BIN" mcp wrap --profile mcp-readonly -- \
-      node "$SERVER_ENTRYPOINT" . "$VAULT") 2>/dev/null | python3 -c '
+      node "$SERVER_ENTRYPOINT" . "$VAULT") 2>"$SERVER_STDERR" | python3 -c '
 import sys, json
 
 SECRET_MARKER = "API_TOKEN"
 SECRET_MARKER_VAULT = "planted-secret-do-not-exfiltrate"
+# What a kernel refusal looks like coming back through the server: EPERM on
+# macOS Seatbelt, EACCES on Linux Landlock.
+KERNEL_REFUSALS = ("EPERM", "EACCES", "operation not permitted", "permission denied")
 # Replies arrive as each call finishes, which is not the order that reads as a
 # story. Collected by request id and printed in order once the server is done.
 lines = {}
@@ -211,11 +222,17 @@ for line in sys.stdin:
             lines[4] = f"  read .env          -> UNEXPECTED ({text.strip()[:40]!r})"
     elif request_id == 5:
         # The server was handed this directory as one of its own allowed roots,
-        # so its policy permits the read. Anything that stops it is the sandbox.
+        # so its policy permits the read. But "the read failed" is not the same
+        # claim as "the sandbox refused it": a missing file, a mode bit or the
+        # server changing its mind would also fail, and calling any of those an
+        # enforcement result would be inventing evidence. Only a kernel refusal
+        # counts, and it has to say so.
         if text is None:
             lines[5] = "  read secret-vault  -> UNKNOWN (malformed response)"
-        elif is_error:
+        elif is_error and any(marker in text for marker in KERNEL_REFUSALS):
             lines[5] = f"  read secret-vault  -> blocked by the sandbox ({text.strip()[:40]})"
+        elif is_error:
+            lines[5] = f"  read secret-vault  -> FAILED, but not by the sandbox ({text.strip()[:40]})"
         elif SECRET_MARKER_VAULT in text:
             lines[5] = f"  read secret-vault  -> LEAKED ({text.strip()[:40]!r})"
         else:
@@ -234,7 +251,14 @@ for request_id in (2, 3, 4, 5):
             f"  {labels[request_id]:<18} -> NO RESPONSE (the server did not reply; see stderr)",
         )
     )
-'
+')
+printf '%s\n' "$LIVE_OUTPUT"
+
+if grep -q "NO RESPONSE" <<<"$LIVE_OUTPUT" 2>/dev/null; then
+  echo ""
+  echo "Server diagnostics (stderr):"
+  sed 's/^/  /' "$SERVER_STDERR" | head -20
+fi
 
 cat <<'LIVE_NOTE'
 
@@ -257,6 +281,10 @@ LIVE_NOTE
 # ---------------------------------------------------------------------------
 
 RUN_DIR=$(ls -td "$HOME"/.clawcrate/runs/*/ 2>/dev/null | head -1)
+if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR" ]]; then
+  echo "No run directory found under ~/.clawcrate/runs — the wrapped server did not start." >&2
+  exit 1
+fi
 RUN_ID=$(basename "${RUN_DIR%/}")
 
 echo "Audit trail for run $RUN_ID:"
@@ -301,20 +329,31 @@ cat <<'COVERAGE'
   What lands in `audit.ndjson` differs by platform, and the difference is a
   property of the operating systems rather than of ClawCrate:
 
-    - Refused outbound connections are recorded exactly, on both platforms.
-    - Refused syscalls are recorded exactly on Linux.
-    - Refused file reads are recorded on macOS best-effort — the kernel drops
-      some reports — and not at all on Linux, where Landlock tells the child
-      `EACCES` and nobody else.
+    - Refused outbound connections and refused syscalls are ClawCrate's own
+      decisions, so they are recorded before the refusal is returned. Repeats
+      collapse into one entry and the record is capped, with the number of
+      dropped entries written to the trail rather than left implicit.
+    - Refused file reads are the kernel's own. macOS reports them best-effort —
+      it drops some — and Linux does not report them at all, because Landlock
+      tells the child `EACCES` and nobody else. So on Linux the block above is
+      real but leaves no entry here, by design.
 
-  So an entry proves a denial happened. Its absence does not prove none did.
-  The block itself is not in question either way: the read failed every time.
+  An entry proves a denial happened. Its absence does not prove none did. The
+  block itself is not in question either way: the read failed every time.
 
 COVERAGE
 
 echo "Verifying the audit chain..."
 echo ""
-CLAWCRATE_AUDIT_HASHCHAIN=1 "$CLAWCRATE_BIN" verify "$RUN_ID" || true
+# Not swallowed. A demo whose whole point is tamper-evident evidence must not
+# report success when verification failed; the exit status is carried out to the
+# caller so a wrapper or CI job sees it too.
+VERIFY_STATUS=0
+CLAWCRATE_AUDIT_HASHCHAIN=1 "$CLAWCRATE_BIN" verify "$RUN_ID" || VERIFY_STATUS=$?
+if [[ "$VERIFY_STATUS" -ne 0 ]]; then
+  echo ""
+  echo "Audit chain verification FAILED (exit $VERIFY_STATUS)." >&2
+fi
 
 cat <<'LIVE_NOTE'
 
@@ -323,3 +362,5 @@ Inspect the run yourself:
   RUN=$(ls -t ~/.clawcrate/runs/ | head -1)
   cat ~/.clawcrate/runs/"$RUN"/audit.ndjson
 LIVE_NOTE
+
+exit "$VERIFY_STATUS"
