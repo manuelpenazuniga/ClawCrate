@@ -28,6 +28,7 @@ pub mod egress_proxy;
 pub mod env_scrub;
 pub mod fs_clone;
 pub mod linux;
+pub mod linux_notify;
 pub mod linux_probe;
 #[cfg(target_os = "macos")]
 pub mod macos_probe;
