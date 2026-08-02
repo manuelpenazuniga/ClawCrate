@@ -1,4 +1,6 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
+use nix::libc;
 use std::fs;
 use std::io;
 #[cfg(target_os = "linux")]
@@ -14,6 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::Utc;
 #[cfg(target_os = "macos")]
 use clawcrate_sandbox::darwin::DarwinSandbox;
+#[cfg(target_os = "linux")]
+use clawcrate_sandbox::linux::KernelEnforcer;
 use clawcrate_sandbox::linux::{
     EnforcementStep, LinuxEnforcer, LinuxSandbox, LinuxSandboxError, PreparedLinuxSandbox,
 };
@@ -105,8 +109,8 @@ impl LinuxEnforcer for RejectRlimitEnforcer {
         &self,
         _command: &mut Command,
         _prepared: &PreparedLinuxSandbox,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
+    ) -> Result<Option<std::os::fd::OwnedFd>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
     }
 }
 
@@ -559,11 +563,11 @@ fn fixture_linux_seccomp_denies_socket_when_network_is_none() {
         ],
     );
 
-    let output = sandbox
-        .launch(&prepared)
-        .expect("launch fixture command")
-        .wait_with_output()
-        .expect("wait for fixture command");
+    let child = sandbox.launch(&prepared).expect("launch fixture command");
+    // Taken before `wait_with_output` consumes the child; the supervisor is
+    // joined during that call, so draining afterwards sees a complete record.
+    let denial_log = child.denied_syscall_log();
+    let output = child.wait_with_output().expect("wait for fixture command");
 
     assert!(
         !output.status.success(),
@@ -573,6 +577,130 @@ fn fixture_linux_seccomp_denies_socket_when_network_is_none() {
     assert!(
         stderr.contains("Operation not permitted") || stderr.contains("PermissionError"),
         "unexpected seccomp deny stderr: {stderr}"
+    );
+
+    // Enforcement alone is not the whole job: the refusal has to be reportable,
+    // or `audit.ndjson` cannot say what the sandbox stopped.
+    let log = denial_log.expect("seccomp notification supervisor should be running");
+    let (denials, dropped) = log.drain();
+    assert_eq!(dropped, 0, "nothing should have been dropped");
+    assert!(
+        denials
+            .iter()
+            .any(|denial| denial.nr as i64 == libc::SYS_socket),
+        "the refused socket syscall should have been recorded, got {denials:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+/// Applies the real syscall filter while skipping Landlock.
+///
+/// Seccomp user notification needs only Linux 5.0, but Landlock needs a kernel
+/// built with it, and ClawCrate fails closed when it is missing. Isolating the
+/// two lets the notification path be tested wherever it actually works instead
+/// of only where both happen to be present.
+struct SeccompOnlyEnforcer;
+
+#[cfg(target_os = "linux")]
+impl LinuxEnforcer for SeccompOnlyEnforcer {
+    fn apply_rlimits(
+        &self,
+        command: &mut Command,
+        limits: &clawcrate_types::ResourceLimits,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        KernelEnforcer.apply_rlimits(command, limits)
+    }
+
+    fn apply_landlock(
+        &self,
+        _command: &mut Command,
+        _prepared: &PreparedLinuxSandbox,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    fn apply_seccomp(
+        &self,
+        command: &mut Command,
+        prepared: &PreparedLinuxSandbox,
+    ) -> Result<Option<std::os::fd::OwnedFd>, Box<dyn std::error::Error + Send + Sync>> {
+        KernelEnforcer.apply_seccomp(command, prepared)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_linux_seccomp_records_the_syscall_it_denied() {
+    // The point of the exercise: the child must be refused exactly as before,
+    // AND the refusal must be recoverable, or `audit.ndjson` cannot report it.
+    // Driven through the interpreter rather than a shell: the shell would have
+    // to fork to reach an external `chroot`, and RLIMIT_NPROC is per-UID, so on
+    // a busy CI runner the fork fails and the syscall is never attempted.
+    let python3 = require_python3_for_linux_fixtures();
+
+    let workspace = TempPathGuard::new("clawcrate_fixture_notify_workspace");
+    fs::create_dir_all(workspace.path()).expect("create temporary workspace");
+    let fixtures = fixture_paths();
+
+    let mut plan = fixture_plan(
+        &fixtures,
+        vec![
+            python3.to_string(),
+            "-c".to_string(),
+            // `chroot(2)` is in no profile's allowlist. seccomp intercepts
+            // before the kernel's own permission check, so the attempt is
+            // recorded whether or not the caller could ever have succeeded.
+            "import os\ntry:\n    os.chroot('/')\nexcept OSError as error:\n    print('denied', error.errno)\nprint('done')".to_string(),
+        ],
+        NetLevel::None,
+    );
+    plan.cwd = workspace.path().to_path_buf();
+    plan.profile.fs_read = vec![workspace.path().to_path_buf()];
+    plan.profile.fs_write = vec![workspace.path().to_path_buf()];
+
+    let sandbox = LinuxSandbox::new_with_enforcer(Arc::new(SeccompOnlyEnforcer));
+    let prepared = sandbox.prepare_with_env(
+        &plan,
+        vec![
+            (
+                "HOME".to_string(),
+                fixtures.home_root.to_string_lossy().to_string(),
+            ),
+            (
+                "PATH".to_string(),
+                "/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            ),
+        ],
+    );
+
+    let child = sandbox.launch(&prepared).expect("launch fixture command");
+    let denial_log = child
+        .denied_syscall_log()
+        .expect("the notification supervisor should be running");
+    let output = child.wait_with_output().expect("wait for fixture command");
+
+    let (denials, dropped) = denial_log.drain();
+    assert_eq!(dropped, 0, "nothing should have been dropped");
+    assert!(
+        !denials.is_empty(),
+        "a sandboxed process attempting chroot must leave a record; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        denials
+            .iter()
+            .any(|denial| denial.nr as i64 == libc::SYS_chroot),
+        "the refused chroot should be among the records, got {denials:?}"
+    );
+    // The child keeps running afterwards: the supervisor returns an error, it
+    // does not kill. A denial that terminated the process would be a different
+    // product.
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("done"),
+        "the process should survive a denied syscall; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

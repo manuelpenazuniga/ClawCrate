@@ -14,7 +14,8 @@ use clawcrate_types::{ExecutionPlan, NetLevel, ResourceLimits};
 use nix::{errno::Errno, libc};
 #[cfg(target_os = "linux")]
 use seccompiler::{
-    BpfProgram, Error as SeccompApplyError, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
+    BpfProgram, Error as SeccompApplyError, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
+    SeccompCondition, SeccompFilter, SeccompRule, TargetArch,
 };
 #[cfg(target_os = "linux")]
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,7 +24,9 @@ use std::convert::TryInto;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd};
+// `OwnedFd` appears in the enforcer trait, which is compiled on every platform.
+use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use thiserror::Error;
@@ -240,6 +243,14 @@ fn landlock_access_for_path_type(access_mask: u64, is_dir: bool) -> u64 {
 #[derive(Debug)]
 struct LinuxSeccompContext {
     program: BpfProgram,
+    /// The child's end of the listener handover channel, when the filter was
+    /// rewritten to notify. `None` means the plain `EPERM` filter, which denies
+    /// exactly the same syscalls but records nothing.
+    listener_channel_child: Option<OwnedFd>,
+    /// The same program in the kernel's own layout, materialized here in the
+    /// parent because the child half runs post-fork, where allocating is not
+    /// async-signal-safe.
+    notify_program: Vec<libc::sock_filter>,
 }
 
 #[cfg(target_os = "linux")]
@@ -508,21 +519,127 @@ fn prepare_linux_seccomp_context(
             format!("unsupported seccomp target architecture: {source}"),
         )
     })?;
+    // The handover channel is created before the filter, because the filter has
+    // to name it: the child sends the listener over this socket *after* the
+    // filter is live, so that one `sendmsg` must be permitted or the child traps
+    // on the very call that would summon its supervisor.
+    let handover = crate::linux_notify::runtime::listener_channel().ok();
+
+    let mut rules = build_linux_seccomp_rules(&prepared.net);
+    if let Some(channel) = handover.as_ref() {
+        allow_listener_handover_sendmsg(&mut rules, channel.child.as_raw_fd());
+    }
+
     // Deny-by-default: syscalls in the rule set are allowed, everything else
     // returns EPERM. `EPERM` rather than `KillProcess` keeps a missing syscall
     // diagnosable — the program reports a permission error instead of dying
     // without explanation.
     let filter = SeccompFilter::new(
-        build_linux_seccomp_rules(&prepared.net),
+        rules,
         SeccompAction::Errno(libc::EPERM as u32),
         SeccompAction::Allow,
         target_arch,
     )
     .map_err(|source| io::Error::other(format!("failed to build seccomp filter: {source}")))?;
-    let program: BpfProgram = filter.try_into().map_err(|source| {
+    let mut program: BpfProgram = filter.try_into().map_err(|source| {
         io::Error::other(format!("failed to compile seccomp filter: {source}"))
     })?;
-    Ok(LinuxSeccompContext { program })
+
+    // Retarget the mismatch return so ClawCrate adjudicates the denial itself
+    // and can record it. Enforcement is unchanged: the supervisor returns the
+    // same `EPERM` this filter would have. Any failure here leaves the plain
+    // filter in place, because a missing record is better than a stalled child.
+    let listener_channel_child = handover.and_then(|channel| {
+        let rewritten = rewrite_seccomp_mismatch_to_notify(&mut program);
+        if rewritten == 0 {
+            // The filter denies some other way than the mismatch action this
+            // code expects. Supervising notifications that will never arrive
+            // would leave the child unattended, so stay on the plain filter.
+            return None;
+        }
+        LISTENER_CHANNEL_PARENT.with(|slot| slot.borrow_mut().replace(channel.parent));
+        Some(channel.child)
+    });
+
+    let notify_program = if listener_channel_child.is_some() {
+        program
+            .iter()
+            .map(|instruction| libc::sock_filter {
+                code: instruction.code,
+                jt: instruction.jt,
+                jf: instruction.jf,
+                k: instruction.k,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(LinuxSeccompContext {
+        program,
+        listener_channel_child,
+        notify_program,
+    })
+}
+
+/// Retargets the filter's `EPERM` returns to user notification, reporting how
+/// many were changed so the caller can refuse to supervise a filter that will
+/// never notify.
+#[cfg(target_os = "linux")]
+fn rewrite_seccomp_mismatch_to_notify(program: &mut BpfProgram) -> usize {
+    let mut rewritten = 0usize;
+    for instruction in program.iter_mut() {
+        if let Some(replacement) = crate::linux_notify::user_notif_replacement(
+            instruction.code,
+            instruction.k,
+            libc::EPERM as u32,
+        ) {
+            instruction.k = replacement;
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
+/// Permits the single `sendmsg` that hands the listener to the supervisor.
+///
+/// `sendmsg` is otherwise granted only when the profile allows network access,
+/// which is exactly the case the sandbox is most careful about — and also the
+/// case where a blanket allow would be a hole. So it is granted on one file
+/// descriptor: the child's end of the handover channel, whose number is known
+/// here because the socket is created before the filter is compiled.
+///
+/// Under `network: none` there is no way for the child to obtain a socket to
+/// put on that descriptor: `socket` and `socketpair` are not in the allowlist,
+/// so nothing connectable exists to redirect onto it.
+#[cfg(target_os = "linux")]
+fn allow_listener_handover_sendmsg(
+    rules: &mut BTreeMap<i64, Vec<SeccompRule>>,
+    handover_fd: std::os::fd::RawFd,
+) {
+    // An empty rule vector means "allow unconditionally"; if the profile
+    // already grants sendmsg outright, narrowing it here would be a regression.
+    if rules.get(&libc::SYS_sendmsg).is_some_and(Vec::is_empty) {
+        return;
+    }
+
+    let condition = SeccompCondition::new(
+        0,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        handover_fd as u64,
+    );
+    if let Ok(rule) = condition.and_then(|condition| SeccompRule::new(vec![condition])) {
+        rules.entry(libc::SYS_sendmsg).or_default().push(rule);
+    }
+}
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// Hand-off slot between building the filter and configuring `pre_exec`,
+    /// which run in the same call on the same thread.
+    static LISTENER_CHANNEL_PARENT: std::cell::RefCell<Option<OwnedFd>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(target_os = "linux")]
@@ -534,7 +651,44 @@ fn build_linux_seccomp_rules(net: &NetLevel) -> BTreeMap<i64, Vec<SeccompRule>> 
     for syscall in linux_seccomp_allowed_syscalls(net) {
         rules.insert(syscall, Vec::new());
     }
+    restrict_prctl_from_installing_filters(&mut rules);
     rules
+}
+
+/// Narrows `prctl` so the sandboxed process cannot install a seccomp filter.
+///
+/// A child-installed filter can only ever restrict further, so this is not an
+/// escape — but action precedence is not about restriction. `SECCOMP_RET_ERRNO`
+/// outranks `SECCOMP_RET_USER_NOTIF`, so a child that installs an `EPERM`
+/// filter of its own keeps being denied while ClawCrate stops being told: the
+/// syscalls vanish from the audit trail instead of appearing in it.
+///
+/// `prctl` stays available for everything else, because programs legitimately
+/// use it for thread names, dumpability and similar. Only the one operation
+/// that would blind the record is refused.
+#[cfg(target_os = "linux")]
+fn restrict_prctl_from_installing_filters(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
+    // BPF can compare scalar arguments, and `prctl`'s option is its first, so
+    // this is expressible in the filter itself rather than after the fact.
+    let condition = SeccompCondition::new(
+        0,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Ne,
+        libc::PR_SET_SECCOMP as u64,
+    );
+    let rule = condition.and_then(|condition| SeccompRule::new(vec![condition]));
+    match rule {
+        Ok(rule) => {
+            rules.insert(libc::SYS_prctl, vec![rule]);
+        }
+        Err(_) => {
+            // Expressing the condition failed, so the choice is between an
+            // unconditional allow and no `prctl` at all. Deny-by-default says
+            // remove it: a build that breaks is visible, a silenced audit trail
+            // is not.
+            rules.remove(&libc::SYS_prctl);
+        }
+    }
 }
 
 /// Syscalls a sandboxed process is allowed to make.
@@ -899,11 +1053,17 @@ pub trait LinuxEnforcer: Send + Sync {
         command: &mut Command,
         prepared: &PreparedLinuxSandbox,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Applies the syscall filter.
+    ///
+    /// Returns the supervisor's end of the listener handover channel when the
+    /// filter was built to notify rather than to return `EPERM` directly. The
+    /// caller must keep it until the child has been spawned; `None` means the
+    /// run uses the plain filter and produces no syscall denial records.
     fn apply_seccomp(
         &self,
         command: &mut Command,
         prepared: &PreparedLinuxSandbox,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Option<OwnedFd>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -941,15 +1101,17 @@ impl LinuxEnforcer for KernelEnforcer {
         &self,
         command: &mut Command,
         prepared: &PreparedLinuxSandbox,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<OwnedFd>, Box<dyn std::error::Error + Send + Sync>> {
         #[cfg(target_os = "linux")]
         {
             let context = prepare_linux_seccomp_context(prepared)?;
-            configure_linux_seccomp_pre_exec(command, context);
+            Ok(configure_linux_seccomp_pre_exec(command, context))
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = (command, prepared);
-        Ok(())
+        {
+            let _ = (command, prepared);
+            Ok(None)
+        }
     }
 }
 
@@ -1028,20 +1190,81 @@ impl LinuxSandbox {
         command.process_group(0);
         command.env_clear();
         command.envs(prepared.scrubbed_env.iter().cloned());
-        apply_enforcement_steps(self.enforcer.as_ref(), &mut command, prepared)?;
+        let listener_channel =
+            apply_enforcement_steps(self.enforcer.as_ref(), &mut command, prepared)?;
+
+        // Started before spawning: the child waits in its pre-exec hook to be
+        // acknowledged, and `spawn` does not return until the child execs, so
+        // supervising afterwards would deadlock the two against each other.
+        let notify_supervisor = start_seccomp_notify_supervisor(listener_channel);
 
         let child = command.spawn().map_err(LinuxSandboxError::Spawn)?;
-        Ok(LinuxSandboxedChild { child })
+
+        Ok(LinuxSandboxedChild {
+            child,
+            notify_supervisor,
+        })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn start_seccomp_notify_supervisor(
+    listener_channel: Option<OwnedFd>,
+) -> Option<crate::linux_notify::runtime::NotifySupervisor> {
+    let channel = listener_channel?;
+    crate::linux_notify::runtime::NotifySupervisor::start(channel).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_seccomp_notify_supervisor(listener_channel: Option<OwnedFd>) -> Option<()> {
+    let _ = listener_channel;
+    None
 }
 
 pub struct LinuxSandboxedChild {
     child: Child,
+    /// Answers notifications for as long as this handle lives, which is why it
+    /// is owned by the child rather than dropped at the end of `launch`.
+    #[cfg(target_os = "linux")]
+    notify_supervisor: Option<crate::linux_notify::runtime::NotifySupervisor>,
+    // Off Linux there is no supervisor to hold; the field exists so the struct
+    // has one shape and the launch path needs no platform branch.
+    #[cfg(not(target_os = "linux"))]
+    #[allow(dead_code)]
+    notify_supervisor: Option<()>,
 }
 
 impl LinuxSandboxedChild {
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Syscalls the supervisor refused, with the number of distinct records
+    /// dropped past the retention cap. Empty when the run used the plain
+    /// filter, which enforces identically but records nothing.
+    pub fn drain_denied_syscalls(&self) -> (Vec<crate::linux_notify::DeniedSyscall>, usize) {
+        self.denied_syscall_log()
+            .map(|log| log.drain())
+            .unwrap_or_default()
+    }
+
+    /// Handle onto the denial record that outlives this child.
+    ///
+    /// `wait_with_output` consumes the child, so a caller that needs both the
+    /// output and the denials takes this first. The supervisor is joined while
+    /// the child handle drops, which happens before `wait_with_output` returns,
+    /// so draining afterwards sees a complete record.
+    pub fn denied_syscall_log(&self) -> Option<crate::linux_notify::DeniedSyscallLog> {
+        #[cfg(target_os = "linux")]
+        {
+            self.notify_supervisor
+                .as_ref()
+                .map(|supervisor| supervisor.log())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     pub fn child_mut(&mut self) -> &mut Child {
@@ -1061,7 +1284,7 @@ pub(crate) fn apply_enforcement_steps(
     enforcer: &dyn LinuxEnforcer,
     command: &mut Command,
     prepared: &PreparedLinuxSandbox,
-) -> Result<(), LinuxSandboxError> {
+) -> Result<Option<OwnedFd>, LinuxSandboxError> {
     enforcer
         .apply_rlimits(command, &prepared.resource_limits)
         .map_err(|source| LinuxSandboxError::Enforcement {
@@ -1076,14 +1299,14 @@ pub(crate) fn apply_enforcement_steps(
             source,
         })?;
 
-    enforcer
+    let listener_channel = enforcer
         .apply_seccomp(command, prepared)
         .map_err(|source| LinuxSandboxError::Enforcement {
             step: EnforcementStep::Seccomp,
             source,
         })?;
 
-    Ok(())
+    Ok(listener_channel)
 }
 
 pub fn scrub_environment_for_profile(plan: &ExecutionPlan) -> (Vec<(String, String)>, Vec<String>) {
@@ -1266,7 +1489,11 @@ fn landlock_errno_to_io_error(
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn configure_linux_seccomp_pre_exec(command: &mut Command, context: LinuxSeccompContext) {
+fn configure_linux_seccomp_pre_exec(
+    command: &mut Command,
+    context: LinuxSeccompContext,
+) -> Option<OwnedFd> {
+    let supervisor_end = LISTENER_CHANNEL_PARENT.with(|slot| slot.borrow_mut().take());
     // SAFETY:
     // - The closure runs in the child post-fork/pre-exec.
     // - The seccomp BPF program is fully materialized in the parent process.
@@ -1274,6 +1501,7 @@ fn configure_linux_seccomp_pre_exec(command: &mut Command, context: LinuxSeccomp
     unsafe {
         command.pre_exec(move || apply_linux_seccomp_filter(&context));
     }
+    supervisor_end
 }
 
 #[cfg(target_os = "linux")]
@@ -1285,7 +1513,25 @@ fn apply_linux_seccomp_filter(context: &LinuxSeccompContext) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(Errno::last_raw()));
     }
 
-    seccompiler::apply_filter(context.program.as_slice()).map_err(seccomp_apply_error_as_io_error)
+    let Some(handover) = context.listener_channel_child.as_ref() else {
+        return seccompiler::apply_filter(context.program.as_slice())
+            .map_err(seccomp_apply_error_as_io_error);
+    };
+
+    // Install the notifying filter and hand the listener to the supervisor.
+    //
+    // Ordering is load-bearing: the filter is live from this point, so the
+    // `sendmsg` below is itself subject to it. `sendmsg` is allowlisted for
+    // exactly this reason — were it not, this call would block waiting for a
+    // supervisor that is still waiting for this very message.
+    let listener = crate::linux_notify::runtime::install_filter_with_listener(
+        context.notify_program.as_slice(),
+    )?;
+    let send_result =
+        crate::linux_notify::runtime::hand_over_listener(handover.as_raw_fd(), listener);
+    // SAFETY: `listener` was just returned by seccomp and is not used again.
+    unsafe { libc::close(listener) };
+    send_result
 }
 
 #[cfg(target_os = "linux")]
@@ -1309,6 +1555,7 @@ fn seccomp_apply_error_as_io_error(source: SeccompApplyError) -> io::Error {
 mod tests {
     #[cfg(target_os = "linux")]
     use std::fs;
+    use std::os::fd::OwnedFd;
     #[cfg(target_os = "linux")]
     use std::path::Path;
     use std::path::PathBuf;
@@ -1457,12 +1704,12 @@ mod tests {
             &self,
             _command: &mut Command,
             _prepared: &PreparedLinuxSandbox,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Option<OwnedFd>, Box<dyn std::error::Error + Send + Sync>> {
             self.calls
                 .lock()
                 .expect("lock calls")
                 .push(EnforcementStep::Seccomp);
-            Ok(())
+            Ok(None)
         }
     }
 
