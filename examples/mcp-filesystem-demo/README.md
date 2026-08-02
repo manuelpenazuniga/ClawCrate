@@ -24,6 +24,54 @@ A secret is also planted *outside* the workspace at
 [`secret-vault/api-key.txt`](secret-vault/api-key.txt); it is unreachable
 because it is neither copied into the Replica nor in the read allowlist.
 
+### Watch it
+
+[`demo.cast`](demo.cast) is a recording of `./demo.sh --live` on macOS:
+
+```bash
+asciinema play examples/mcp-filesystem-demo/demo.cast
+```
+
+It is a real capture, not a mock-up, produced by [`record.py`](record.py) —
+regenerate it and compare rather than take it on trust. The recorder shortens
+long waits (Node starting, the Replica materializing) and rewrites the recording
+machine's home and checkout paths to placeholders; it never adds, drops or
+reorders output.
+
+### Two defences, doing two different jobs
+
+`./demo.sh --live` exercises both, and the distinction is the point of the demo.
+
+`workspace/.env` is **never in the sandbox**. Replica Mode filters it out before
+the server starts, so there is nothing to read. This is deterministic: it
+depends on what ClawCrate copied, not on catching an access in the act. The
+`ReplicaCreated` event in `audit.ndjson` lists exactly what was withheld.
+
+`secret-vault/` is **blocked by the kernel**. The live run hands that directory
+to the server as one of its own allowed roots, so the server's policy permits
+the read and it goes ahead and tries — and the sandbox refuses it anyway. That
+separation matters: the block comes from ClawCrate, not from the server being
+well behaved. Without it the demo would only prove that a cooperative server
+cooperates.
+
+### What the audit trail can and cannot tell you
+
+An entry proves a denial happened; its absence does not prove none did. The
+enforcement is not in question either way — the read fails every time — but what
+the operating system is willing to *report* differs:
+
+| Denial | Linux | macOS |
+| --- | --- | --- |
+| Outbound connection refused by the egress proxy | recorded, complete | recorded, complete |
+| Syscall refused by the sandbox | recorded, complete | n/a |
+| File read refused by the sandbox | **not recorded** | recorded, best-effort |
+
+The two complete rows are decisions ClawCrate makes itself, so it records them
+before returning the refusal. File denials are the kernel's own: Landlock tells
+the child `EACCES` and nobody else, and macOS drops some of its sandbox reports.
+Set `CLAWCRATE_SEATBELT_VIOLATIONS=1` to collect the macOS ones. See
+[`docs/architecture.md`](../../docs/architecture.md#recorded-denials).
+
 ## Prerequisites
 
 | Requirement | Notes |
@@ -145,7 +193,9 @@ clawcrate verify "$(ls -t ~/.clawcrate/runs/ | head -1)"
 ```text
 examples/mcp-filesystem-demo/
 ├── README.md               # this file
-├── demo.sh                 # policy preview (clawcrate plan; no npm/network)
+├── demo.sh                 # policy preview, or the full story with --live
+├── record.py               # regenerates demo.cast from a real run
+├── demo.cast               # asciinema recording of ./demo.sh --live
 ├── launcher.sh             # canonical mcp wrap launcher for real MCP clients
 ├── workspace/              # the fixture directory exposed to the server
 │   ├── README.md, docs/notes.md, src/index.js   # benign, readable

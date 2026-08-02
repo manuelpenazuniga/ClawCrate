@@ -211,7 +211,7 @@ clawcrate mcp install --client cursor --server-name filesystem --profile mcp-rea
 clawcrate mcp uninstall --client cursor --server-name filesystem
 ```
 
-`mcp install` previews with `--dry-run`, always backs up the original config, and refuses to double-wrap. See the runnable demo at [`examples/mcp-filesystem-demo/`](examples/mcp-filesystem-demo/): normal reads work, secrets are unreachable, writes fail, env is scrubbed, network is blocked — all enforced by the kernel.
+`mcp install` previews with `--dry-run`, always backs up the original config, and refuses to double-wrap. See the runnable demo at [`examples/mcp-filesystem-demo/`](examples/mcp-filesystem-demo/): normal reads work, secrets are unreachable, writes fail, env is scrubbed, network is blocked — all enforced by the kernel. `./demo.sh --live` runs the real server end to end and shows two distinct defences: `.env` is filtered out before the server starts, while a secret the server *was* authorized to read is refused by the kernel anyway. It then verifies the run's audit chain. There is a [recording](examples/mcp-filesystem-demo/demo.cast) of exactly that.
 
 ## Audit Trail You Can Prove
 
