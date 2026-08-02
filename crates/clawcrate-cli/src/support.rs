@@ -9,6 +9,7 @@ use chrono::Utc;
 use clawcrate_audit::{ArtifactWriter, SqliteAuditIndex, DEFAULT_AUDIT_DB};
 use clawcrate_capture::FsChange;
 use clawcrate_sandbox::egress_proxy::{start_egress_proxy, EgressProxyConfig, EgressProxyHandle};
+use clawcrate_sandbox::linux_notify::DeniedSyscallLog;
 use clawcrate_types::{
     AuditEvent, AuditEventKind, ExecutionPlan, ExecutionResult, NetLevel, ResolvedProfile, Status,
 };
@@ -159,16 +160,43 @@ pub(crate) const DENIAL_OVERFLOW_RESOURCE: &str = "clawcrate://denial-record-ove
 ///   `CLAWCRATE_SEATBELT_VIOLATIONS=1` is set — best-effort only. The kernel
 ///   drops some denial reports, so an event proves a denial happened while its
 ///   absence proves nothing. See `clawcrate_sandbox::macos_violations`.
-/// * Linux reports neither filesystem nor syscall denials. Landlock surfaces
-///   them to the child as `EACCES` and nowhere else, and the seccomp filter
-///   deliberately returns `EPERM` instead of killing the process, so nothing
-///   reaches the parent. Recovering them would mean weakening one of the two.
+/// * Refused syscalls are reported on Linux, where the filter notifies ClawCrate
+///   rather than returning `EPERM` from the kernel, so the supervisor records
+///   the attempt before answering it.
+/// * Linux filesystem denials are still not reported. Landlock surfaces them to
+///   the child as `EACCES` and nowhere else, and recovering them would mean
+///   giving up a property the sandbox has on purpose.
 pub(crate) fn record_observed_denials(
     writer: &ArtifactWriter,
     egress_proxy: Option<&EgressProxyHandle>,
+    denied_syscalls: Option<&DeniedSyscallLog>,
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] pid: u32,
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] elapsed: Duration,
 ) -> Result<()> {
+    if let Some(log) = denied_syscalls {
+        let (denials, dropped) = log.drain();
+        for denial in denials {
+            append_audit_event(
+                writer,
+                AuditEventKind::PermissionBlocked {
+                    resource: denial.resource(),
+                    reason: denial.reason_text(),
+                },
+            )?;
+        }
+        if dropped > 0 {
+            append_audit_event(
+                writer,
+                AuditEventKind::PermissionBlocked {
+                    resource: DENIAL_OVERFLOW_RESOURCE.to_string(),
+                    reason: format!(
+                        "{dropped} further blocked syscalls were not recorded (buffer limit reached)"
+                    ),
+                },
+            )?;
+        }
+    }
+
     if let Some(proxy) = egress_proxy {
         let (denials, dropped) = proxy.drain_denials();
         for denial in denials {

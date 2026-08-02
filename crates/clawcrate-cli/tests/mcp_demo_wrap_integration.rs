@@ -177,3 +177,63 @@ fn demo_launcher_always_passes_a_server_root() {
         "the default root must be applied after the workspace argument is shifted off"
     );
 }
+
+/// The demo's central claim rests on one detail that is easy to lose in an
+/// edit: the live run must hand `secret-vault/` to the server as one of its own
+/// allowed roots. If it does not, the server refuses the read under its own
+/// policy, the demo still prints a refusal, and the whole thing quietly stops
+/// demonstrating anything about the sandbox.
+#[test]
+fn demo_live_run_authorizes_the_server_to_reach_the_planted_secret() {
+    let contents = fs::read_to_string(demo_dir().join("demo.sh")).expect("read demo.sh");
+
+    assert!(
+        contents.contains(r#"VAULT="$SCRIPT_DIR/secret-vault""#),
+        "the demo must locate the vault outside the workspace"
+    );
+    assert!(
+        contents.contains(r#"node "$SERVER_ENTRYPOINT" . "$VAULT""#),
+        "the server must be started with the vault as an allowed root, or the          refusal proves only that the server polices itself"
+    );
+
+    let request_at = contents
+        .find("secret-vault")
+        .expect("the demo should request the planted secret");
+    let vault_root_at = contents
+        .find(r#"node "$SERVER_ENTRYPOINT" . "$VAULT""#)
+        .expect("the demo should grant the vault as a root");
+    assert!(
+        vault_root_at < request_at || contents.matches("$VAULT").count() >= 2,
+        "the vault must be both granted and requested"
+    );
+
+    // The recording is committed alongside, and a stale one is worse than none:
+    // it would show a demo that no longer exists.
+    assert!(
+        demo_dir().join("demo.cast").is_file(),
+        "the committed recording should be present"
+    );
+    assert!(
+        demo_dir().join("record.py").is_file(),
+        "the recorder should be committed so the cast can be regenerated"
+    );
+}
+
+/// The committed recording must not carry the machine that produced it.
+#[test]
+fn demo_recording_does_not_leak_the_recording_machine() {
+    let cast = fs::read_to_string(demo_dir().join("demo.cast")).expect("read demo.cast");
+
+    assert!(
+        !cast.contains("/Users/"),
+        "the cast must not contain a home directory path"
+    );
+    assert!(
+        !cast.contains("/home/"),
+        "the cast must not contain a home directory path"
+    );
+    assert!(
+        cast.contains("Hash chain valid"),
+        "the recording should cover the audit verification, not stop before it"
+    );
+}

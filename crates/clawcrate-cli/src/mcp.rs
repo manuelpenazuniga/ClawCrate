@@ -250,6 +250,9 @@ pub(crate) fn launch_and_relay_mcp(
         .take()
         .ok_or(CaptureError::MissingStderrPipe)
         .map_err(|source| anyhow!("failed to relay MCP stderr pipe: {source}"))?;
+    // Taken before the child is monitored: the supervisor is joined when the
+    // child handle drops, so draining afterwards sees a complete record.
+    let denied_syscalls = child.denied_syscall_log();
     let launched_at = Instant::now();
     let monitored = run_mcp_relay_child(
         child.child_mut(),
@@ -259,7 +262,13 @@ pub(crate) fn launch_and_relay_mcp(
         plan.profile.resources.max_cpu_seconds,
         Some(pid as i32),
     )?;
-    record_observed_denials(writer, egress_proxy.as_ref(), pid, launched_at.elapsed())?;
+    record_observed_denials(
+        writer,
+        egress_proxy.as_ref(),
+        denied_syscalls.as_ref(),
+        pid,
+        launched_at.elapsed(),
+    )?;
     drop(egress_proxy);
 
     Ok(McpRelayExecutionOutcome {
@@ -327,6 +336,9 @@ pub(crate) fn launch_and_relay_mcp(
         .take()
         .ok_or(CaptureError::MissingStderrPipe)
         .map_err(|source| anyhow!("failed to relay MCP stderr pipe: {source}"))?;
+    // Seatbelt has no notification channel, so there is no syscall log to
+    // drain here; macOS denials come from the unified log instead.
+    let denied_syscalls: Option<clawcrate_sandbox::linux_notify::DeniedSyscallLog> = None;
     let launched_at = Instant::now();
     let monitored = run_mcp_relay_child(
         child.child_mut(),
@@ -336,7 +348,13 @@ pub(crate) fn launch_and_relay_mcp(
         plan.profile.resources.max_cpu_seconds,
         Some(pid as i32),
     )?;
-    record_observed_denials(writer, egress_proxy.as_ref(), pid, launched_at.elapsed())?;
+    record_observed_denials(
+        writer,
+        egress_proxy.as_ref(),
+        denied_syscalls.as_ref(),
+        pid,
+        launched_at.elapsed(),
+    )?;
     drop(egress_proxy);
 
     Ok(McpRelayExecutionOutcome {

@@ -2170,6 +2170,7 @@ fn refused_connections_are_recorded_as_permission_blocked() {
     record_observed_denials(
         &writer,
         Some(&proxy),
+        None,
         std::process::id(),
         Duration::from_secs(1),
     )
@@ -2208,8 +2209,14 @@ fn a_run_without_denials_records_no_permission_blocked() {
     let writer = ArtifactWriter::from_artifacts_dir(artifacts_dir.join("run"))
         .expect("create artifact writer");
 
-    record_observed_denials(&writer, None, std::process::id(), Duration::from_secs(1))
-        .expect("record denials");
+    record_observed_denials(
+        &writer,
+        None,
+        None,
+        std::process::id(),
+        Duration::from_secs(1),
+    )
+    .expect("record denials");
 
     let audit_path = writer.audit_ndjson_path();
     let contents = fs::read_to_string(&audit_path).unwrap_or_default();
