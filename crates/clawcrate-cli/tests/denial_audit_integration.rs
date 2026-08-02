@@ -85,15 +85,26 @@ fn sandbox_available_or_skip(what: &str) -> bool {
     // check that silently never matches would skip everywhere, including CI.
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse doctor --json");
-    let available = report
-        .get("landlock_abi")
-        .is_some_and(|value| !value.is_null());
+
+    // Ask each platform about its own mechanism. Checking Landlock everywhere
+    // reports "unavailable" on macOS, where it is not a concept — which is how
+    // this guard first failed CI on the platform it was meant to let through.
+    let available = if cfg!(target_os = "macos") {
+        report
+            .get("seatbelt_available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    } else {
+        report
+            .get("landlock_abi")
+            .is_some_and(|value| !value.is_null())
+    };
     if !available {
         assert!(
             std::env::var_os("CI").is_none(),
-            "{what} requires Landlock, and CI must not skip it"
+            "{what} requires a working sandbox, and CI must not skip it"
         );
-        eprintln!("skipping {what}: this kernel has no Landlock");
+        eprintln!("skipping {what}: this machine cannot sandbox");
     }
     available
 }
