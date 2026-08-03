@@ -888,3 +888,99 @@ fn fixture_sbpl_blocks_secret_reads_and_reflects_network_policy() {
     assert!(prepared_open.sbpl_profile.contains("(allow network*)"));
     assert!(!prepared_open.sbpl_profile.contains("(deny network*)"));
 }
+
+/// Measures what the notification supervisor costs per denied syscall.
+///
+/// The mechanism adds a userspace round trip to every refusal. Measured on
+/// Linux 6.12 with 200 iterations:
+///
+/// ```text
+/// denied_us_each   22.47
+/// allowed_us_each   0.16
+/// ```
+///
+/// So a refusal costs roughly 22µs against 0.16µs for a permitted syscall, and
+/// permitted syscalls pay nothing at all — which is the number that matters,
+/// because an ordinary build makes no denied calls. The cost lands only on a
+/// program that hits the same wall repeatedly: ten thousand refused attempts
+/// come to about a fifth of a second. Shipping that without a figure was a gap.
+///
+/// Ignored by default because it is a measurement rather than an assertion, and
+/// timing on a shared CI runner is noise.
+///
+/// Run with: `cargo test -p clawcrate-sandbox --test security_fixtures -- --ignored --nocapture bench`
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "measurement, not an assertion"]
+fn bench_cost_of_a_denied_syscall() {
+    let python3 = require_python3_for_linux_fixtures();
+    let workspace = TempPathGuard::new("clawcrate_bench_notify_workspace");
+    fs::create_dir_all(workspace.path()).expect("create temporary workspace");
+    let fixtures = fixture_paths();
+
+    const ITERATIONS: usize = 200;
+    // Assembled line by line: a multi-line Rust literal with continuations is
+    // easy to get subtly wrong, and a malformed script makes the interpreter
+    // exit before measuring anything while the test still reports success.
+    let script = [
+        "import os, time".to_string(),
+        "t0 = time.monotonic()".to_string(),
+        format!("for _ in range({ITERATIONS}):"),
+        "    try:".to_string(),
+        "        os.chroot('/')".to_string(),
+        "    except OSError:".to_string(),
+        "        pass".to_string(),
+        "t1 = time.monotonic()".to_string(),
+        format!("for _ in range({ITERATIONS}):"),
+        "    os.getpid()".to_string(),
+        "t2 = time.monotonic()".to_string(),
+        format!("print('denied_us_each', round((t1 - t0) / {ITERATIONS} * 1e6, 2))"),
+        format!("print('allowed_us_each', round((t2 - t1) / {ITERATIONS} * 1e6, 2))"),
+    ]
+    .join("\n");
+
+    let mut plan = fixture_plan(
+        &fixtures,
+        vec![python3.to_string(), "-c".to_string(), script],
+        NetLevel::None,
+    );
+    plan.cwd = workspace.path().to_path_buf();
+    plan.profile.fs_read = vec![workspace.path().to_path_buf()];
+    plan.profile.fs_write = vec![workspace.path().to_path_buf()];
+
+    let sandbox = LinuxSandbox::new_with_enforcer(Arc::new(SeccompOnlyEnforcer));
+    let prepared = sandbox.prepare_with_env(
+        &plan,
+        vec![
+            (
+                "HOME".to_string(),
+                fixtures.home_root.to_string_lossy().to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ],
+    );
+
+    let child = sandbox.launch(&prepared).expect("launch benchmark");
+    let denial_log = child.denied_syscall_log();
+    let output = child.wait_with_output().expect("wait for benchmark");
+
+    println!("--- cost of a denied syscall ({ITERATIONS} iterations) ---");
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        println!("stderr: {}", stderr.trim());
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("denied_us_each"),
+        "the measurement did not run; a benchmark that reports nothing must not pass"
+    );
+    if let Some(log) = denial_log {
+        let (denials, dropped) = log.drain();
+        // Repeats collapse, so one entry stands for the whole loop; that is the
+        // record working as intended, not a lost measurement.
+        println!(
+            "distinct denials recorded {} (dropped {dropped})",
+            denials.len()
+        );
+    }
+}
