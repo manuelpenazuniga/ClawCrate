@@ -241,8 +241,13 @@ pub(crate) mod runtime {
     // `_IOWR('!', 0, struct seccomp_notif)` and `_IOWR('!', 1, struct
     // seccomp_notif_resp)`. Both structures are fixed-size across Linux
     // architectures, so these encodings are architecture-independent.
-    const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc050_2100;
-    const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc018_2101;
+    //
+    // Typed as `libc::Ioctl` rather than a fixed width: `ioctl`'s request
+    // parameter is `c_ulong` against glibc and `c_int` against musl, so a
+    // hardcoded `c_ulong` compiles for the gnu targets and fails for the musl
+    // ones — which are exactly the targets the release builds.
+    const SECCOMP_IOCTL_NOTIF_RECV: libc::Ioctl = 0xc050_2100_u32 as libc::Ioctl;
+    const SECCOMP_IOCTL_NOTIF_SEND: libc::Ioctl = 0xc018_2101_u32 as libc::Ioctl;
 
     /// How long the parent waits for the child to hand over the listener.
     /// Bounded so a child that dies during setup cannot hang the run.
