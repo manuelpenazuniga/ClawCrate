@@ -128,7 +128,15 @@ bash scripts/release.sh attach-local --tag vX.Y.Z --target x86_64-apple-darwin
 ```
 
 It builds the target, packages it, downloads the published `SHA256SUMS`, merges
-this archive's line into it, and uploads both. It merges rather than
+this archive's line into it, uploads the archive and then the checksums, and
+finally re-downloads every published asset and verifies it.
+
+The archive is uploaded **before** the checksums on purpose. `gh release upload
+--clobber` deletes the existing asset before sending the replacement, so a
+failure partway through a combined upload can leave the release with no
+`SHA256SUMS` at all — which does not merely break the platform being attached,
+it makes **every** platform uninstallable. Uploading in this order means the
+worst case is the state you started from. It merges rather than
 regenerating, because regenerating from a machine that only built one target
 would drop every other platform's line and break their installs instead of
 fixing this one. Re-running after a rebuild replaces the entry rather than

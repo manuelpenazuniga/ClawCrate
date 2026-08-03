@@ -41,6 +41,21 @@ sha256_cmd() {
   echo ""
 }
 
+# Prints the SHA-256 of a single file, using whichever tool this machine has.
+# `sha256_cmd` above names the tool for the batch path; this wraps it for the
+# one-file case so both paths agree on how a checksum is produced.
+sha256_file() {
+  local file="$1"
+  local cmd
+  cmd="$(sha256_cmd)"
+  if [[ -z "$cmd" ]]; then
+    echo "error: no SHA256 command found (sha256sum or shasum)" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC2086  # cmd may legitimately carry the `-a 256` flag.
+  $cmd "$file" | awk '{print $1}'
+}
+
 package_cmd() {
   local target=""
   local binary=""
@@ -196,7 +211,13 @@ attach_local_cmd() {
   # and break their installs instead of fixing this one.
   local published="$dist_dir/SHA256SUMS.published"
   echo "==> Fetching published SHA256SUMS for $tag"
-  gh release download "$tag" --pattern SHA256SUMS --output "$published" --clobber
+  if ! gh release download "$tag" --pattern SHA256SUMS --output "$published" --clobber; then
+    echo "error: $tag has no SHA256SUMS to merge into." >&2
+    echo "       Nothing was uploaded. Every platform is currently uninstallable," >&2
+    echo "       because the installer requires a checksum entry. Restore the file" >&2
+    echo "       from the release workflow run before retrying." >&2
+    exit 1
+  fi
 
   # Same-name lines are replaced, so re-running after a rebuild corrects the
   # entry instead of leaving two contradictory ones.
@@ -206,12 +227,39 @@ attach_local_cmd() {
   LC_ALL=C sort -k2 -o "$merged" "$merged"
   rm -f "$published"
 
-  echo "==> Uploading $archive and the merged SHA256SUMS"
-  gh release upload "$tag" "$dist_dir/$archive" "$merged" --clobber
+  # Uploaded in two steps, archive first, because `gh ... --clobber` deletes the
+  # existing asset before sending the replacement. A failure partway through a
+  # combined upload can therefore leave the release with no SHA256SUMS at all —
+  # which does not merely break this platform, it makes every platform
+  # uninstallable, since the installer refuses to proceed without one.
+  #
+  # Ordering it this way means the worst case is the state we started from: the
+  # archive present but not yet listed, which fails closed for this platform
+  # only. Learned the hard way on v0.3.0-alpha.0.
+  echo "==> Uploading $archive"
+  gh release upload "$tag" "$dist_dir/$archive" --clobber
+
+  echo "==> Uploading the merged SHA256SUMS"
+  gh release upload "$tag" "$merged" --clobber
 
   echo ""
-  echo "Attached $archive to $tag and merged its checksum."
-  echo "Verify from a clean machine before announcing:"
+  echo "==> Verifying every published asset against the published SHA256SUMS"
+  local verify_dir="$dist_dir/verify"
+  rm -rf "$verify_dir"
+  mkdir -p "$verify_dir"
+  (
+    cd "$verify_dir"
+    gh release download "$tag" --clobber >/dev/null
+    if [[ "$(sha256_cmd)" == "sha256sum" ]]; then
+      sha256sum -c SHA256SUMS
+    else
+      shasum -a 256 -c SHA256SUMS
+    fi
+  )
+
+  echo ""
+  echo "Attached $archive to $tag; all published assets verify."
+  echo "Smoke test the installer from a clean machine before announcing:"
   echo "  curl -fsSL https://github.com/manuelpenazuniga/ClawCrate/releases/download/$tag/install.sh | bash"
 }
 
