@@ -44,6 +44,19 @@ jobs:
 
       - name: Audit benchmark compile (informational)
         run: cargo bench -p clawcrate-audit --no-run
+
+      # The release ships musl binaries, and musl is not glibc: `ioctl`'s
+      # request parameter is `c_int` there and `c_ulong` here, so a type that
+      # compiles on this runner can still fail the release build. Checking the
+      # release targets here means that failure surfaces on the pull request
+      # rather than after a tag is pushed. `check` needs no linker, so it costs
+      # a fraction of a real cross build.
+      - name: Cargo check release targets (musl)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          cargo check -p clawcrate-sandbox --target x86_64-unknown-linux-musl
+          cargo check -p clawcrate-sandbox --target aarch64-unknown-linux-musl
         continue-on-error: true
 
   integration-and-fixtures:
