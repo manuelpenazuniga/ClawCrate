@@ -108,15 +108,39 @@ After tag push:
 - It builds and uploads:
   - `clawcrate-x86_64-unknown-linux-musl.tar.gz`
   - `clawcrate-aarch64-unknown-linux-musl.tar.gz`
-  - `clawcrate-x86_64-apple-darwin.tar.gz`
   - `clawcrate-aarch64-apple-darwin.tar.gz`
   - `SHA256SUMS`
   - `scripts/install.sh`
 
+## 5b. Attach the Intel macOS build (manual, from an Intel Mac)
+
+`x86_64-apple-darwin` is **not** built by the hosted runners. Until it is, the
+release is incomplete for Intel Macs and this step is not optional:
+`install.sh` requires a checksum entry for the asset it downloads and exits
+rather than installing without one. So an Intel user gets a hard failure, not an
+unverified install — and uploading the tarball without merging its checksum
+leaves them in exactly that state.
+
+Run this on the Intel Mac, after the workflow above has finished:
+
+```bash
+bash scripts/release.sh attach-local --tag vX.Y.Z --target x86_64-apple-darwin
+```
+
+It builds the target, packages it, downloads the published `SHA256SUMS`, merges
+this archive's line into it, and uploads both. It merges rather than
+regenerating, because regenerating from a machine that only built one target
+would drop every other platform's line and break their installs instead of
+fixing this one. Re-running after a rebuild replaces the entry rather than
+adding a second, contradictory one.
+
 ## 6. Post-Release Verification
 
 - Confirm GitHub Release exists for the pushed tag.
-- Verify all expected assets are attached.
+- Verify all expected assets are attached, **including the manually attached
+  `clawcrate-x86_64-apple-darwin.tar.gz`**.
+- Confirm `SHA256SUMS` has one line per attached archive. A missing line means
+  that platform cannot install at all.
 - Smoke test installer:
 
 ```bash

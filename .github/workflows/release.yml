@@ -29,11 +29,12 @@ jobs:
             target: aarch64-unknown-linux-musl
             use_cross: true
           - os: macos-14
-            target: x86_64-apple-darwin
-            use_cross: false
-          - os: macos-14
             target: aarch64-apple-darwin
             use_cross: false
+          # x86_64-apple-darwin is built and uploaded from a local Intel Mac
+          # instead. See docs/release-checklist.md: the hosted runner stopped
+          # producing a binary we are willing to ship, and a release asset we
+          # cannot vouch for is worse than one platform arriving separately.
 
     steps:
       - name: Checkout repository
