@@ -142,6 +142,23 @@ would drop every other platform's line and break their installs instead of
 fixing this one. Re-running after a rebuild replaces the entry rather than
 adding a second, contradictory one.
 
+## 5c. Point the README at the new tag
+
+The README's install command names an exact tag rather than
+`releases/latest/download/`, because that path resolves to the newest
+**non-prerelease**. While every release carries a SemVer prerelease identifier —
+the hyphen in `v0.3.0-alpha.0` — it serves whatever shipped before the alphas
+began. It is stale by construction rather than by accident, and it is stale for
+the installer *script* as well as the binary, so the two compound.
+
+Bump the tag in `README.md` as part of the release:
+
+```bash
+sed -i '' "s|releases/download/v[^/]*/install.sh|releases/download/vX.Y.Z/install.sh|" README.md
+```
+
+Re-point it at `releases/latest/download/` once a non-prerelease exists.
+
 ## 6. Post-Release Verification
 
 - Confirm GitHub Release exists for the pushed tag.
@@ -149,6 +166,9 @@ adding a second, contradictory one.
   `clawcrate-x86_64-apple-darwin.tar.gz`**.
 - Confirm `SHA256SUMS` has one line per attached archive. A missing line means
   that platform cannot install at all.
+- Run the install command **exactly as the README prints it** and confirm the
+  version it reports is the one just released. Both the script and the binary
+  are resolved from the release, so a stale link serves a stale pair of them.
 - Smoke test installer:
 
 ```bash
