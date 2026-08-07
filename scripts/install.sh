@@ -9,7 +9,7 @@ BIN_NAME="clawcrate"
 usage() {
   cat <<'EOF'
 Usage:
-  sh install.sh [--version <version|latest>] [--install-dir <path>] [--repo <owner/repo>]
+  sh install.sh [--version <version|latest|stable>] [--install-dir <path>] [--repo <owner/repo>]
 
 Examples:
   sh install.sh
@@ -124,7 +124,33 @@ detect_target() {
 }
 
 resolve_tag() {
+  # `latest` means the newest release that exists, prereleases included.
+  #
+  # GitHub's `/releases/latest` endpoint excludes prereleases, and every
+  # ClawCrate release so far carries a SemVer prerelease identifier — the
+  # hyphen in `v0.3.0-alpha.0`. Resolving through that endpoint therefore served
+  # the last non-prerelease tag, which by August 2026 was four months and two
+  # feature releases stale. The list endpoint returns newest first and includes
+  # prereleases, so it answers the question a user actually asked.
+  #
+  # Use `--version stable` for the newest non-prerelease, and `--version vX.Y.Z`
+  # to pin exactly.
   if [ "$VERSION" = "latest" ]; then
+    api_url="https://api.github.com/repos/$REPO/releases?per_page=1"
+    tag="$(
+      fetch_text "$api_url" \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n1
+    )"
+    if [ -z "$tag" ]; then
+      echo "error: failed to resolve the newest release for $REPO" >&2
+      exit 1
+    fi
+    printf "%s" "$tag"
+    return
+  fi
+
+  if [ "$VERSION" = "stable" ]; then
     api_url="https://api.github.com/repos/$REPO/releases/latest"
     tag="$(
       fetch_text "$api_url" \
@@ -132,7 +158,9 @@ resolve_tag() {
         | head -n1
     )"
     if [ -z "$tag" ]; then
-      echo "error: failed to resolve latest release tag for $REPO" >&2
+      echo "error: $REPO has no non-prerelease release yet." >&2
+      echo "       Use --version latest for the newest prerelease," >&2
+      echo "       or --version vX.Y.Z to pin one." >&2
       exit 1
     fi
     printf "%s" "$tag"
